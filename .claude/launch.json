@@ -1,0 +1,25 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "static",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "http.server", "8765"],
+      "port": 8765
+    },
+    {
+      "name": "static-2",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "http.server", "8771"],
+      "port": 8771,
+      "autoPort": false
+    },
+    {
+      "name": "static-3",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "http.server", "8779"],
+      "port": 8779,
+      "autoPort": false
+    }
+  ]
+}

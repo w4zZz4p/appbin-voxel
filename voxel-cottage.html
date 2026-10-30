@@ -1,0 +1,445 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voxel Cottage Build</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #1e7a34; font-family: system-ui, sans-serif; }
+  body { background: radial-gradient(ellipse at 50% 40%, #2f9a45 0%, #1f7d35 55%, #145a25 100%); }
+  canvas { display: block; }
+  #ui { position: fixed; left: 16px; bottom: 16px; display: flex; gap: 8px; align-items: center; color: #e9ffe9; font-size: 13px; flex-wrap: wrap; }
+  #ui button { background: rgba(0,0,0,.28); color: #fff; border: 1px solid rgba(255,255,255,.25); border-radius: 6px; padding: 6px 12px; cursor: pointer; font: inherit; }
+  #ui button:hover { background: rgba(0,0,0,.4); }
+  #bar { width: 160px; height: 4px; background: rgba(0,0,0,.25); border-radius: 2px; overflow: hidden; }
+  #bar i { display: block; height: 100%; width: 0; background: #d8ffd8; }
+  #ui.hidden { display: none; }
+  label { display: flex; gap: 4px; align-items: center; user-select: none; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="ui">
+  <button id="replay">Replay (R)</button>
+  <button id="pause">Pause (Space)</button>
+  <label><input type="checkbox" id="loop" checked> Loop</label>
+  <div id="bar"><i></i></div>
+  <span id="info" style="opacity:.7"></span>
+</div>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// Voxel subdivision: each design unit is S×S×S small voxels. Override with ?res=1..4
+const S = Math.max(1, Math.min(4, parseInt(new URLSearchParams(location.search).get('res')) || 2));
+
+// ---------- helpers ----------
+function hash(x, z, s = 0) {
+  let h = Math.imul(x | 0, 374761393) ^ Math.imul(z | 0, 668265263) ^ Math.imul(s | 0, 1442695041);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  h ^= h >>> 16;
+  return (h >>> 0) / 4294967295;
+}
+function vnoise(x, z, sc, s = 0) {
+  x /= sc; z /= sc;
+  const xi = Math.floor(x), zi = Math.floor(z), xf = x - xi, zf = z - zi;
+  const u = xf * xf * (3 - 2 * xf), v = zf * zf * (3 - 2 * zf);
+  const a = hash(xi, zi, s), b = hash(xi + 1, zi, s), c = hash(xi, zi + 1, s), d = hash(xi + 1, zi + 1, s);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+let seed = 1337;
+const rnd = () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+const pick = a => a[Math.floor(rnd() * a.length)];
+
+// Fine-grid voxel store. Design coords are multiplied by S; dc() maps a fine cell back to design space.
+const V = new Map();
+const key = (x, y, z) => ((x + 32) * 1024 + (y + 32)) * 1024 + (z + 32);
+const fset = (x, y, z, c) => V.set(key(x, y, z), { x, y, z, c });
+const fhas = (x, y, z) => V.has(key(x, y, z));
+const dc = f => (f - (S - 1) / 2) / S;
+const col = (c, x, y, z) => typeof c === 'function' ? c(x, y, z) : Array.isArray(c) ? c[Math.floor(hash(x * 7 + y, z, 3) * c.length)] : c;
+function fbox(x0, y0, z0, x1, y1, z1, c) {
+  for (let x = x0; x <= x1; x++) for (let y = y0; y <= y1; y++) for (let z = z0; z <= z1; z++) fset(x, y, z, col(c, x, y, z));
+}
+// inclusive box in design units
+const box = (x0, y0, z0, x1, y1, z1, c) => fbox(x0 * S, y0 * S, z0 * S, x1 * S + S - 1, y1 * S + S - 1, z1 * S + S - 1, c);
+
+// ---------- palette ----------
+const P = {
+  soil: [0x1d6b2c, 0x24813a, 0x2f9643],
+  grass: [0x4cb84a, 0x43a943, 0x56c252, 0x3c9e3e],
+  water: [0x3a9f94, 0x44ad9f, 0x358f88],
+  dirt: [0x7a5a34, 0x6b4d2c],
+  stone: [0xa3a3a3, 0x8c8c8c, 0xb5b5b5, 0x979797],
+  log: [0xc8a24e, 0xb08a3c],
+  logDark: 0x6e4f26,
+  plank: [0x8a6a3c, 0x7a5c33],
+  glass: 0x6aa8c8,
+  door: [0x4f86a3, 0x45799a],
+  frame: 0x5a3f1e,
+  shingle: [0xb9a83f, 0xa49434],
+  moss: [0x3fae4a, 0x2f9a3c, 0x4fc157, 0x2a8a36],
+  brick: [0x8a4a2e, 0x7a3e26, 0x9a5636],
+  smoke: [0xf4f4f4, 0xe2e2e2, 0xffffff],
+  pine: [0x2e9e3e, 0x258a35, 0x37ad47],
+  leaf: [0x4cc35a, 0x3fb04e, 0x58cf63],
+  teal: [0x4fb3a0, 0x3e9a8a, 0x67c9b6, 0x2f8577],
+  trunk: [0x6a4423, 0x5a391d],
+  bush: [0xf2f2f2, 0xdedede, 0xffffff],
+  wellRoof: [0x8a8f96, 0x737880],
+};
+
+const N = 48, F = N * S;
+const G = 3;               // design layer of the grass top
+const TOP = (G + 1) * S;   // first free fine layer above the grass
+
+// ---------- terrain ----------
+const ponds = [[3, 40, 3.6], [16, 44, 2.4], [30, 40, 3], [40, 35, 2], [9, 46, 1.6]];
+const isWater = (x, z) => {
+  for (const [px, pz, r] of ponds) {
+    const d = Math.hypot(x - px, (z - pz) * 1.2);
+    if (d < r + (vnoise(x, z, 3, 7) - 0.5) * 1.6) return true;
+  }
+  return x >= 3.6 && x <= 6.4 && z >= 41.5; // stream to the edge
+};
+for (let fx = 0; fx < F; fx++) for (let fz = 0; fz < F; fz++) {
+  const x = dc(fx), z = dc(fz);
+  for (let fy = 0; fy < G * S; fy++) fset(fx, fy, fz, P.soil[Math.floor(fy / S)]);
+  if (isWater(x, z)) { fset(fx, G * S - 1, fz, pick(P.water)); continue; }
+  const dirt = vnoise(x, z, 2.5, 11) > 0.82;
+  const c = dirt ? pick(P.dirt) : P.grass[Math.min(3, Math.floor(vnoise(x, z, 5, 3) * 4))];
+  for (let fy = G * S; fy < TOP; fy++) fset(fx, fy, fz, c);
+}
+// waterfall down the front edge
+for (let fx = 0; fx < F; fx++) if (isWater(dc(fx), N - 0.5)) for (let fy = 0; fy < G * S; fy++) fset(fx, fy, F, pick(P.water));
+
+// ---------- house ----------
+const HX0 = 20, HX1 = 37, HZ0 = 5, HZ1 = 20, PX = 43;
+const logC = (x, y) => P.log[y % 2];
+const stoneC = (x, y, z) => hash(Math.floor((x + (y % 2) * S) / (2 * S - 1)), z * 13 + y, 4) < 0.12 ? 0x777777 : P.stone[Math.floor(hash(x, y * 31 + z, 5) * 4)];
+box(HX0 - 1, 4, HZ0, HX1, 4, HZ1, stoneC);                    // foundation
+box(HX1 + 1, 4, HZ0, PX, 4, HZ1, (x, y, z) => P.plank[z % 2]); // porch floor
+fbox(44 * S, 4 * S, 11 * S, 45 * S - 1, 4 * S + Math.ceil(S / 2) - 1, 15 * S - 1, stoneC); // step
+box(45, G, 11, 47, G, 14, stoneC);                            // path
+// walls with logs one fine voxel tall
+box(HX0, 5, HZ0, HX1, 13, HZ0, logC);
+box(HX0, 5, HZ1, HX1, 13, HZ1, logC);
+box(HX0, 5, HZ0, HX0, 13, HZ1, logC);
+box(HX1, 5, HZ0, HX1, 13, HZ1, logC);
+for (const x of [HX0, HX1]) for (const z of [HZ0, HZ1]) box(x, 5, z, x, 13, z, P.logDark);
+// window: frame + glass with a cross mullion. axis 'x' = in the wall z=plane, 'z' = in the wall x=plane
+function win(axis, plane, a0, a1, y0, y1) {
+  const A0 = a0 * S, A1 = a1 * S + S - 1, Y0 = y0 * S, Y1 = y1 * S + S - 1;
+  const am = Math.floor((A0 + A1) / 2), ym = Math.floor((Y0 + Y1) / 2);
+  for (let a = A0 - S; a <= A1 + S; a++) for (let y = Y0 - S; y <= Y1 + S; y++) {
+    const inner = a >= A0 && a <= A1 && y >= Y0 && y <= Y1;
+    const c = inner && a !== am && y !== ym ? P.glass : P.frame;
+    for (let t = 0; t < S; t++) axis === 'x' ? fset(a, y, plane * S + t, c) : fset(plane * S + t, y, a, c);
+  }
+}
+win('x', HZ1, 23, 25, 8, 10);
+win('x', HZ1, 30, 32, 8, 10);
+win('z', HX1, 7, 8, 8, 10);
+win('z', HX1, 17, 18, 8, 10);
+// door: frame + vertical planks + knob
+box(HX1, 5, 11, HX1, 10, 14, P.frame);
+box(HX1, 5, 12, HX1, 9, 13, (x, y, z) => P.door[z % 2]);
+fset(HX1 * S + S, 7 * S, 13 * S, 0xe0c060);
+// porch posts, beam, railings (thin, one fine voxel)
+for (const z of [HZ0 + 1, HZ1 - 1]) box(PX, 5, z, PX, 13, z, P.logDark);
+box(PX, 13, HZ0, PX, 13, HZ1, P.logDark);
+const railY = 7 * S;
+for (let fz = (HZ0 + 2) * S; fz < (HZ1 - 1) * S; fz++) {
+  if (fz >= 11 * S && fz < 15 * S) continue;
+  const fx = PX * S + Math.floor(S / 2);
+  fset(fx, railY, fz, P.plank[0]);
+  if (fz % 2 === 0) for (let fy = 5 * S; fy < railY; fy++) fset(fx, fy, fz, P.plank[1]);
+}
+for (let fx = (HX1 + 1) * S; fx < PX * S; fx++) for (const z of [HZ0 + 1, HZ1 - 1]) {
+  const fz = z * S + Math.floor(S / 2);
+  fset(fx, railY, fz, P.plank[0]);
+  if (fx % 2 === 0) for (let fy = 5 * S; fy < railY; fy++) fset(fx, fy, fz, P.plank[1]);
+}
+// gable walls (back wall and over the porch)
+for (let k = 0; ; k++) {
+  const fy = 14 * S + k, z0 = HZ0 * S + k, z1 = (HZ1 + 1) * S - 1 - k;
+  if (z0 > z1) break;
+  for (let fz = z0; fz <= z1; fz++) for (let t = 0; t < S; t++) {
+    fset(HX0 * S + t, fy, fz, P.log[fy % 2]);
+    fset(PX * S + t, fy, fz, P.log[fy % 2]);
+  }
+}
+win('z', PX, 12, 13, 15, 17);
+// roof: fine staircase, two voxels thick, mossy
+{
+  const z0 = 4 * S, z1 = 22 * S - 1, x0 = (HX0 - 1) * S, x1 = 45 * S - 1;
+  let last = 0;
+  for (let k = 0; z0 + k <= z1 - k; k++) last = k;
+  for (let k = 0; k <= last; k++) {
+    const fy = 14 * S + k;
+    for (let fx = x0; fx <= x1; fx++) for (const fz of new Set([z0 + k, z1 - k])) {
+      const m = vnoise(dc(fx), dc(fz) + dc(fy) * 1.7, 4, 21);
+      const edge = fx === x0 || fx === x1;
+      let c = k >= last - 1 ? 0x8b7d2a : edge ? 0x8f8030 : P.shingle[Math.floor(k / S) % 2];
+      if (m > 0.5 && !edge) c = pick(P.moss);
+      fset(fx, fy, fz, c);
+      fset(fx, fy - 1, fz, c);
+      if (m > 0.64 && k < last) fset(fx, fy + 1, fz, pick(P.moss));
+      if (m > 0.74 && k < last - 1 && hash(fx, fz, 8) > 0.5) fset(fx, fy + 2, fz, pick(P.moss));
+      if (k === 0 && m > 0.5 && hash(fx, fz, 5) > 0.55) {        // hanging moss
+        const len = 1 + Math.floor(hash(fx, fz, 6) * 2 * S);
+        for (let i = 2; i <= len + 1; i++) fset(fx, fy - i, fz, pick(P.moss));
+      }
+    }
+  }
+}
+// ivy creeping up the front-left wall
+for (let fx = HX0 * S + S; fx < HX1 * S; fx++) {
+  const x = dc(fx);
+  if ((x > 21.5 && x < 26.5) || (x > 28.5 && x < 33.5) || hash(fx, 3, 9) < 0.5) continue;
+  const top = 5 * S + Math.floor(hash(fx, 1, 2) * 9 * S);
+  for (let fy = 5 * S; fy <= top; fy++) {
+    fset(fx, fy, (HZ1 + 1) * S, pick(P.moss));
+    if (hash(fx, fy, 4) > 0.8) fset(fx, fy, (HZ1 + 1) * S + 1, pick(P.moss));
+  }
+}
+// chimney
+box(24, 14, 7, 25, 25, 8, (x, y, z) => y % 3 === 2 ? 0x6a3a26 : P.brick[Math.floor(hash(Math.floor((x + z + (y % 6 < 3 ? 1 : 0)) / 2), y, 7) * 3)]);
+box(23, 26, 6, 26, 26, 9, 0x5e2f1c);
+
+// ---------- organic shapes (rasterised on the fine grid) ----------
+function blob(cx, cy, cz, r, pal, sy = 1, rough = 0.5) {
+  const R = r + 1;
+  for (let fx = Math.floor((cx - R) * S); fx <= Math.ceil((cx + R) * S); fx++)
+    for (let fy = Math.floor((cy - R * sy) * S); fy <= Math.ceil((cy + R * sy) * S); fy++)
+      for (let fz = Math.floor((cz - R) * S); fz <= Math.ceil((cz + R) * S); fz++) {
+        const d = Math.hypot(dc(fx) - cx, (dc(fy) - cy) / sy, dc(fz) - cz);
+        if (d <= r + (rnd() - 0.5) * rough) fset(fx, fy, fz, pick(pal));
+      }
+}
+blob(25, 29, 7, 1.6, P.smoke);
+blob(27, 32, 6, 2.2, P.smoke);
+blob(30, 34, 5, 2.4, P.smoke);
+blob(32, 36, 7, 1.8, P.smoke);
+
+// well
+const WX = 11, WZ = 24;
+for (let fx = (WX - 4) * S; fx < (WX + 5) * S; fx++) for (let fz = (WZ - 4) * S; fz < (WZ + 5) * S; fz++) {
+  const d = Math.hypot(dc(fx) - WX, dc(fz) - WZ);
+  if (d > 3.3) continue;
+  for (let fy = 4 * S; fy < 7 * S; fy++) {
+    if (d >= 2.2) fset(fx, fy, fz, stoneC(fx, fy, fz));
+    else if (fy < 5 * S) fset(fx, fy, fz, 0x1d4a55);
+  }
+}
+for (const dx of [-3, 3]) box(WX + dx, 7, WZ, WX + dx, 11, WZ, P.trunk);
+box(WX - 2, 10, WZ, WX + 2, 10, WZ, P.trunk[0]);
+for (let fy = 8 * S; fy < 10 * S; fy++) fset(WX * S, fy, WZ * S, 0xc9b48a);       // rope
+box(WX, 7, WZ, WX, 7, WZ, 0x7a5a32);                                                // bucket
+{
+  const z0 = (WZ - 4) * S, z1 = (WZ + 5) * S - 1;
+  for (let k = 0; z0 + k <= z1 - k; k++) for (let fx = (WX - 4) * S; fx < (WX + 5) * S; fx++)
+    for (const fz of new Set([z0 + k, z1 - k])) {
+      const c = P.wellRoof[Math.floor(k / S) % 2];
+      fset(fx, 11 * S + k, fz, c); fset(fx, 11 * S + k - 1, fz, c);
+    }
+}
+
+// trees
+function pine(cx, cz, h, r0) {
+  box(cx, 4, cz, cx, 6, cz, P.trunk);
+  for (let fy = 6 * S; fy < (5 + h) * S; fy++) {
+    const y = dc(fy);
+    const t = (y - 6) / (h - 2);
+    const tier = (((y - 6) % 4) + 4) % 4 / 4;
+    const r = Math.max(0.5, r0 * (1 - t) * (1 - tier * 0.45) + 0.4);
+    for (let fx = Math.floor((cx - r - 1) * S); fx <= Math.ceil((cx + r + 1) * S); fx++)
+      for (let fz = Math.floor((cz - r - 1) * S); fz <= Math.ceil((cz + r + 1) * S); fz++)
+        if (Math.hypot(dc(fx) - cx, dc(fz) - cz) <= r + (rnd() - 0.5) * 0.6) fset(fx, fy, fz, pick(P.pine));
+  }
+  box(cx, 5 + h, cz, cx, 5 + h, cz, P.pine[2]);
+}
+function roundTree(cx, cz, r, th) {
+  box(cx, 4, cz, cx, 4 + th, cz, P.trunk);
+  blob(cx, 4 + th + r * 0.7, cz, r, P.leaf, 0.85, 0.9);
+  blob(cx + 2, 4 + th + r * 0.3, cz + 2, r * 0.6, P.leaf, 0.85, 0.9);
+}
+(function tealTree() {
+  let x = 12, z = 6;
+  for (let y = 4; y <= 21; y++) {
+    if (y === 10) x++;
+    if (y === 15) { x++; z--; }
+    box(x, y, z, x + 1, y, z, P.trunk);
+  }
+  for (let i = 0; i < 6; i++) box(14 + i, 18 + (i >> 1), 5, 14 + i, 18 + (i >> 1), 5, P.trunk);
+  for (let i = 0; i < 5; i++) box(12 - i, 16 + (i >> 1), 6 + (i >> 1), 12 - i, 16 + (i >> 1), 6 + (i >> 1), P.trunk);
+  blob(8, 19, 8, 3.2, P.teal, 0.6, 1);
+  blob(13, 24, 5, 3.8, P.teal, 0.6, 1);
+  blob(19, 22, 4, 3.4, P.teal, 0.6, 1);
+  blob(16, 28, 7, 2.8, P.teal, 0.6, 1);
+  blob(9, 25, 4, 2.5, P.teal, 0.6, 1);
+})();
+for (const [x, z, h, r] of [[4, 10, 15, 4], [4, 30, 13, 4], [11, 33, 14, 4], [18, 39, 11, 3], [25, 31, 12, 3], [9, 42, 9, 3], [42, 44, 8, 2.5]]) pine(x, z, h, r);
+roundTree(6, 19, 4.5, 5);
+roundTree(17, 13, 3.4, 3);
+roundTree(34, 29, 3, 3);
+for (const [x, z, r] of [[16, 20, 1.8], [19, 27, 2], [14, 29, 1.6], [37, 24, 1.8], [45, 24, 1.8], [24, 42, 1.8], [36, 45, 1.6], [45, 39, 1.5]]) blob(x, 3.6 + r * 0.7, z, r, P.bush, 0.9, 0.6);
+for (const [x, z, r] of [[28, 24, 1.6], [41, 30, 1.6], [10, 37, 1.5], [21, 46, 1.4]]) blob(x, 3.6 + r * 0.6, z, r, P.leaf, 0.8, 0.6);
+// grass tufts & flowers on the fine grid
+for (let fx = 0; fx < F; fx++) for (let fz = 0; fz < F; fz++) {
+  if (!fhas(fx, TOP - 1, fz) || fhas(fx, TOP, fz)) continue;
+  const h = hash(fx, fz, 77);
+  if (h < 0.05) { fset(fx, TOP, fz, pick(P.grass)); if (h < 0.015 && S > 1) fset(fx, TOP + 1, fz, pick(P.grass)); }
+  else if (h < 0.058) fset(fx, TOP, fz, pick([0xffffff, 0xf3e27a, 0xf2a0c0]));
+}
+
+// ---------- instanced mesh ----------
+const vox = [...V.values()];
+const LAYER = 0.32 / S;   // seconds per fine layer
+const DUR = 0.55;
+for (const v of vox) {
+  const radial = Math.hypot(v.x - F / 2, v.z - F / 2) / (F * 0.75);
+  v.t0 = v.y * LAYER + (hash(v.x, v.z, v.y) * 0.6 + radial * 0.4) * 0.32 * 2.2;
+}
+vox.sort((a, b) => a.t0 - b.t0);
+const COUNT = vox.length;
+const BUILD_END = vox[COUNT - 1].t0 + DUR;
+document.getElementById('info').textContent = `${COUNT.toLocaleString()} voxels · F skip · H hides UI · drag to orbit · ?res=1-4`;
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.3;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const VIEW = 36;
+const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 1000);
+cam.position.set(70, 62, 70);
+const controls = new OrbitControls(cam, renderer.domElement);
+controls.target.set(0, 9, 0);
+controls.enableDamping = true;
+controls.autoRotate = true;
+controls.autoRotateSpeed = 0.35;
+controls.maxPolarAngle = Math.PI * 0.45;
+function resize() {
+  const a = innerWidth / innerHeight;
+  cam.left = -VIEW * a; cam.right = VIEW * a; cam.top = VIEW; cam.bottom = -VIEW;
+  cam.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+}
+addEventListener('resize', resize); resize();
+
+scene.add(new THREE.HemisphereLight(0xf0fff4, 0x3a7a40, 1.7));
+const sun = new THREE.DirectionalLight(0xfff4e0, 2.2);
+sun.position.set(-35, 70, 45);
+sun.castShadow = true;
+sun.shadow.mapSize.set(4096, 4096);
+Object.assign(sun.shadow.camera, { left: -50, right: 50, top: 50, bottom: -50, near: 1, far: 200 });
+sun.shadow.bias = -0.0006;
+sun.shadow.normalBias = 0.02;
+scene.add(sun);
+
+// soft voxel edge texture
+const cv = document.createElement('canvas'); cv.width = cv.height = 32;
+const g = cv.getContext('2d');
+g.fillStyle = '#d8d8d8'; g.fillRect(0, 0, 32, 32);
+g.fillStyle = '#ffffff'; g.fillRect(3, 3, 26, 26);
+const tex = new THREE.CanvasTexture(cv);
+tex.colorSpace = THREE.SRGBColorSpace;
+
+const mesh = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshStandardMaterial({ map: tex, roughness: 0.85 }), COUNT);
+mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+mesh.castShadow = mesh.receiveShadow = true;
+mesh.frustumCulled = false;
+const c3 = new THREE.Color();
+vox.forEach((v, i) => {
+  c3.setHex(v.c).offsetHSL(0, 0, (hash(v.x, v.z, v.y + 99) - 0.5) * 0.05);
+  mesh.setColorAt(i, c3);
+});
+const group = new THREE.Group();
+group.scale.setScalar(1 / S);
+group.position.set(-N / 2 + 0.5 / S, 0.5 / S, -N / 2 + 0.5 / S);
+group.add(mesh);
+scene.add(group);
+
+const shadowPlane = new THREE.Mesh(new THREE.PlaneGeometry(400, 400), new THREE.ShadowMaterial({ opacity: 0.28 }));
+shadowPlane.rotation.x = -Math.PI / 2;
+shadowPlane.position.y = -0.01;
+shadowPlane.receiveShadow = true;
+scene.add(shadowPlane);
+
+// ---------- animation ----------
+const M = mesh.instanceMatrix.array;
+function setM(i, x, y, z, s) {
+  const o = i * 16;
+  M[o] = s; M[o + 5] = s; M[o + 10] = s;
+  M[o + 12] = x; M[o + 13] = y; M[o + 14] = z;
+}
+const easeOutCubic = p => 1 - Math.pow(1 - p, 3);
+const easeOutBack = p => { const c = 1.9; return 1 + (c + 1) * Math.pow(p - 1, 3) + c * Math.pow(p - 1, 2); };
+const DROP = 6 * S;
+
+let t = 0, first = 0, paused = false, doneAt = -1;
+function reset() {
+  for (let i = 0; i < COUNT; i++) setM(i, 0, -9999, 0, 0);
+  mesh.instanceMatrix.needsUpdate = true;
+  t = 0; first = 0; doneAt = -1;
+}
+reset();
+
+function step() {
+  let i = first;
+  while (i < COUNT && vox[i].t0 <= t) {
+    const v = vox[i];
+    const p = (t - v.t0) / DUR;
+    if (p >= 1) {
+      setM(i, v.x, v.y, v.z, 1);
+      if (i === first) first++;
+    } else {
+      const s = Math.max(0, easeOutBack(Math.min(1, p * 1.25)));
+      setM(i, v.x, v.y + (1 - easeOutCubic(p)) * DROP, v.z, s);
+    }
+    i++;
+  }
+  mesh.instanceMatrix.needsUpdate = true;
+}
+
+const bar = document.querySelector('#bar i');
+const loopBox = document.getElementById('loop');
+document.getElementById('replay').onclick = reset;
+const pauseBtn = document.getElementById('pause');
+const togglePause = () => { paused = !paused; pauseBtn.textContent = paused ? 'Play (Space)' : 'Pause (Space)'; };
+pauseBtn.onclick = togglePause;
+addEventListener('keydown', e => {
+  if (e.code === 'KeyR') reset();
+  else if (e.code === 'KeyF') t = BUILD_END;
+  else if (e.code === 'Space') { e.preventDefault(); togglePause(); }
+  else if (e.code === 'KeyH') document.getElementById('ui').classList.toggle('hidden');
+});
+
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.1);
+  if (!paused) {
+    t += dt;
+    if (first < COUNT) step();
+    else if (doneAt < 0) doneAt = t;
+    else if (loopBox.checked && t - doneAt > 5) reset();
+    bar.style.width = Math.min(100, (t / BUILD_END) * 100) + '%';
+  }
+  controls.autoRotate = !paused;
+  controls.update();
+  renderer.render(scene, cam);
+});
+</script>
+</body>
+</html>

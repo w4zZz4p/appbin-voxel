@@ -1,0 +1,465 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voxel House Build</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; font-family: system-ui, sans-serif; }
+  body { background: radial-gradient(ellipse at 50% 35%, #f4efe3 0%, #dfe8e6 55%, #b9cfd3 100%); }
+  canvas { display: block; }
+  #ui { position: fixed; left: 16px; bottom: 16px; display: flex; gap: 8px; align-items: center; color: #33423f; font-size: 13px; flex-wrap: wrap; }
+  #ui button { background: rgba(255,255,255,.55); color: #233; border: 1px solid rgba(0,0,0,.15); border-radius: 6px; padding: 6px 12px; cursor: pointer; font: inherit; }
+  #ui button:hover { background: rgba(255,255,255,.8); }
+  #bar { width: 160px; height: 4px; background: rgba(0,0,0,.12); border-radius: 2px; overflow: hidden; }
+  #bar i { display: block; height: 100%; width: 0; background: #3a6d50; }
+  #ui.hidden { display: none; }
+  label { display: flex; gap: 4px; align-items: center; user-select: none; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="ui">
+  <button id="replay">Replay (R)</button>
+  <button id="pause">Pause (Space)</button>
+  <label><input type="checkbox" id="loop" checked> Loop</label>
+  <div id="bar"><i></i></div>
+  <span id="info" style="opacity:.75"></span>
+</div>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// Voxel subdivision: each design unit is S×S×S small voxels. Override with ?res=1..4
+const S = Math.max(1, Math.min(4, parseInt(new URLSearchParams(location.search).get('res')) || 2));
+
+// ---------- helpers ----------
+function hash(x, z, s = 0) {
+  let h = Math.imul(x | 0, 374761393) ^ Math.imul(z | 0, 668265263) ^ Math.imul(s | 0, 1442695041);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  h ^= h >>> 16;
+  return (h >>> 0) / 4294967295;
+}
+function vnoise(x, z, sc, s = 0) {
+  x /= sc; z /= sc;
+  const xi = Math.floor(x), zi = Math.floor(z), xf = x - xi, zf = z - zi;
+  const u = xf * xf * (3 - 2 * xf), v = zf * zf * (3 - 2 * zf);
+  const a = hash(xi, zi, s), b = hash(xi + 1, zi, s), c = hash(xi, zi + 1, s), d = hash(xi + 1, zi + 1, s);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+let seed = 4242;
+const rnd = () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+const pick = a => a[Math.floor(rnd() * a.length)];
+
+// Fine-grid voxel store. Design coords are multiplied by S; dc() maps a fine cell back to design space.
+const V = new Map();
+const key = (x, y, z) => ((x + 32) * 1024 + (y + 32)) * 1024 + (z + 32);
+const fset = (x, y, z, c) => V.set(key(x, y, z), { x, y, z, c });
+const fhas = (x, y, z) => V.has(key(x, y, z));
+const fdel = (x, y, z) => V.delete(key(x, y, z));
+const dc = f => (f - (S - 1) / 2) / S;
+const col = (c, x, y, z) => typeof c === 'function' ? c(x, y, z) : Array.isArray(c) ? c[Math.floor(hash(x * 7 + y, z, 3) * c.length)] : c;
+function fbox(x0, y0, z0, x1, y1, z1, c) {
+  for (let x = x0; x <= x1; x++) for (let y = y0; y <= y1; y++) for (let z = z0; z <= z1; z++) fset(x, y, z, col(c, x, y, z));
+}
+const box = (x0, y0, z0, x1, y1, z1, c) => fbox(x0 * S, y0 * S, z0 * S, x1 * S + S - 1, y1 * S + S - 1, z1 * S + S - 1, c);
+// put a voxel in a plane: axis 'x' means the plane runs along x (wall at fixed z), 'z' along z (wall at fixed x)
+const pset = (axis, a, y, l, c) => axis === 'x' ? fset(a, y, l, c) : fset(l, y, a, c);
+const pdel = (axis, a, y, l) => axis === 'x' ? fdel(a, y, l) : fdel(l, y, a);
+
+// ---------- palette ----------
+const P = {
+  soil: [0x5b7a3a, 0x6b8c42],
+  grass: [0x7cbf5a, 0x72b552, 0x86c962, 0x69a94c],
+  base: [0x8a6440, 0x7a5636],
+  wall: [0xf0dfb8, 0xe3cfa2],
+  trim: 0xcaa56f,
+  trimDark: 0xa8834f,
+  frame: 0xc49a62,
+  glass: 0xa9c6cf,
+  door: [0xa47b4a, 0x946c3f],
+  deck: [0xc29a64, 0xb48b56],
+  roof: [0x2f5e44, 0x376a4e, 0x2a553e],
+  stone: [0xb8bcc0, 0xa4a8ad, 0xc8ccd0, 0x9a9ea3],
+  smoke: [0xffffff, 0xf0f0f0, 0xe6e6e6],
+  leaf: [0x4f9e45, 0x5cae4f, 0x438c3c],
+  trunk: [0x6a4423, 0x5a391d],
+  flower: [0xf28aa8, 0xffffff, 0xf3d36a, 0xd77ad6],
+};
+const wallC = (x, y) => P.wall[y % 2];
+const stoneC = (x, y, z) => P.stone[Math.floor(hash(Math.floor((x + z + (Math.floor(y / 2) % 2) * 2) / 3), y, 4) * 4)];
+
+const NX = 48, NZ = 42, FX = NX * S, FZ = NZ * S;
+
+// ---------- lawn + platform ----------
+for (let fx = 0; fx < FX; fx++) for (let fz = 0; fz < FZ; fz++) {
+  for (let fy = 0; fy < 2 * S; fy++) fset(fx, fy, fz, P.soil[Math.floor(fy / S)]);
+  const n = vnoise(dc(fx), dc(fz), 5, 3);
+  for (let fy = 2 * S; fy < 3 * S; fy++) fset(fx, fy, fz, P.grass[Math.min(3, Math.floor(n * 4))]);
+}
+box(3, 3, 2, 44, 3, 33, (x, y, z) => P.base[(Math.floor(x / 3)) % 2]);
+box(19, 2, 34, 22, 2, 41, stoneC); // path
+
+// ---------- walls ----------
+// main body x5..40 z4..22, left wing x5..16 forward to z28, floors y4..26
+box(5, 4, 4, 40, 26, 4, wallC);     // back
+box(40, 4, 4, 40, 26, 22, wallC);   // right
+box(5, 4, 4, 5, 26, 28, wallC);     // left (incl. wing)
+box(16, 4, 22, 40, 26, 22, wallC);  // main front (recessed)
+box(5, 4, 28, 16, 26, 28, wallC);   // wing front
+box(16, 4, 22, 16, 26, 28, wallC);  // wing right side
+// corner boards + floor belt
+for (const [x, z] of [[5, 4], [40, 4], [40, 22], [5, 28], [16, 28]]) box(x, 4, z, x, 26, z, P.trim);
+box(5, 15, 28, 16, 15, 28, P.trim);
+box(16, 15, 22, 16, 15, 28, P.trim);
+box(16, 15, 22, 40, 15, 22, P.trim);
+box(40, 15, 4, 40, 15, 22, P.trim);
+box(5, 15, 4, 5, 15, 28, P.trim);
+
+// ---------- openings ----------
+// mask(a, y) -> 'F' outer trim (protrudes), 'f' mullion, 'g' glass (recessed), 'd' door leaf, null = untouched
+function opening(axis, plane, dir, A0, A1, Y0, Y1, mask) {
+  for (let a = A0; a <= A1; a++) for (let y = Y0; y <= Y1; y++) {
+    const m = mask(a, y);
+    if (!m) continue;
+    for (let t = 0; t < S; t++) {
+      const l = plane * S + t, outer = dir > 0 ? t === S - 1 : t === 0;
+      if (m === 'g') { outer && S > 1 ? pdel(axis, a, y, l) : pset(axis, a, y, l, P.glass); }
+      else if (m === 'd') pset(axis, a, y, l, outer && (a + y) % 5 === 0 ? P.door[1] : P.door[0]);
+      else pset(axis, a, y, l, P.frame);
+    }
+    if (m === 'F') pset(axis, a, y, dir > 0 ? plane * S + S : plane * S - 1, P.trim);
+  }
+}
+const divs = (lo, hi, n) => { const s = new Set(); for (let i = 0; i <= n; i++) s.add(Math.round(lo + (hi - lo) * i / n)); return s; };
+function win(axis, plane, dir, a0, a1, y0, y1, cols = 3, rows = 2) {
+  const A0 = a0 * S, A1 = a1 * S + S - 1, Y0 = y0 * S, Y1 = y1 * S + S - 1;
+  const ca = divs(A0, A1, cols), cy = divs(Y0, Y1, rows);
+  opening(axis, plane, dir, A0, A1, Y0, Y1, (a, y) =>
+    a === A0 || a === A1 || y === Y0 || y === Y1 ? 'F' : ca.has(a) || cy.has(y) ? 'f' : 'g');
+  // sill
+  for (let a = A0 - 1; a <= A1 + 1; a++) pset(axis, a, Y0 - 1, dir > 0 ? plane * S + S : plane * S - 1, P.trim);
+}
+// arched window/door: rectangle up to the spring line, semicircle above, radial mullions
+function arch(axis, plane, dir, a0, a1, y0, ySpring, fanOnly = false) {
+  const A0 = a0 * S, A1 = a1 * S + S - 1, Y0 = y0 * S, YS = ySpring * S + S - 1;
+  const ac = (A0 + A1) / 2, R = (A1 - A0) / 2;
+  const ca = divs(A0, A1, 4), cy = divs(Y0, YS, 3);
+  opening(axis, plane, dir, A0, A1, Y0, Math.ceil(YS + R), (a, y) => {
+    if (y <= YS) {
+      if (fanOnly) return null;
+      if (a === A0 || a === A1 || y === Y0) return 'F';
+      return ca.has(a) || cy.has(y) ? 'f' : 'g';
+    }
+    const dx = a - ac, dy = y - YS, d = Math.hypot(dx, dy);
+    if (d > R + 0.5) return null;
+    if (d > R - 0.6 || (fanOnly && y === YS + 1)) return 'F';
+    if (Math.abs(d - R * 0.4) < 0.6) return 'f';
+    const th = Math.atan2(dy, dx);
+    for (let k = 1; k < 6; k++) if (Math.abs(th - k * Math.PI / 6) * d < 0.6 && d > R * 0.4) return 'f';
+    return 'g';
+  });
+}
+function door(axis, plane, dir, a0, a1, y0, y1) {
+  const A0 = a0 * S, A1 = a1 * S + S - 1, Y0 = y0 * S, Y1 = y1 * S + S - 1;
+  const mid = Math.floor((A0 + A1) / 2), glassY = Y1 - Math.floor((Y1 - Y0) * 0.35);
+  opening(axis, plane, dir, A0, A1, Y0, Y1, (a, y) => {
+    if (a === A0 || a === A1 || y === Y1) return 'F';
+    if (a === mid || a === mid + 1) return 'f';
+    if (y > glassY && y < Y1 - 1 && a !== A0 + 1 && a !== A1 - 1 && a !== mid - 1 && a !== mid + 2) return 'g';
+    return 'd';
+  });
+  pset(axis, mid - 1, Y0 + Math.floor((Y1 - Y0) / 2), dir > 0 ? plane * S + S : plane * S - 1, 0xe0c060);
+  pset(axis, mid + 2, Y0 + Math.floor((Y1 - Y0) / 2), dir > 0 ? plane * S + S : plane * S - 1, 0xe0c060);
+}
+
+// wing front: two bay windows with little roofs
+for (const [y0, y1] of [[7, 12], [18, 23]]) {
+  win('x', 28, 1, 7, 14, y0, y1, 4, 2);
+  for (let fz = 28 * S + S; fz < 31 * S; fz++) {           // bay roof (shed)
+    const fy = (y1 + 2) * S - Math.floor((fz - 28 * S - S) / 2);
+    for (let fx = 6 * S; fx < 16 * S; fx++) { fset(fx, fy, fz, col(P.roof, fx, fy, fz)); fset(fx, fy - 1, fz, P.roof[2]); }
+  }
+  box(6, y0 - 1, 29, 15, y0 - 1, 29, P.trim);
+}
+// main front
+door('x', 22, 1, 19, 23, 6, 13);
+win('x', 22, 1, 26, 29, 8, 12, 2, 2);
+win('x', 22, 1, 32, 36, 8, 12, 3, 2);
+arch('x', 22, 1, 19, 25, 18, 22);
+win('x', 22, 1, 29, 35, 18, 23, 3, 2);
+// right side
+win('z', 40, 1, 13, 17, 8, 12, 3, 2);
+win('z', 40, 1, 13, 17, 18, 23, 3, 2);
+// left side
+win('z', 5, -1, 9, 13, 8, 12, 3, 2);
+win('z', 5, -1, 9, 13, 18, 23, 3, 2);
+
+// ---------- porch ----------
+box(17, 4, 23, 39, 5, 31, (x, y, z) => P.deck[x % 2]);
+box(19, 4, 32, 22, 4, 32, P.deck[1]);                      // step
+for (const x of [17, 28, 38]) box(x, 6, 31, x, 13, 31, P.trim);
+box(38, 6, 23, 38, 13, 23, P.trim);
+function rail(axis, plane, a0, a1, y0, skip = () => false) {
+  const l = plane * S + Math.floor(S / 2);
+  for (let a = a0 * S; a <= a1 * S + S - 1; a++) {
+    if (skip(a)) continue;
+    pset(axis, a, y0 * S + 2 * S, l, P.trim);
+    pset(axis, a, y0 * S + 2 * S + 1, l, P.trim);
+    if (a % 2 === 0) for (let y = y0 * S; y < y0 * S + 2 * S; y++) pset(axis, a, y, l, P.frame);
+  }
+}
+rail('x', 31, 18, 37, 6, a => a >= 19 * S && a < 23 * S);
+rail('z', 38, 24, 30, 6);
+rail('z', 17, 29, 30, 6);
+// porch roof: shallow shed from the wall out over the posts
+for (let fz = 22 * S + S; fz < 33 * S; fz++) {
+  const fy = 17 * S + S - 1 - Math.floor((fz - 23 * S) * 0.2);
+  for (let fx = 16 * S + S; fx < 40 * S; fx++) {
+    const edge = fz === 33 * S - 1 || fx === 40 * S - 1;
+    fset(fx, fy, fz, edge ? P.trim : P.roof[Math.floor((fz - 23 * S) / 3) % 2]);
+    fset(fx, fy - 1, fz, edge ? P.trim : P.roof[2]);
+  }
+}
+// balcony over the porch
+box(18, 17, 23, 27, 17, 26, P.trim);
+rail('x', 26, 18, 27, 18);
+rail('z', 18, 23, 26, 18);
+rail('z', 27, 23, 26, 18);
+
+// ---------- roofs ----------
+// gable roof with ridge along `axis`; a = ridge-axis range, b = slope-axis range (both design, inclusive, incl. overhang)
+function roof(axis, a0, a1, b0, b1, y0) {
+  const B0 = b0 * S, B1 = b1 * S + S - 1, A0 = a0 * S, A1 = a1 * S + S - 1;
+  let last = 0;
+  for (let k = 0; B0 + k <= B1 - k; k++) last = k;
+  for (let k = 0; k <= last; k++) {
+    const fy = y0 * S + k;
+    for (let a = A0; a <= A1; a++) for (const b of new Set([B0 + k, B1 - k])) {
+      const edge = a === A0 || a === A1 || k === 0;
+      const c = edge ? P.trim : k >= last - 1 ? P.roof[2] : P.roof[Math.floor(k / 2) % 2] - (hash(a, b, k) > 0.85 ? 0x050505 : 0);
+      pset(axis === 'x' ? 'x' : 'z', a, fy, b, c);
+      pset(axis === 'x' ? 'x' : 'z', a, fy - 1, b, edge ? P.trim : P.roof[2]);
+    }
+  }
+  return { B0, B1, y0 };
+}
+// triangle of wall under a roof, in the slab at ridge-axis coordinate `plane`, limited to wall range w0..w1
+function gable(axis, plane, w0, w1, r) {
+  for (let k = 0; ; k++) {
+    const lo = Math.max(w0 * S, r.B0 + k + 1), hi = Math.min(w1 * S + S - 1, r.B1 - k - 1);
+    if (r.B0 + k > r.B1 - k) break;
+    const fy = r.y0 * S + k;
+    for (let b = lo; b <= hi; b++) for (let t = 0; t < S; t++) pset(axis === 'x' ? 'z' : 'x', b, fy, plane * S + t, wallC(0, fy));
+  }
+}
+const mainRoof = roof('x', 4, 41, 3, 23, 27);
+gable('x', 5, 4, 22, mainRoof);
+gable('x', 40, 4, 22, mainRoof);
+win('z', 40, 1, 12, 14, 30, 32, 2, 2);
+const wingRoof = roof('z', 12, 29, 4, 17, 27);
+gable('z', 28, 5, 16, wingRoof);
+arch('x', 28, 1, 8, 13, 27, 27, true);
+// dormers on the front slope
+for (const x0 of [20, 30]) {
+  box(x0, 29, 15, x0 + 4, 33, 19, wallC);
+  box(x0, 29, 19, x0, 33, 19, P.trim); box(x0 + 4, 29, 19, x0 + 4, 33, 19, P.trim);
+  win('x', 19, 1, x0 + 1, x0 + 3, 30, 33, 2, 2);
+  const r = roof('z', 14, 20, x0 - 1, x0 + 5, 34);
+  gable('z', 19, x0, x0 + 4, r);
+}
+// chimney on the right side
+box(41, 3, 6, 43, 26, 10, stoneC);
+box(41, 27, 7, 42, 40, 9, stoneC);
+box(40, 41, 6, 43, 41, 10, 0x7d8185);
+
+// ---------- lawn decoration ----------
+function blob(cx, cy, cz, r, pal, sy = 1, rough = 0.5) {
+  const R = r + 1;
+  for (let fx = Math.floor((cx - R) * S); fx <= Math.ceil((cx + R) * S); fx++)
+    for (let fy = Math.floor((cy - R * sy) * S); fy <= Math.ceil((cy + R * sy) * S); fy++)
+      for (let fz = Math.floor((cz - R) * S); fz <= Math.ceil((cz + R) * S); fz++) {
+        const d = Math.hypot(dc(fx) - cx, (dc(fy) - cy) / sy, dc(fz) - cz);
+        if (d <= r + (rnd() - 0.5) * rough) fset(fx, fy, fz, pick(pal));
+      }
+}
+blob(42, 44, 8, 1.4, P.smoke);
+blob(43.5, 46.5, 7, 1.9, P.smoke);
+blob(45.5, 49, 6, 2.2, P.smoke);
+// shrubs with flowers along the front of the platform
+for (const [x, z, r] of [[5, 35, 1.8], [9, 36, 1.5], [14, 35, 1.7], [27, 35, 1.7], [32, 36, 1.5], [37, 35, 1.8], [44, 30, 1.6], [45, 20, 1.6], [1, 20, 1.6]]) {
+  blob(x, 3 + r * 0.6, z, r, P.leaf, 0.8, 0.7);
+  for (let i = 0; i < 6; i++) {
+    const a = rnd() * Math.PI * 2, fx = Math.round((x + Math.cos(a) * r * 0.8) * S), fz = Math.round((z + Math.sin(a) * r * 0.8) * S);
+    fset(fx, Math.round((3 + r * 1.1) * S) - 1, fz, pick(P.flower));
+  }
+}
+// two trees
+function tree(x, z, h, r) { box(x, 3, z, x, 3 + h, z, P.trunk); blob(x, 3 + h + r * 0.6, z, r, P.leaf, 0.9, 0.9); blob(x + 1.5, 3 + h, z + 1, r * 0.7, P.leaf, 0.9, 0.9); }
+tree(1, 2, 9, 3.6);
+tree(46, 39, 6, 2.6);
+// grass tufts & flowers on the open lawn
+const TOP = 3 * S;
+for (let fx = 0; fx < FX; fx++) for (let fz = 0; fz < FZ; fz++) {
+  if (fhas(fx, TOP, fz)) continue;
+  const h = hash(fx, fz, 77);
+  if (h < 0.05) fset(fx, TOP, fz, pick(P.grass));
+  else if (h < 0.058) fset(fx, TOP, fz, pick(P.flower));
+}
+
+// ---------- instanced mesh ----------
+const vox = [...V.values()];
+const LAYER = 0.28 / S;
+const DUR = 0.55;
+for (const v of vox) {
+  const radial = Math.hypot(v.x - FX / 2, v.z - FZ / 2) / (FX * 0.75);
+  v.t0 = v.y * LAYER + (hash(v.x, v.z, v.y) * 0.6 + radial * 0.4) * 0.28 * 2.2;
+}
+vox.sort((a, b) => a.t0 - b.t0);
+const COUNT = vox.length;
+const BUILD_END = vox[COUNT - 1].t0 + DUR;
+document.getElementById('info').textContent = `${COUNT.toLocaleString()} voxels · F skip · H hides UI · drag to orbit · ?res=1-4`;
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.15;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const VIEW = 34;
+const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 1000);
+const controls = new OrbitControls(cam, renderer.domElement);
+controls.target.set(0, 15, 0);
+controls.enableDamping = true;
+controls.maxPolarAngle = Math.PI * 0.48;
+let userMoved = false;
+controls.addEventListener('start', () => { userMoved = true; });
+const ORBIT_R = 110, ORBIT_EL = 0.42;
+function swayCamera(time) {
+  const az = 0.5 + Math.sin(time * 0.15) * 0.35; // front-right, swaying side to side
+  cam.position.set(Math.sin(az) * Math.cos(ORBIT_EL) * ORBIT_R, 15 + Math.sin(ORBIT_EL) * ORBIT_R, Math.cos(az) * Math.cos(ORBIT_EL) * ORBIT_R);
+}
+swayCamera(0);
+function resize() {
+  const a = innerWidth / innerHeight;
+  const v = a < 1 ? VIEW / a : VIEW;
+  cam.left = -v * a; cam.right = v * a; cam.top = v; cam.bottom = -v;
+  cam.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+}
+addEventListener('resize', resize); resize();
+
+scene.add(new THREE.HemisphereLight(0xfffaf0, 0x6b7a5a, 1.6));
+const sun = new THREE.DirectionalLight(0xfff1dc, 2.3);
+sun.position.set(-40, 75, 55);
+sun.castShadow = true;
+sun.shadow.mapSize.set(4096, 4096);
+Object.assign(sun.shadow.camera, { left: -55, right: 55, top: 55, bottom: -55, near: 1, far: 220 });
+sun.shadow.bias = -0.0006;
+sun.shadow.normalBias = 0.02;
+scene.add(sun);
+
+// soft voxel edge texture
+const cv = document.createElement('canvas'); cv.width = cv.height = 32;
+const g = cv.getContext('2d');
+g.fillStyle = '#dadada'; g.fillRect(0, 0, 32, 32);
+g.fillStyle = '#ffffff'; g.fillRect(3, 3, 26, 26);
+const tex = new THREE.CanvasTexture(cv);
+tex.colorSpace = THREE.SRGBColorSpace;
+
+const mesh = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshStandardMaterial({ map: tex, roughness: 0.85 }), COUNT);
+mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+mesh.castShadow = mesh.receiveShadow = true;
+mesh.frustumCulled = false;
+const c3 = new THREE.Color();
+vox.forEach((v, i) => {
+  c3.setHex(v.c).offsetHSL(0, 0, (hash(v.x, v.z, v.y + 99) - 0.5) * 0.04);
+  mesh.setColorAt(i, c3);
+});
+const group = new THREE.Group();
+group.scale.setScalar(1 / S);
+group.position.set(-NX / 2 + 0.5 / S, 0.5 / S, -NZ / 2 + 0.5 / S);
+group.add(mesh);
+scene.add(group);
+
+const shadowPlane = new THREE.Mesh(new THREE.PlaneGeometry(400, 400), new THREE.ShadowMaterial({ opacity: 0.2 }));
+shadowPlane.rotation.x = -Math.PI / 2;
+shadowPlane.position.y = -0.01;
+shadowPlane.receiveShadow = true;
+scene.add(shadowPlane);
+
+// ---------- animation ----------
+const M = mesh.instanceMatrix.array;
+function setM(i, x, y, z, s) {
+  const o = i * 16;
+  M[o] = s; M[o + 5] = s; M[o + 10] = s;
+  M[o + 12] = x; M[o + 13] = y; M[o + 14] = z;
+}
+const easeOutCubic = p => 1 - Math.pow(1 - p, 3);
+const easeOutBack = p => { const c = 1.9; return 1 + (c + 1) * Math.pow(p - 1, 3) + c * Math.pow(p - 1, 2); };
+const DROP = 6 * S;
+
+let t = 0, first = 0, paused = false, doneAt = -1, camT = 0;
+function reset() {
+  for (let i = 0; i < COUNT; i++) setM(i, 0, -9999, 0, 0);
+  mesh.instanceMatrix.needsUpdate = true;
+  t = 0; first = 0; doneAt = -1;
+}
+reset();
+
+function step() {
+  let i = first;
+  while (i < COUNT && vox[i].t0 <= t) {
+    const v = vox[i];
+    const p = (t - v.t0) / DUR;
+    if (p >= 1) {
+      setM(i, v.x, v.y, v.z, 1);
+      if (i === first) first++;
+    } else {
+      const s = Math.max(0, easeOutBack(Math.min(1, p * 1.25)));
+      setM(i, v.x, v.y + (1 - easeOutCubic(p)) * DROP, v.z, s);
+    }
+    i++;
+  }
+  mesh.instanceMatrix.needsUpdate = true;
+}
+
+const bar = document.querySelector('#bar i');
+const loopBox = document.getElementById('loop');
+document.getElementById('replay').onclick = reset;
+const pauseBtn = document.getElementById('pause');
+const togglePause = () => { paused = !paused; pauseBtn.textContent = paused ? 'Play (Space)' : 'Pause (Space)'; };
+pauseBtn.onclick = togglePause;
+addEventListener('keydown', e => {
+  if (e.code === 'KeyR') reset();
+  else if (e.code === 'KeyF') t = BUILD_END;
+  else if (e.code === 'Space') { e.preventDefault(); togglePause(); }
+  else if (e.code === 'KeyH') document.getElementById('ui').classList.toggle('hidden');
+});
+
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.1);
+  if (!paused) {
+    t += dt; camT += dt;
+    if (first < COUNT) step();
+    else if (doneAt < 0) doneAt = t;
+    else if (loopBox.checked && t - doneAt > 5) reset();
+    bar.style.width = Math.min(100, (t / BUILD_END) * 100) + '%';
+    if (!userMoved) swayCamera(camT);
+  }
+  controls.update();
+  renderer.render(scene, cam);
+});
+</script>
+</body>
+</html>

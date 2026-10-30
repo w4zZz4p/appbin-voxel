@@ -1,0 +1,1313 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voxel Green House</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; font-family: system-ui, sans-serif; }
+  /* photo sky: clear blue overhead fading to a pale hazy horizon */
+  body { background: linear-gradient(#789edb 0%, #8fb2e2 30%, #b9cfe6 62%, #d8e3ec 100%); }
+  canvas { display: block; position: relative; z-index: 1; }
+  #night { position: fixed; inset: 0; opacity: 0; pointer-events: none; background: linear-gradient(#0a1430 0%, #1c2a4e 55%, #3b3552 100%); } /* sky=night fades this in */
+  #ui { z-index: 2; position: fixed; left: 16px; bottom: 16px; display: flex; gap: 8px; align-items: center; color: #2c3336; font-size: 13px; flex-wrap: wrap; }
+  #ui button { background: rgba(255,255,255,.5); color: #222; border: 1px solid rgba(0,0,0,.15); border-radius: 6px; padding: 6px 12px; cursor: pointer; font: inherit; }
+  #ui button:hover { background: rgba(255,255,255,.75); }
+  #ui select { background: rgba(255,255,255,.5); color: #222; border: 1px solid rgba(0,0,0,.15); border-radius: 6px; padding: 5px 6px; font: inherit; cursor: pointer; }
+  #bar { width: 160px; height: 4px; background: rgba(0,0,0,.15); border-radius: 2px; overflow: hidden; }
+  #bar i { display: block; height: 100%; width: 0; background: #d98a2e; }
+  #ui.hidden { display: none; }
+  body.dark #ui { color: #dfe6f2; }
+  body.dark #ui button, body.dark #ui select { background: rgba(20,30,55,.6); color: #e6ecf5; border-color: rgba(255,255,255,.2); }
+  label { display: flex; gap: 4px; align-items: center; user-select: none; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="night"></div>
+<div id="ui">
+  <button id="replay">Replay (R)</button>
+  <button id="pause">Pause (Space)</button>
+  <label><input type="checkbox" id="loop" checked> Loop</label>
+  <label><input type="checkbox" id="orbit" checked> Orbit</label>
+  <label>Intro <select id="intro"><option value="none">None</option><option value="blueprint">Blueprint</option></select></label>
+  <label>Order <select id="order"><option value="layers">Layers</option><option value="scan">3D print</option><option value="stages">Stages</option></select></label>
+  <label>Motion <select id="motion"><option value="drop">Drop</option><option value="grow">Grow</option><option value="swarm">Swarm</option><option value="tornado">Tornado</option><option value="slide">Slide</option><option value="pop">Pop</option><option value="tumble">Tumble</option><option value="squash">Squash</option><option value="flash">Flash</option></select></label>
+  <label>Detail <select id="res"><option value="1">1 · coarse</option><option value="2">2</option><option value="3">3</option><option value="4">4 · fine</option></select></label>
+  <label>Ending <select id="outro"><option value="reset">Reset</option><option value="demolish">Demolish</option><option value="pile">Pile &amp; rebuild</option></select></label>
+  <label>Sky <select id="sky"><option value="day">Day</option><option value="night">Day → night</option></select></label>
+  <div id="bar"><i></i></div>
+  <span id="info" style="opacity:.75"></span>
+</div>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+// Voxel subdivision: each design unit is S×S×S small voxels. Override with ?res=1..4
+const Q = new URLSearchParams(location.search);
+const S = Math.max(1, Math.min(4, parseInt(Q.get('res')) || 2));
+// Animation style (see SKILL.md, Animation modes). Set the scene's defaults here; ?intro= ?order= ?motion= ?outro= ?sky= override.
+//   intro:  none | blueprint (see-through outline of the finished model first, then it fills in)
+//   order:  layers (bottom up, jittered) | scan (3D printer: strict layers, sweeping head) | stages (by STAGE tag)
+//   motion: drop | grow | swarm | tornado | slide | pop | tumble | squash | flash (see POSE)
+//   outro:  reset (hold, then restart) | demolish (collapse in reverse build order, rebuild) | pile (heap up, rebuild from the heap)
+//   sky:    day | night (dusk falls a few seconds after the build completes)
+const ANIM = { intro: 'none', order: 'layers', motion: 'drop', outro: 'reset', sky: 'day' };
+for (const k in ANIM) ANIM[k] = Q.get(k) || ANIM[k];
+if (!Q.has('motion') && ANIM.order === 'scan') ANIM.motion = 'grow';
+
+// =====================================================================================================
+// ENGINE: helpers (keep as is)
+// =====================================================================================================
+function hash(x, z, s = 0) {
+  let h = Math.imul(x | 0, 374761393) ^ Math.imul(z | 0, 668265263) ^ Math.imul(s | 0, 1442695041);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  h ^= h >>> 16;
+  return (h >>> 0) / 4294967295;
+}
+function vnoise(x, z, sc, s = 0) {
+  x /= sc; z /= sc;
+  const xi = Math.floor(x), zi = Math.floor(z), xf = x - xi, zf = z - zi;
+  const u = xf * xf * (3 - 2 * xf), v = zf * zf * (3 - 2 * zf);
+  const a = hash(xi, zi, s), b = hash(xi + 1, zi, s), c = hash(xi, zi + 1, s), d = hash(xi + 1, zi + 1, s);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+let seed = 1234;
+const rnd = () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+const pick = a => a[Math.floor(rnd() * a.length)];
+
+// Fine-grid voxel store; e = false (lit), true (glowing), 'glass' (semi-transparent).
+// The +256 key offset matters: the island underside goes to negative y.
+// TAG marks what a voxel is so passes can treat it differently (see SKILL.md, Fire, smoke and steam).
+const V = new Map();
+const key = (x, y, z) => ((x + 256) * 1024 + (y + 256)) * 1024 + (z + 256);
+// STAGE groups voxels for ?order=stages: lower stages build first (0 ground, 1 walls, 2 openings, 3 roof, 4 props).
+let TAG = 0, STAGE = 0;
+const fset = (x, y, z, c, e = false) => V.set(key(x, y, z), { x, y, z, c, e, g: TAG, st: STAGE });
+const fdel = (x, y, z) => V.delete(key(x, y, z));
+const fhas = (x, y, z) => V.has(key(x, y, z));
+const dc = f => (f - (S - 1) / 2) / S;                 // fine cell -> design coordinate
+const col = (c, x, y, z) => typeof c === 'function' ? c(x, y, z) : Array.isArray(c) ? c[Math.floor(hash(x * 7 + y, z, 3) * c.length)] : c;
+function fbox(x0, y0, z0, x1, y1, z1, c, e = false) {
+  for (let x = x0; x <= x1; x++) for (let y = y0; y <= y1; y++) for (let z = z0; z <= z1; z++) fset(x, y, z, col(c, x, y, z), e);
+}
+const box = (x0, y0, z0, x1, y1, z1, c, e) => fbox(x0 * S, y0 * S, z0 * S, x1 * S + S - 1, y1 * S + S - 1, z1 * S + S - 1, c, e);
+function shell(x0, y0, z0, x1, y1, z1, c) {            // hollow box, one fine voxel thick (design units)
+  const X0 = x0 * S, X1 = x1 * S + S - 1, Y0 = y0 * S, Y1 = y1 * S + S - 1, Z0 = z0 * S, Z1 = z1 * S + S - 1;
+  for (let x = X0; x <= X1; x++) for (let y = Y0; y <= Y1; y++) for (let z = Z0; z <= Z1; z++)
+    if (x === X0 || x === X1 || y === Y0 || y === Y1 || z === Z0 || z === Z1) fset(x, y, z, col(c, x, y, z));
+}
+// plane helpers: axis 'x' = wall at fixed fine z (a runs along x), 'z' = wall at fixed fine x (a runs along z)
+const pset = (axis, a, y, l, c, e) => axis === 'x' ? fset(a, y, l, c, e) : fset(l, y, a, c, e);
+const pdel = (axis, a, y, l) => axis === 'x' ? fdel(a, y, l) : fdel(l, y, a);
+function disc(cx, cz, r0, r1, fy0, fy1, c, e) {        // ring/disc, design centre + radii, fine y range
+  for (let fx = Math.floor((cx - r1 - 1) * S); fx <= Math.ceil((cx + r1 + 1) * S); fx++)
+    for (let fz = Math.floor((cz - r1 - 1) * S); fz <= Math.ceil((cz + r1 + 1) * S); fz++) {
+      const d = Math.hypot(dc(fx) - cx, dc(fz) - cz);
+      if (d >= r0 && d <= r1) for (let fy = fy0; fy <= fy1; fy++) fset(fx, fy, fz, col(c, fx, fy, fz), e);
+    }
+}
+function blob(cx, cy, cz, r, pal, sy = 1, rough = 0.6, e = false) {   // noisy ellipsoid (leaves, bushes, smoke)
+  const R = r + 1;
+  for (let fx = Math.floor((cx - R) * S); fx <= Math.ceil((cx + R) * S); fx++)
+    for (let fy = Math.floor((cy - R * sy) * S); fy <= Math.ceil((cy + R * sy) * S); fy++)
+      for (let fz = Math.floor((cz - R) * S); fz <= Math.ceil((cz + R) * S); fz++) {
+        const d = Math.hypot(dc(fx) - cx, (dc(fy) - cy) / sy, dc(fz) - cz);
+        if (d <= r + (rnd() - 0.5) * rough) fset(fx, fy, fz, pick(pal), e);
+      }
+}
+// face-connected line between two design points (trunks, branches, poles): steps one axis at a time
+function limb(x0, y0, z0, x1, y1, z1, pal, thick = 1) {
+  const n = Math.ceil(Math.hypot(x1 - x0, y1 - y0, z1 - z0) * S * 1.5);
+  const put = (fx, fy, fz) => { for (let a = 0; a < thick; a++) for (let b = 0; b < thick; b++) fset(fx + a, fy, fz + b, col(pal, fx + a, fy, fz + b)); };
+  let px = Math.round(x0 * S), py = Math.round(y0 * S), pz = Math.round(z0 * S);
+  put(px, py, pz);
+  for (let i = 1; i <= n; i++) {
+    const t = i / n, fx = Math.round((x0 + (x1 - x0) * t) * S), fy = Math.round((y0 + (y1 - y0) * t) * S), fz = Math.round((z0 + (z1 - z0) * t) * S);
+    while (px !== fx) { px += Math.sign(fx - px); put(px, py, pz); }
+    while (pz !== fz) { pz += Math.sign(fz - pz); put(px, py, pz); }
+    while (py !== fy) { py += Math.sign(fy - py); put(px, py, pz); }
+  }
+}
+
+// =====================================================================================================
+// SCENE: sage-green stucco house, one and a half storeys under a green metal-tile gable roof. Front gable:
+// two teal doors, globe lamps, a recessed corner loggia upstairs; a canted bay on the left side; metal
+// chimney, roof ladder, skylights, antenna. Garden from the photos (paved parking with a red car, lavender,
+// mugo pines, roses on obelisks, rose arch, hose reels) plus an imagined back: raised terrace behind a
+// block wall, shed, veg beds, bench, birch and pine.
+// =====================================================================================================
+const P = {
+  lawn: [0x5f9a3c, 0x68a443, 0x578f36],
+  lawnDry: [0x8f9a52, 0x84914a],
+  worn: [0x9a9460, 0x8c8a58, 0x868a50],
+  weed: [0x4f8a32, 0x6a9a3a, 0x3d6e2a, 0x7fa848],
+  litter: [0x7a6a34, 0x8f7a3a, 0x6a5a2e, 0x5f7a30],
+  topsoil: [0x5a4a36, 0x4f412f],
+  under: [0x8a8478, 0x7c766b, 0x6e695f, 0x605b53],
+  wall: [0xa2b59c, 0x9eb198, 0xa8baa2, 0x9aad94],
+  surround: [0xe4e6e1, 0xdadcd6, 0xeceee9],
+  plinth: [0x8f8789, 0x878083, 0x968e90],
+  plinthJoint: 0x6a6365,
+  frame: 0xf4f4f0,
+  reveal: 0xcfd1cb,
+  sill: 0x5c6e60,
+  door: [0x1f4a4b, 0x1c4546],
+  doorLine: 0x143637,
+  doorFrame: 0x163a3b,
+  roof: [0x7a9a7a, 0x74947a, 0x80a07f],
+  roofLine: 0x5a735d,
+  roofCap: 0x5d7562,
+  soffit: 0xeef0ec,
+  gutter: 0xdfe3e2,
+  chimney: [0x506358, 0x58695f, 0x485a50],
+  pave: [0xa79d95, 0x9c928b, 0xb2a89f, 0x958b84],
+  paveJoint: 0x7c746e,
+  mulch: [0x6e5a44, 0x7a6449, 0x665240],
+  floor: 0x8a6a4c,
+  leaf: [0x3f7a35, 0x4a8a3c, 0x356a2e],
+  leafDark: [0x2f5a2c, 0x3b6b34, 0x2a5228],
+  pine: [0x2a4a2c, 0x335634, 0x243f26],
+  pineBark: [0x8a5a3a, 0x7a4e30],
+  birch: [0x6f9a3e, 0x7aa848, 0x5f8a36],
+  birchBark: [0xe8e6e0, 0xdedcd4, 0xe2e0da, 0x3a3a36],
+  apple: [0x4f8a3a, 0x5a9842, 0x47803a, 0x4f8a3a, 0xc0392b],
+  bark: [0x4a3a2c, 0x3d3024],
+  thuja: [0x3a6a2e, 0x447634, 0x335e2a],
+  box: [0x3a6a30, 0x427536, 0x33602b],
+  shrub: [0x4f8a3a, 0x5a9842, 0x47803a],
+  mugo: [0x2f4a2a, 0x38562f, 0x2a4226],
+  bigleaf: [0x9cbf3c, 0x8aad34, 0xb2cc52, 0x7a9a30],
+  rose: [0x4f7d3a, 0x5a8a42, 0x4a7536, 0x4f7d3a, 0xe890b0, 0xf2c0d0],
+  lavender: [0x8a78c0, 0x9a88cc, 0x7a68b0],
+  lavStem: [0x7d8f6c, 0x8a9a78],
+  block: [0x9a9690, 0x8f8b85, 0xa4a09a],
+  blockJoint: 0x6e6a66,
+  metal: 0xc4c8cc,
+  black: 0x1e2220,
+  arch: 0x2f6a46,
+  terracotta: [0xb06a42, 0xa05e3a],
+  wood: [0x8a6a48, 0x7a5c3c],
+  shed: [0x7a5a3e, 0x6e5036, 0x84623f],
+};
+const GLOW = 0xf6f2e6;             // milky globe lamps
+const GLASS = 0x5f9cc4;
+const tmp = new THREE.Color(), tmp2 = new THREE.Color();
+
+const CX = 29, CZ = 28;            // island centre (design units)
+const GY = 3, TOP = GY * S;        // ground surface is fine layer TOP-1; things stand from TOP
+const F = v => Math.round(v * S);  // design edge -> fine edge
+const ec = f => (f + 0.5) / S;     // fine cell -> design edge coordinate (design cell n spans [n, n+1))
+// Only fixtures emit light: lamp() registers a baked light tied to a glowing voxel `src` of its fixture (fine cells).
+const LAMPS = [];
+const lamp = (src, fx, fy, fz, o = {}) => LAMPS.push({ src, fx, fy, fz, color: 0xffc070, power: 1.6, r: 3.5, ...o });
+
+// ---------- ground plan (edge coordinates) ----------
+const inMain = (x, z) => x >= 20 && x < 40 && z >= 16 && z < 40;
+const inBay = (x, z) => x >= 17 && x < 20 && z >= 20 && z < 31 && x + z >= 40 && x - z >= -11;   // canted bay, left side
+const inFoot = (x, z) => inMain(x, z) || inBay(x, z);
+const terraceX = z => 48 + Math.sin(z / 5) * 0.7;
+const onTerrace = (x, z) => x >= terraceX(z) && z < 30;                     // raised back-right lawn
+const isRetain = (x, z) => onTerrace(x, z) && (x < terraceX(z) + 1 || z >= 29);
+const isPave = (x, z) => !inFoot(x, z) && ((z >= 40.3 && z < 52 + vnoise(x, 0, 4, 6) * 2 && x >= 9 + vnoise(z, 0, 4, 5) * 2.5 && x < 45 + vnoise(z, 1, 4, 7) * 2) || (x >= 40.3 && x < 46.5 && z >= 37));
+const isBedX = (x, z) => x >= 40.3 && x < 44.4 && z >= 13 && z < 37;       // lavender + mugo bed, right side
+const isBedB = (x, z) => z >= 12.2 && z < 16 && x >= 19 && x < 40.3;        // rose bed along the back
+const isWorn = (x, z) => z > 11 && z < 40.5 && Math.abs(x - 13.8 - Math.sin(z / 4.5) * 0.9) < 0.7 + vnoise(x, z, 2, 9) * 0.6;
+const flatHere = (x, z) => inFoot(x, z) || isPave(x, z) || isBedX(x, z) || isBedB(x, z) || (x > 15 && x < 47 && z > 12 && z < 44);
+const heightAt = (x, z) => onTerrace(x, z) ? 2 : (!flatHere(x, z) && vnoise(x, z, 6, 71) > 0.72 ? 0.5 : 0);
+const gy = (x, z) => GY + heightAt(x, z);
+
+// ---------- island: irregular lobed outline, rounded rim bumps, one iceberg rock mass underneath ----------
+const ISLAND = 7;
+const LOBES = [2, 3, 5].map((n, i) => ({ n, a: [3.2, 2.4, 1.3][i] * (0.6 + hash(n, i, ISLAND) * 0.8), p: hash(i, n, ISLAND + 1) * 6.283 }));
+function edgeR(x, z) {
+  const th = Math.atan2(z - CZ, x - CX), K = 14;
+  const u = (th / (2 * Math.PI) + 0.5) * K + (vnoise(th * 4 + 9, 3, 1, 8) - 0.5) * 0.5;
+  const k = Math.floor(u), f = u - k, bump = Math.sin(Math.PI * f) ** 2;
+  const amp = 0.6 + Math.pow(hash(((k % K) + K) % K, 0, 61 + ISLAND), 2) * 5;
+  const lobe = LOBES.reduce((s, l) => s + l.a * Math.sin(l.n * th + l.p), 0);
+  const ragged = (vnoise(x, z, 9, 62 + ISLAND) - 0.5) * 5 + (vnoise(x, z, 3.5, 63) - 0.5) * 1.6;
+  return 33 + lobe + ragged + amp * bump;
+}
+const LO = (CX - 52) * S, WD = 104 * S, OUT = 1 << 14;
+const bottom = new Int32Array(WD * WD).fill(OUT), top = new Int32Array(WD * WD).fill(-OUT);
+const idx = (fx, fz) => (fx - LO) * WD + (fz - LO);
+const inGrid = (fx, fz) => fx >= LO && fz >= LO && fx < LO + WD && fz < LO + WD;
+const botAt = (fx, fz) => inGrid(fx, fz) ? bottom[idx(fx, fz)] : OUT;
+const topAt = (fx, fz) => inGrid(fx, fz) ? top[idx(fx, fz)] : -OUT;
+for (let fx = LO; fx < LO + WD; fx++) for (let fz = LO; fz < LO + WD; fz++) {
+  const x = dc(fx), z = dc(fz), dx = x - CX, dz = z - CZ;
+  const e = edgeR(x, z) - Math.pow(dx ** 4 + dz ** 4, 0.25);
+  if (e < 0) continue;
+  top[idx(fx, fz)] = TOP - 1 + Math.round(heightAt(ec(fx), ec(fz)) * S);
+  const ra = Math.min(1, Math.hypot(x - CX - 2, z - CZ + 1) / 40);
+  const facet = (Math.floor(vnoise(x, z, 6, 51) * 5) / 5 - 0.4) * 5;
+  const depth = 2 + Math.min(1, e / 4) * (28 * Math.pow(1 - ra, 1.4) + facet * (1 - ra));
+  bottom[idx(fx, fz)] = TOP - 1 - Math.max(S, Math.round(depth * S));
+}
+const paveC = (fx, fz) => {
+  const id = Math.floor((fx + (fz % 2) * 1) / 2), hh = hash(id, fz, 75);
+  return hh > 0.93 ? P.paveJoint : hh < 0.015 ? 0x6f6862 : P.pave[Math.floor(hash(id, fz, 76) * P.pave.length)];   // the odd cracked paver
+};
+const blockC = (fx, fy, fz) => ((fz + fx + ((fy >> 1) & 1) * 2) % 4 === 0 || fy % 2 === 0 && hash(fx, fz, fy) < 0.3) ? P.blockJoint
+  : P.block[Math.floor(hash((fx + fz) >> 2, fy >> 1, 77) * 3)];
+function surfaceC(x, z, fx, fz) {
+  if (inFoot(x, z)) return P.floor;
+  if (isRetain(x, z)) return blockC(fx, 99, fz);
+  if (isPave(x, z)) return paveC(fx, fz);
+  if (isBedX(x, z) || isBedB(x, z)) return pick(P.mulch);
+  if (isWorn(x, z) && hash(fx, fz, 74) < 0.75) return pick(P.worn);
+  if (vnoise(x, z, 5, 72) > 0.74 && hash(fx, fz, 73) < 0.8) return pick(P.lawnDry);
+  return P.lawn[(Math.floor((x + z * 0.15) / 3) % 2 + 2) % 2 + (hash(fx, fz, 2) > 0.85 ? 1 : 0)];
+}
+STAGE = 0; TAG = 4;
+for (let fx = LO; fx < LO + WD; fx++) for (let fz = LO; fz < LO + WD; fz++) {
+  const b = botAt(fx, fz);
+  if (b === OUT) continue;
+  const t = topAt(fx, fz), x = ec(fx), z = ec(fz);
+  const nb = [[1, 0], [-1, 0], [0, 1], [0, -1]].map(([a, c]) => [botAt(fx + a, fz + c), topAt(fx + a, fz + c)]);
+  for (let fy = b; fy <= t; fy++) {
+    if (fy !== b && fy !== t && nb.every(([nbot, ntop]) => nbot < fy && ntop > fy)) continue;
+    let c;
+    if (isRetain(x, z) && fy >= TOP - 1 - S) c = blockC(fx, fy, fz);
+    else if (fy > t - 2 * S) c = surfaceC(x, z, fx, fz);
+    else c = P.under[Math.min(3, Math.floor((TOP - fy) / (6 * S)))];
+    fset(fx, fy, fz, c);
+  }
+  const lawnHere = !inFoot(x, z) && !isPave(x, z) && !isRetain(x, z) && !isBedX(x, z) && !isBedB(x, z);
+  if (lawnHere && hash(fx, fz, 41) < 0.03) fset(fx, t + 1, fz, pick(P.lawn));             // grass tufts
+  else if (lawnHere && hash(fx, fz, 42) < 0.004) fset(fx, t + 1, fz, pick([0xffffff, 0xf2d64a]));   // daisies, buttercups
+}
+
+TAG = 0;
+
+// ---------- house: walls, roof height map ----------
+const E = GY + 9, EF = F(E), SLOPE = 0.85;
+const X0 = F(20), X1 = F(40) - 1, Z0 = F(16), Z1 = F(40) - 1;               // outer wall cells
+const X0R = F(18.5), X1R = F(41.5) - 1, Z0R = F(15), Z1R = F(41) - 1;       // roof incl. overhang
+const DM = Math.floor((X1R - X0R) / 2);
+const LF = F(GY + 6.5);                                                     // loggia floor: first free layer
+const LX0 = F(21), LX1 = F(28) - 1, LZ0 = F(36);
+const inLoggia = (fx, fz) => fx >= LX0 && fx <= LX1 && fz >= LZ0 && fz <= Z1;
+const footAt = (fx, fy, fz) => inFoot(ec(fx), ec(fz)) && !(fy >= LF && inLoggia(fx, fz));
+const EBF = EF - Math.floor((ec(X0R - 1) - 16) * S * 0.5);                 // bay skirt eave, meets the main eave
+const RH = new Map(), rk = (fx, fz) => (fx + 512) * 4096 + (fz + 512);
+const rh = (fx, fz) => RH.get(rk(fx, fz))?.h;
+for (let fx = F(15); fx <= X1R; fx++) for (let fz = Z0R; fz <= Z1R; fz++) {
+  if (fx >= X0R) {
+    const d = Math.min(fx - X0R, X1R - fx);
+    RH.set(rk(fx, fz), { h: EF + Math.floor(d * SLOPE), type: fz >= Z0 && fz <= Z1 ? 1 : 2, d });
+  } else {
+    const x = ec(fx), z = ec(fz), d = Math.min(x - 16, (x + z - 40) / Math.SQRT2 + 1, (x - z + 11) / Math.SQRT2 + 1);
+    if (d >= 0) RH.set(rk(fx, fz), { h: EBF + Math.floor(d * S * 0.5), type: 3, d: Math.floor(d * S) });
+  }
+}
+STAGE = 3;
+// roof: metal tiles in courses, darker ridge/edge flashing, white soffits and barge boards
+for (const [k, r] of RH) {
+  const fx = Math.floor(k / 4096) - 512, fz = k % 4096 - 512, { h, type, d } = r;
+  const inside = inFoot(ec(fx), ec(fz));
+  const edgeZ = type !== 3 && (fz === Z0R || fz === Z1R);
+  const c = edgeZ || (type !== 3 && d >= DM - 1) ? P.roofCap
+    : d % 3 === 0 ? P.roofLine : P.roof[((fz >> 1) + (hash(fx >> 2, fz >> 1, 4) > 0.85 ? 1 : 0)) % 3];
+  fset(fx, h, fz, c); fset(fx, h - 1, fz, c);
+  if (type !== 3 && d >= DM && !edgeZ) fset(fx, h + 1, fz, P.roofCap);    // ridge roll
+  if (inside) { if (inLoggia(fx, fz)) fset(fx, h - 2, fz, P.soffit); continue; }
+  if (type === 1) for (let y = EF - 2; y <= h - 2; y++) fset(fx, y, fz, P.soffit);
+  else if (type === 3) for (let y = EBF - 2; y <= h - 2; y++) fset(fx, y, fz, P.soffit);
+  else { fset(fx, h - 2, fz, P.soffit); if (edgeZ) fset(fx, h - 3, fz, P.soffit); }
+}
+// gutters along every low eave edge
+for (let fx = F(15) - 1; fx <= X1R + 1; fx++) for (let fz = Z0R - 1; fz <= Z1R + 1; fz++) {
+  if (RH.has(rk(fx, fz))) continue;
+  for (const [a, b] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+    const n = RH.get(rk(fx + a, fz + b));
+    if (n && n.h === (n.type === 3 ? EBF : EF)) { fset(fx, n.h - 1, fz, P.gutter); break; }
+  }
+}
+STAGE = 1;
+// walls: every footprint cell with an outside neighbour, up to the roof underside
+const PL = Math.max(1, Math.round(0.9 * S));
+function wallC(fx, fy, fz) {
+  if (fy < TOP + PL) return (fx + fz) % 3 === 0 ? P.plinthJoint : P.plinth[Math.floor(hash(fx, fz, 22) * 3)];
+  return P.wall[Math.floor(hash(fx * 3 + fy, fz, 21) * P.wall.length)];
+}
+for (let fx = F(17); fx <= X1; fx++) for (let fz = Z0; fz <= Z1; fz++) {
+  const h = rh(fx, fz);
+  if (h === undefined) continue;
+  for (let fy = TOP; fy <= h - 2; fy++) {
+    if (!footAt(fx, fy, fz)) continue;
+    let edge = false;
+    for (let a = -1; a <= 1 && !edge; a++) for (let b = -1; b <= 1; b++) if (!footAt(fx + a, fy, fz + b)) { edge = true; break; }
+    if (edge) fset(fx, fy, fz, wallC(fx, fy, fz));
+  }
+}
+
+STAGE = 2;
+// ---------- openings ----------
+// surround band on the wall plane, white frame + glass one voxel in, reveal back to the room 3 voxels in.
+// dir = +1/-1 is the direction the wall faces; a0..a1, y0..y1 are design edges.
+function opening(axis, l, dir, a0, a1, y0, y1, o = {}) {
+  const A0 = F(a0), A1 = F(a1) - 1, Y0 = F(y0), Y1 = F(y1) - 1, B = o.B ?? Math.max(1, Math.round(S * 0.8));
+  for (let a = A0 - B; a <= A1 + B; a++) for (let y = Math.max(TOP, Y0 - B); y <= Y1 + B; y++)
+    if (a < A0 || a > A1 || y < Y0 || y > Y1) pset(axis, a, y, l, pick(P.surround));
+  if (!o.door && B > 0) for (let a = A0 - 1; a <= A1 + 1; a++) pset(axis, a, Y0 - 1, l + dir, P.sill);
+  for (let a = A0 - 1; a <= A1 + 1; a++) for (let y = Y0 - 1; y <= Y1 + 1; y++)
+    if (a < A0 || a > A1 || y < Y0 || y > Y1) pset(axis, a, y, l - dir, P.reveal);
+  const leaves = o.leaves || 1, mid = (A0 + A1) / 2, mull = new Set();
+  for (let k = 1; k < leaves; k++) mull.add(A0 + Math.round(k * (A1 - A0) / leaves));
+  for (let a = A0; a <= A1; a++) for (let y = Y0; y <= Y1; y++) {
+    pdel(axis, a, y, l);
+    const border = a === A0 || a === A1 || y === Y0 || y === Y1;
+    if (o.door) {
+      const c = border ? P.doorFrame : (y - Y0) % 4 === 3 || a === A0 + 1 || a === A1 - 1 ? P.doorLine : P.door[(a + y) % 2];
+      pset(axis, a, y, l - dir, c);
+      continue;
+    }
+    if (border || mull.has(a)) {
+      pset(axis, a, y, l - dir, P.frame);
+      if (border && !o.noRoom) { pset(axis, a, y, l - 2 * dir, P.reveal); pset(axis, a, y, l - 3 * dir, P.reveal); }
+      continue;
+    }
+    if (o.shutter && y >= Y1 - Math.max(1, Math.round(S * 0.6)) && (o.shutter === true || (o.shutter === 'R' ? a > mid : a < mid))) {
+      pset(axis, a, y, l - dir, 0xe8e8e4);
+      continue;
+    }
+    pset(axis, a, y, l - dir, GLASS, 'glass');
+    if (o.noRoom) continue;
+    const t = (y - Y0) / Math.max(1, Y1 - Y0), cur = o.curtain || '';
+    const drape = (cur.includes('L') && a - A0 <= 2) || (cur.includes('R') && A1 - a <= 2);
+    if (o.lit) pset(axis, a, y, l - 3 * dir, drape ? 0xffc070 : tmp.set(0xf0b860).lerp(tmp2.set(0xffe2a6), t).getHex(), true);
+    else pset(axis, a, y, l - 3 * dir, drape ? (o.curtainC ?? 0xece6da) : tmp.set(o.room ?? 0x4c5258).lerp(tmp2.set(0x8c949a), t * 0.8).getHex());
+    if (o.plant && y <= Y0 + 2 && Math.abs(a - mid) < 1.5) pset(axis, a, y, l - 2 * dir, y === Y0 + 1 ? 0xf0f0ec : pick(P.shrub));
+  }
+  if (o.door) pset(axis, o.hinge === 'R' ? A0 + 1 : A1 - 1, Y0 + Math.round(2.4 * S), l, P.metal);     // handle
+  if (o.bars) for (let a = A0 + 1; a < A1; a += 2) for (let y = Y0; y <= Y1; y++) pset(axis, a, y, l, P.black);
+  if (o.lit && !o.noRoom) {
+    const am = Math.round(mid), src = axis === 'x' ? [am, Y0 + 1, l - 3 * dir] : [l - 3 * dir, Y0 + 1, am];
+    const at = [mid, (Y0 + Y1) / 2, l + dir], [fx, fy, fz] = axis === 'x' ? at : [at[2], at[1], at[0]];
+    lamp(src, fx, fy, fz, { color: 0xffb860, power: 1, r: 9, wrap: 0, dir: axis === 'x' ? [0, 0, dir] : [dir, 0, 0], cone: 0 });
+  }
+}
+// globe wall lamp: bracket touching the wall, milky globe
+function globe(ax) {
+  const a = F(ax), y = F(GY + 5.5), l = Z1;
+  fset(a, y, l + 1, P.black); fset(a, y + 1, l + 1, P.black); fset(a, y - 1, l + 1, 0x4a524c);
+  fbox(a, y + 1, l + 2, a + 1, y + 2, l + 3, GLOW, true);
+  lamp([a, y + 1, l + 2], a + 0.5, y + 1.5, l + 2.5, { color: 0xffe0b0 });
+}
+
+// front gable (faces +z)
+opening('x', Z1, 1, 22.2, 23.6, GY + 1.8, GY + 4.8, { curtain: 'R', plant: true });
+opening('x', Z1, 1, 25.4, 27.5, GY + 0.5, GY + 5.5, { door: true });
+opening('x', Z1, 1, 32.0, 34.2, GY + 0.5, GY + 5.5, { door: true, hinge: 'R' });
+opening('x', Z1, 1, 31.6, 33.2, GY + 8.6, GY + 11.4, { curtain: 'LR', lit: true });
+[24.1, 28.0, 31.0, 35.0].forEach(globe);
+fbox(F(28.6), F(GY + 3.2), Z1 + 1, F(28.6), F(GY + 3.2) + 1, Z1 + 1, 0x222222);     // intercom by the left door
+// loggia: tiled slab with a lip, black railing, back wall with balcony door and barred window, side opening
+fbox(LX0, LF - 1, LZ0, LX1, LF - 1, Z1, (x, y, z) => (x + z) % 4 === 0 ? 0x8a847c : 0xa09a90);
+fbox(X0, LF - 1, Z1 + 1, LX1 + 1, LF - 1, Z1 + 1, P.sill);
+for (let fx = LX0; fx <= LX1; fx++) {
+  fset(fx, LF + 5, Z1, P.black);
+  if (fx % 2 === 0) for (let y = LF; y < LF + 5; y++) fset(fx, y, Z1, P.black);
+}
+opening('x', LZ0 - 1, 1, 21.7, 23.3, GY + 7.3, GY + 9.6, { B: 0, bars: true, curtain: 'L' });
+opening('x', LZ0 - 1, 1, 25.4, 27.4, GY + 6.6, GY + 11, { B: 0, room: 0x4a4038 });
+for (let fz = F(36.3); fz < F(39.2); fz++) for (let fy = LF; fy < LF + 4; fy++) {
+  fdel(X0, fy, fz); fdel(X0 + 1, fy, fz);
+  if (fz % 2 === 0) fset(X0, fy, fz, P.black);
+}
+fbox(F(21.8), F(GY + 11), LZ0, F(21.8) + 1, F(GY + 11), LZ0, P.black);              // floodlight
+fbox(F(21.8), F(GY + 11) - 1, LZ0, F(21.8) + 1, F(GY + 11) - 1, LZ0 + 1, GLOW, true);
+lamp([F(21.8), F(GY + 11) - 1, LZ0 + 1], F(21.8) + 0.5, F(GY + 11) - 1.5, LZ0 + 1.5, { color: 0xfff2dc, power: 2, r: 8, dir: [0, -1, 0.4], cone: 0.3 });
+disc(22.6, 37.4, 0, 0.5, LF, LF + 1, P.terracotta); blob(22.6, GY + 7.6, 37.4, 0.8, P.shrub, 1, 0.4);
+disc(24.4, 38.6, 0, 0.4, LF, LF, 0x3a6aa0); blob(24.4, GY + 7.2, 38.6, 0.6, P.leaf, 1, 0.3);
+fbox(F(26.2), LF, F(38.2), F(27.4), LF + 1, F(39.2), [0xb8aa96, 0x9a8a7a]);           // cushions on a low stool
+
+// right side (+x, photo 2): two windows
+opening('z', X1, 1, 27.6, 29.4, GY + 2, GY + 5, { curtain: 'L', plant: true, lit: true });
+opening('z', X1, 1, 21.3, 24.2, GY + 2.2, GY + 5, { shutter: true, curtain: 'R' });
+// back gable (faces -z, photo 3)
+opening('x', Z0, -1, 32.2, 35.5, GY + 1.8, GY + 5, { curtain: 'L' });
+opening('x', Z0, -1, 24.2, 27.1, GY + 1.8, GY + 5, { shutter: true, room: 0x2a2620 });
+opening('x', Z0, -1, 27.4, 29.4, GY + 8.4, GY + 11.4, { curtain: 'L', lit: true });
+opening('x', Z0, -1, 29.9, 31.9, GY + 8.4, GY + 11.4, { curtain: 'R', curtainC: 0xe4ded2 });
+fbox(F(30), TOP, Z0 - 2, F(30) + 1, TOP + 2, Z0 - 1, 0xa0a4a6);                     // gas meter box
+// bay (left side, photo 4): French window on the front face, tall narrow windows on the canted sides
+opening('z', F(17), -1, 23.6, 27.4, GY + 0.4, GY + 5.6, { leaves: 2, shutter: 'R', noRoom: true });
+function bayDiag(z0, z1) {
+  const Y0 = F(GY + 0.6), Y1 = F(GY + 5.4) - 1, B = Math.max(1, Math.round(S * 0.8));
+  for (let fx = F(17) + 1; fx < X0; fx++) for (let fz = F(z0) - B; fz < F(z1) + B; fz++) for (let fy = Y0 - B; fy <= Y1 + B; fy++) {
+    if (!fhas(fx, fy, fz)) continue;
+    const inWin = fz >= F(z0) && fz < F(z1) && fy >= Y0 && fy <= Y1;
+    if (!inWin) { fset(fx, fy, fz, pick(P.surround)); continue; }
+    const outer = [[1, 0], [-1, 0], [0, 1], [0, -1]].some(([a, b]) => !footAt(fx + a, fy, fz + b));
+    if (!outer) { fdel(fx, fy, fz); continue; }
+    const edgeCell = fz === F(z0) || fz === F(z1) - 1 || fy === Y0 || fy === Y1;
+    fset(fx, fy, fz, edgeCell ? P.frame : GLASS, edgeCell ? false : 'glass');
+  }
+}
+bayDiag(20.7, 22.3);
+bayDiag(28.7, 30.3);
+// living room seen through the bay: back wall, ceiling, sofa, floor lamp, rug
+fbox(X0 + 3, TOP, F(19), X0 + 3, F(GY + 6), F(32) - 1, 0xd9d2c4);
+fbox(X0 + 3, F(GY + 2.5), F(24), X0 + 3, F(GY + 4.2), F(26.5), 0x5a7a8a);              // a picture
+for (let fx = F(17); fx < X0 + 3; fx++) for (let fz = F(19); fz < F(32); fz++)
+  if (footAt(fx, TOP, fz) && !fhas(fx, F(GY + 6), fz)) fset(fx, F(GY + 6), fz, 0xe6e2da);
+fbox(X0, TOP, F(23.5), X0 + 2, TOP + 1, F(27.5) - 1, 0x7a7f86);
+fbox(X0 + 2, TOP + 2, F(23.5), X0 + 2, TOP + 3, F(27.5) - 1, 0x6f747a);
+fbox(F(18), TOP - 1, F(23), F(19.5), TOP - 1, F(28), 0xa0503a);                         // rug
+for (let y = TOP; y < TOP + 7; y++) fset(F(18.2), y, F(29.6), P.black);
+fbox(F(18.2) - 1, TOP + 7, F(29.6) - 1, F(18.2) + 1, TOP + 8, F(29.6) + 1, 0xf2e2b8, true);
+lamp([F(18.2), TOP + 7, F(29.6)], F(18.2), TOP + 7.5, F(29.6), { color: 0xffc888, power: 1.2, r: 6 });
+
+STAGE = 3;
+// ---------- roof furniture: skylights, chimney, ladder, antenna, downpipes ----------
+function skylight(x0, x1, z0, z1) {
+  const A0 = F(x0), A1 = F(x1) - 1, B0 = F(z0), B1 = F(z1) - 1;
+  for (let fx = A0 - 1; fx <= A1 + 1; fx++) for (let fz = B0 - 1; fz <= B1 + 1; fz++) {
+    const h = rh(fx, fz);
+    if (fx < A0 || fx > A1 || fz < B0 || fz > B1) { fset(fx, h, fz, 0x3d4842); continue; }   // flashing
+    const border = fx === A0 || fx === A1 || fz === B0 || fz === B1;
+    fset(fx, h, fz, 0x2a3036);
+    fset(fx, h + 1, fz, border ? 0x3b3f42 : GLASS, border ? false : 'glass');
+  }
+}
+skylight(33.2, 35.6, 27, 29);          // right slope (photo 2)
+skylight(24, 26.4, 22, 24);            // left slope (photo 4)
+skylight(25.6, 28, 28, 30);
+{ // metal-clad flue just right of the ridge, with a rain cap
+  const x0 = F(31), z0 = F(31.3), n = Math.max(2, Math.round(1.4 * S)), x1 = x0 + n, z1 = z0 + n;
+  let low = 1e9;
+  for (let fx = x0; fx <= x1; fx++) for (let fz = z0; fz <= z1; fz++) low = Math.min(low, rh(fx, fz));
+  const topY = rh(F(30), z0) + Math.round(2.8 * S);
+  fbox(x0, low - 1, z0, x1, topY, z1, P.chimney);
+  for (let fx = x0 - 1; fx <= x1 + 1; fx++) for (let fz = z0 - 1; fz <= z1 + 1; fz++) if (fx < x0 || fx > x1 || fz < z0 || fz > z1) fset(fx, rh(fx, fz), fz, P.roofCap);
+  fset(x0 + 1, topY + 1, z0 + 1, 0x3c4a42);
+  fbox(x0 - 1, topY + 2, z0 - 1, x1 + 1, topY + 2, z1 + 1, 0x3c4a42);
+}
+{ // roof safety ladder from the right gutter to the ridge, stair-filled so the rails stay face-connected
+  const rails = [F(29.2), F(30.6)];
+  for (let fx = X1R; fx >= F(31); fx--) {
+    for (const fz of rails) {
+      const h0 = rh(fx, fz), h1 = rh(fx - 1, fz) ?? h0;
+      for (let y = h0 + 1; y <= Math.max(h0, h1) + 1; y++) fset(fx, y, fz, P.metal);
+    }
+    if ((X1R - fx) % 3 === 1) for (let fz = rails[0] + 1; fz < rails[1]; fz++) fset(fx, rh(fx, fz) + 1, fz, P.metal);
+  }
+}
+{ // TV antenna on the ridge
+  const fx = X0R + DM, fz = F(26.5), y0 = rh(fx, fz) + 2, yT = y0 + Math.round(3.5 * S);
+  for (let y = y0; y <= yT; y++) fset(fx, y, fz, P.metal);
+  for (let a = -4; a <= 4; a++) fset(fx + a, yT, fz, P.metal);
+  for (let a = -4; a <= 4; a += 2) { fset(fx + a, yT, fz - 1, P.metal); fset(fx + a, yT, fz + 1, P.metal); }
+}
+function downpipe(gx, gz, gyF, wx, wz) {      // from below the gutter cell, jog to the wall, down to the ground
+  let x = gx, z = gz, y = gyF - 1;
+  fset(x, y, z, P.gutter); y--; fset(x, y, z, P.gutter);
+  while (x !== wx) { x += Math.sign(wx - x); fset(x, y, z, P.gutter); }
+  while (z !== wz) { z += Math.sign(wz - z); fset(x, y, z, P.gutter); }
+  for (; y >= TOP; y--) fset(x, y, z, P.gutter);
+  fset(x + Math.sign(gx - wx), TOP, z, P.gutter);                             // shoe
+}
+downpipe(X1R + 1, Z0 + 1, EF - 1, X1 + 1, Z0 + 1);
+downpipe(X0R - 1, F(19.4), EF - 1, X0 - 1, F(19.4));
+downpipe(X0R - 1, F(31.6), EF - 1, X0 - 1, F(31.6));
+downpipe(F(16) - 1, F(23.4), EBF - 1, F(17) - 1, F(23.4));
+for (let y = TOP + 2; y < F(GY + 4.5); y++) for (let fx = X1 - 3; fx <= X1; fx++)      // ivy creeping up the back-right corner
+  if (hash(fx, y, 88) < 0.75 - (y - TOP) / (S * 7)) fset(fx, y, Z0 - 1, pick(P.leafDark));
+
+STAGE = 4;
+// ---------- garden helpers ----------
+const CANOPY = [];
+function tree(x, z, h, r, pal = P.leaf, bark = P.bark) {
+  const base = gy(x, z);
+  const lx = (rnd() - 0.5) * h * 0.22, lz = (rnd() - 0.5) * h * 0.22, kx = x + lx * 0.35, kz = z + lz * 0.35, tx = x + lx, tz = z + lz;
+  limb(x, base, z, kx, base + h * 0.5, kz, bark, 2);
+  limb(kx, base + h * 0.5, kz, tx, base + h, tz, bark, 2);
+  const px = Math.round(x * S), pz = Math.round(z * S);
+  for (const [a, b] of [[-1, 0], [2, 0], [0, -1], [0, 2], [-1, 1], [2, 1]]) if (rnd() < 0.55) fset(px + a, F(base), pz + b, pick(P.bark));
+  const leaves = [...pal, ...pal, ...pal, ...pal, ...pal, ...pal, 0x8f8f3a];
+  const n = 3 + Math.floor(rnd() * 3);
+  for (let i = 0; i < n; i++) {
+    const main = i === 0, rr = main ? r : r * (0.5 + rnd() * 0.4);
+    const dx = main ? 0 : (rnd() - 0.5) * r * 1.6, dz = main ? 0 : (rnd() - 0.5) * r * 1.6, dy = main ? 0 : (rnd() - 0.65) * r;
+    limb(kx, base + h * 0.5, kz, tx + dx, base + h + dy - rr * 0.5, tz + dz, bark, 1);
+    blob(tx + dx, base + h + dy, tz + dz, rr, leaves, 0.75 + rnd() * 0.15, 1.5);
+    CANOPY.push([tx + dx, tz + dz, rr]);
+  }
+}
+function cone(x, z, h, r0, pal = P.thuja, base = gy(x, z)) {        // thuja / topiary column
+  limb(x, base, z, x, base + 1, z, P.bark, 1);
+  for (let fy = F(base + 0.5); fy < F(base + h); fy++) {
+    const t = (fy / S - base - 0.5) / (h - 0.5), r = r0 * Math.pow(1 - t, 0.85) + 0.3;
+    for (let fx = Math.floor((x - r - 1) * S); fx <= Math.ceil((x + r + 1) * S); fx++)
+      for (let fz = Math.floor((z - r - 1) * S); fz <= Math.ceil((z + r + 1) * S); fz++)
+        if (Math.hypot(dc(fx) - x, dc(fz) - z) <= r + (rnd() - 0.5) * 0.5) fset(fx, fy, fz, pick(pal));
+  }
+}
+const shrub = (x, z, r, pal = P.shrub, sy = 0.8) => blob(x, gy(x, z) + r * sy * 0.55, z, r, pal, sy, 0.8);
+function hedge(x0, x1, z0, z1, hgt, pal = P.box) {
+  for (let fx = F(x0); fx < F(x1); fx++) for (let fz = F(z0); fz < F(z1); fz++) {
+    const edge = fx === F(x0) || fx === F(x1) - 1 || fz === F(z0) || fz === F(z1) - 1;
+    if (edge && hash(fx, fz, 91) < 0.3) continue;
+    const g = topAt(fx, fz) + 1, n = Math.round(hgt * S * (0.85 + vnoise(fx, fz, 3, 92) * 0.3));
+    for (let y = g; y < g + n; y++) fset(fx, y, fz, pick(pal));
+  }
+}
+
+// ---------- front: paved parking, steps, potted thuja, hedge, car, bins ----------
+for (const [x0, x1] of [[24.9, 28.0], [31.5, 34.7]]) {
+  fbox(F(x0), TOP, Z1 + 1, F(x1) - 1, TOP, Z1 + F(1.6), (x, y, z) => paveC(x, z));
+  fbox(F(x0) + 1, TOP + 1, Z1 + 1, F(x1) - 2, TOP + 1, Z1 + 1, 0x4a3a2c);               // doormat
+}
+disc(29.9, 41.1, 0, 0.6, TOP, TOP + 1, P.terracotta);
+cone(29.9, 41.1, 4.2, 0.85, P.thuja, GY + 1);
+hedge(20.2, 24.6, 40.3, 41.4, 1.3);
+hedge(44.6, 46.2, 29, 36.5, 1.5);
+{ // red hatchback, nose to the house
+  const x0 = F(13.5), z0 = F(43.5), L = 14, Wd = 6, body = 0xa3232b, T = TOP;
+  for (const [i, j] of [[2, 0], [3, 0], [10, 0], [11, 0], [2, Wd - 1], [3, Wd - 1], [10, Wd - 1], [11, Wd - 1]]) { fset(x0 + j, T, z0 + i, 0x141414); fset(x0 + j, T + 1, z0 + i, 0x141414); }
+  for (let i = 0; i < L; i++) for (let j = 0; j < Wd; j++) {
+    fset(x0 + j, T + 2, z0 + i, i === 0 || i === L - 1 ? 0x2a2a2a : body);
+    if (i > 0 && i < L - 1) fset(x0 + j, T + 3, z0 + i, body);
+    if (i >= 3 && i <= 11) {
+      const side = j === 0 || j === Wd - 1, glassRow = i === 3 || i === 11 || (side && i > 3 && i < 11);
+      fset(x0 + j, T + 4, z0 + i, glassRow ? GLASS : 0x3a2a22, glassRow ? 'glass' : false);
+      fset(x0 + j, T + 5, z0 + i, i === 11 ? 0x1e1e1e : body);
+    }
+  }
+  for (const j of [1, Wd - 2]) { fset(x0 + j, T + 3, z0, 0xf2f0e0, true); fset(x0 + j, T + 3, z0 + L - 1, 0xd03020, true); }
+  fset(x0 + 3, T + 6, z0 + 9, 0x1e1e1e);                                       // roof fin antenna
+}
+{ // lamp post at the far corner of the parking
+  const fx = F(22.5), fz = F(48.5);
+  fbox(fx - 1, TOP, fz - 1, fx + 1, TOP, fz + 1, 0x3a3e3c);
+  for (let y = TOP + 1; y < TOP + F(7); y++) fset(fx, y, fz, P.black);
+  const hy = TOP + F(7);
+  fbox(fx - 1, hy, fz - 1, fx + 1, hy + 1, fz + 1, GLOW, true);
+  fbox(fx - 1, hy + 2, fz - 1, fx + 1, hy + 2, fz + 1, P.black); fset(fx, hy + 3, fz, P.black);
+  lamp([fx, hy, fz], fx, hy + 0.5, fz, { power: 1.4, r: 14 });
+}
+for (const [x, lid] of [[42.2, 0x2e6b3a], [43.4, 0x3a3e40]]) {                 // wheelie bins
+  fbox(F(x), TOP, F(38.4), F(x) + 1, TOP + 3, F(38.4) + 1, 0x3a3e40);
+  fbox(F(x), TOP + 4, F(38.4), F(x) + 1, TOP + 4, F(38.4) + 1, lid);
+}
+cone(12.6, 36.6, 5.5, 1.1);
+cone(10.4, 33, 6.5, 1.3);
+cone(8.6, 37.6, 4.6, 0.9);
+shrub(5.5, 35, 2.2);
+shrub(5, 41.5, 2.5, P.leafDark);
+shrub(17.5, 40.6, 1.1, P.box);
+tree(6.5, 46, 10, 4.2, P.leaf);
+
+// ---------- right side (photo 2): lavender, mugo pines, big-leaf shrub, finial, log stack ----------
+for (let fx = F(40.6); fx < F(44.2); fx++) for (let fz = F(25); fz < F(36.8); fz++) {
+  if (vnoise(fx, fz, 2.2, 93) < 0.38 || hash(fx, fz, 94) > 0.7) continue;
+  const g = topAt(fx, fz) + 1, n = 1 + Math.floor(hash(fx, fz, 95) * 2);
+  for (let k = 0; k < n; k++) fset(fx, g + k, fz, pick(P.lavStem));
+  fset(fx, g + n, fz, pick(P.lavender));
+}
+shrub(42.6, 16.6, 1.5, P.mugo, 0.7);
+shrub(42.9, 20.1, 2.0, P.mugo, 0.65);
+shrub(42.4, 23.2, 1.3, P.mugo, 0.75);
+shrub(43.4, 13.8, 2.1, P.bigleaf, 0.9);
+{ // twisted black garden finial
+  const fx = F(43.2), fz = F(25.6);
+  fbox(fx, TOP, fz, fx + 1, TOP, fz + 1, 0x2a2e2c);
+  for (let y = TOP + 1; y < TOP + 5; y++) { fset(fx + (y % 2), y, fz, P.black); fset(fx + 1 - (y % 2), y, fz + 1, P.black); fset(fx, y, fz + (y % 2), P.black); }
+  fset(fx, TOP + 5, fz, P.black);
+}
+for (let fz = F(17); fz < F(19.5); fz++) for (let fy = TOP; fy < TOP + 4; fy++) for (let fx = X1 + 1; fx <= X1 + 2; fx++)   // log stack under the eave
+  fset(fx, fy, fz, hash(fx, fz, fy) < 0.25 ? 0x5a4430 : pick([0xb08a5a, 0x9a7448, 0xa47e50]));
+
+// ---------- back (photo 3): roses on black obelisks, lilies; raised terrace, birch, veg beds, shed ----------
+for (const x of [23.2, 27.4, 32.4, 36.6]) {
+  const cx = F(x), cz = F(14), r = hash(cx, cz, 96);
+  blob(x, GY + 0.6 + r * 0.6, 14, 0.7 + r * 0.4, P.rose, 1.1, 1.1);              // rose growing up inside the cage
+  for (const [a, b] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) for (let y = TOP; y < TOP + 8; y++) fset(cx + a, y, cz + b, P.black);
+  for (const yy of [TOP + 4, TOP + 7]) for (const [a, b] of [[0, -1], [0, 1], [-1, 0], [1, 0]]) fset(cx + a, yy, cz + b, P.black);
+  for (const [a, b] of [[0, 0], [0, -1], [0, 1], [-1, 0], [1, 0]]) fset(cx + a, TOP + 8, cz + b, P.black);
+  fset(cx, TOP + 9, cz, P.black); fset(cx, TOP + 10, cz, 0x3a3e3c);
+}
+shrub(20.6, 14.2, 1.1, P.rose);
+shrub(39.2, 13.6, 1.3, P.rose);
+for (let fx = F(33.5); fx < F(38.5); fx++) for (let fz = F(12.6); fz < F(15.4); fz++) {
+  if (hash(fx, fz, 97) > 0.35) continue;
+  const g = topAt(fx, fz) + 1, n = 2 + Math.floor(hash(fx, fz, 98) * 2);
+  for (let k = 0; k < n; k++) fset(fx, g + k, fz, pick(P.weed));
+  if (hash(fx, fz, 99) < 0.4) fset(fx, g + n, fz, pick([0xf07a2a, 0xe8662a, 0xf2a43a]));
+}
+fbox(F(29.4), TOP, F(12.6), F(29.4) + 1, TOP + 2, F(12.6) + 1, 0x3a8a4a);                // watering can
+fset(F(29.4) + 2, TOP + 2, F(12.6), 0x3a8a4a);
+// raised terrace on the back-right: block retaining wall, birch, shrubs
+tree(50.5, 6.5, 12, 2.8, P.birch, P.birchBark);
+tree(55, 11, 10.5, 2.4, P.birch, P.birchBark);
+shrub(50.4, 25.5, 1.8, P.shrub);
+shrub(52.8, 8.4, 2.2, P.leafDark);
+// back lawn: apple tree, bench, raised veg beds, wheelbarrow, pine and shed on the left
+tree(17.5, 5.5, 7, 2.6, P.apple);
+{
+  const x0 = F(26), z0 = F(6.5);
+  fbox(x0, TOP + 2, z0, x0 + 6, TOP + 2, z0 + 2, P.wood);
+  fbox(x0, TOP + 3, z0, x0 + 6, TOP + 5, z0, P.wood);
+  for (const a of [0, 6]) for (const b of [0, 2]) for (let y = TOP; y < TOP + 2; y++) fset(x0 + a, y, z0 + b, 0x2a2a2a);
+}
+for (const [x0, z0] of [[34, 3.2], [34, 7.2]]) {
+  const X0b = F(x0), X1b = F(x0 + 4.5) - 1, Z0b = F(z0), Z1b = F(z0 + 2.5) - 1;
+  for (let fx = X0b; fx <= X1b; fx++) for (let fz = Z0b; fz <= Z1b; fz++) {
+    const g = topAt(fx, fz) + 1, rim = fx === X0b || fx === X1b || fz === Z0b || fz === Z1b;
+    fset(fx, g, fz, rim ? P.wood[0] : 0x6a5640);
+    if (rim) fset(fx, g + 1, fz, P.wood[1]);
+    else {
+      const n = 1 + Math.floor(hash(fx, fz, 71) * 2);
+      for (let k = 1; k <= n; k++) fset(fx, g + k, fz, pick([0x4f9a3a, 0x6ab84a, 0x3f8a30]));
+      if (hash(fx, fz, 72) < 0.1) fset(fx, g + n + 1, fz, pick([0xd83a2a, 0xf2a43a]));
+    }
+  }
+}
+tree(11.5, 10, 14, 3.2, P.pine, P.pineBark);
+tree(51.5, 43, 9, 3.4, P.leafDark);
+{ // garden shed with a mono-pitch roof, door toward the house
+  const x0 = F(5), x1 = F(9.5) - 1, z0 = F(14), z1 = F(18) - 1, H = F(GY + 4.5);
+  const roofY = fx => H + 1 + Math.floor((x1 + 1 - fx) * 0.35);
+  for (let fx = x0; fx <= x1; fx++) for (let fz = z0; fz <= z1; fz++) {
+    if (fx !== x0 && fx !== x1 && fz !== z0 && fz !== z1) continue;
+    for (let fy = TOP; fy <= roofY(fx) - 2; fy++) fset(fx, fy, fz, P.shed[Math.floor(hash(fx + fz, 0, 78) * 3)]);
+  }
+  for (let fx = x0 - 1; fx <= x1 + 1; fx++) for (let fz = z0 - 1; fz <= z1 + 1; fz++) { fset(fx, roofY(fx), fz, 0x8a3b32); fset(fx, roofY(fx) - 1, fz, 0x7a332c); }
+  fbox(x1, TOP, z0 + 2, x1, TOP + 7, z0 + 4, 0x5a4030);
+  fset(x1 + 1, TOP + 4, z0 + 4, P.black);
+  fbox(x0 + 2, TOP + 4, z1, x0 + 4, TOP + 5, z1, GLASS, 'glass');
+}
+{ // wheelbarrow by the shed
+  const x0 = F(11), z0 = F(16);
+  fbox(x0, TOP + 1, z0, x0 + 2, TOP + 2, z0 + 1, 0x3a7a4a);
+  fset(x0 + 3, TOP, z0, 0x1e1e1e); fset(x0 + 3, TOP + 1, z0, 0x1e1e1e);
+  fset(x0, TOP, z0, 0x555555); fset(x0, TOP, z0 + 1, 0x555555);
+  fset(x0 - 1, TOP + 2, z0, 0x8a6a48); fset(x0 - 1, TOP + 2, z0 + 1, 0x8a6a48);
+}
+
+// ---------- left side (photo 4): rose arch, roses, potted standard tree, hose reels ----------
+{
+  const R = 1.4, cx = 13.9, sp = GY + 4.2;
+  for (const z of [16.6, 17.8]) {
+    limb(cx - R, GY, z, cx - R, sp, z, P.arch);
+    limb(cx + R, GY, z, cx + R, sp, z, P.arch);
+    let px = cx + R, py = sp;
+    for (let i = 1; i <= 12; i++) { const th = Math.PI * i / 12, nx = cx + R * Math.cos(th), ny = sp + R * Math.sin(th); limb(px, py, z, nx, ny, z, P.arch); px = nx; py = ny; }
+  }
+  for (const [x, y] of [[cx - R, GY + 2], [cx + R, GY + 3.2], [cx, sp + R]]) limb(x, y, 16.6, x, y, 17.8, P.arch);
+  blob(cx - R, GY + 2.2, 17.2, 0.9, P.rose, 1.4, 0.8);
+  blob(cx - R + 0.4, sp + 0.8, 17.2, 0.8, P.rose, 1, 0.8);
+}
+shrub(16, 33.5, 1.0, P.rose);
+shrub(16.3, 36.6, 0.9, P.rose);
+shrub(15.8, 19.6, 1.3, P.rose);
+disc(15.4, 29.1, 0, 0.55, TOP, TOP + 2, 0xf2f2ee);
+limb(15.4, GY + 1, 29.1, 15.4, GY + 3.2, 29.1, P.bark);
+blob(15.4, GY + 3.8, 29.1, 1.0, P.leaf, 1, 0.5);
+for (const [z, rim, hose] of [[34.6, 0xf2c21a, 0x2a7ac0], [37.6, 0xe86a1a, 0xe86a1a]]) {
+  const fx = F(18.4), fz = F(z);
+  fset(fx, TOP, fz, 0x333333); fset(fx, TOP, fz + 2, 0x333333);
+  for (let y = TOP + 1; y <= TOP + 3; y++) for (let a = 0; a <= 2; a++) {
+    fset(fx + a, y, fz, rim); fset(fx + a, y, fz + 2, rim);
+    fset(fx + a, y, fz + 1, (a === 1 && y === TOP + 2) ? 0x333333 : hose);
+  }
+}
+
+// =====================================================================================================
+// ENGINE: connectivity, meshes, lighting, animation (keep; tune lights/camera to the scene)
+// =====================================================================================================
+// scruff: weeds at the foot of anything standing in the lawn, leaf litter under trees. Strengths 0 = off.
+const SCRUFF = { weeds: 0.45, litter: 0.4 };
+{
+  const add = [];
+  for (let fx = LO; fx < LO + WD; fx++) for (let fz = LO; fz < LO + WD; fz++) {
+    const t = topAt(fx, fz);
+    if (t === -OUT || fhas(fx, t + 1, fz)) continue;
+    const foot = [[1, 0], [-1, 0], [0, 1], [0, -1]].some(([a, c]) => fhas(fx + a, t + 1, fz + c) && fhas(fx + a, t + 2, fz + c));
+    if (foot && hash(fx, fz, 81) < SCRUFF.weeds) {
+      const n = hash(fx, fz, 82) < 0.4 ? 2 : 1;
+      for (let k = 1; k <= n; k++) add.push([fx, t + k, fz, pick(P.weed)]);
+      if (hash(fx, fz, 83) < 0.12) add.push([fx, t + n + 1, fz, pick([0xf2d64a, 0xffffff, 0xc89ad8])]);
+    }
+  }
+  for (const [cx, cz, r] of CANOPY)
+    for (let fx = Math.floor((cx - r) * S); fx <= Math.ceil((cx + r) * S); fx++) for (let fz = Math.floor((cz - r) * S); fz <= Math.ceil((cz + r) * S); fz++) {
+      const d = Math.hypot(dc(fx) - cx, dc(fz) - cz) / r, v = V.get(key(fx, topAt(fx, fz), fz));
+      if (v && d < 1.1 && hash(fx, fz, 84) < SCRUFF.litter * (1.1 - d)) v.c = pick(P.litter);
+    }
+  for (const [x, y, z, c] of add) fset(x, y, z, c);
+}
+
+// keep only what is connected (face to face) to one seed on the ground surface
+{
+  const seen = new Set(), stack = [];
+  const k0 = key(Math.round(CX * S), topAt(Math.round(CX * S), Math.round((CZ + 12) * S)), Math.round((CZ + 12) * S));
+  seen.add(k0); stack.push(V.get(k0));
+  const D = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+  while (stack.length) {
+    const v = stack.pop();
+    for (const [dx, dy, dz] of D) {
+      const k = key(v.x + dx, v.y + dy, v.z + dz);
+      if (!seen.has(k) && V.has(k)) { seen.add(k); stack.push(V.get(k)); }
+    }
+  }
+  let removed = 0;
+  const lost = {};                 // where voxels came loose, bucketed by 4-unit design cells (read window.__lost)
+  for (const k of [...V.keys()]) if (!seen.has(k)) { const v = V.get(k), b = `${v.x / S >> 2 << 2},${v.y / S >> 2 << 2},${v.z / S >> 2 << 2}`; lost[b] = (lost[b] || 0) + 1; V.delete(k); removed++; }
+  window.__lost = lost;
+  console.info(`connectivity: removed ${removed} floating voxels`);
+}
+// only lamps whose fixture still glows emit light
+const bakedLights = LAMPS.filter(l => V.get(key(...l.src))?.e === true);
+if (bakedLights.length < LAMPS.length) console.warn(`lamps without a glowing source voxel dropped: ${LAMPS.length - bakedLights.length}`, LAMPS.filter(l => !bakedLights.includes(l)));
+
+const vox = [...V.values()];
+const LAYER = 0.28 / S;            // seconds per fine layer
+const SCAN = LAYER * 1.2;          // seconds per layer when printing (no jitter, so a little slower)
+const DURS = { drop: 0.55, grow: 0.45, swarm: 1.6, tornado: 1.8, slide: 0.7, pop: 0.6, tumble: 0.9, squash: 0.75, flash: 0.9 };   // motion duration per voxel
+let minY = 1e9, maxY = -1e9, minX = 1e9, maxX = -1e9, minZ = 1e9, maxZ = -1e9;
+for (const v of vox) {
+  minY = Math.min(minY, v.y); maxY = Math.max(maxY, v.y); minX = Math.min(minX, v.x); maxX = Math.max(maxX, v.x);
+  minZ = Math.min(minZ, v.z); maxZ = Math.max(maxZ, v.z);
+}
+const layerT = (v, y0) => (v.y - y0) * LAYER + (hash(v.x, v.z, v.y) * 0.6 + Math.hypot(v.x - CX * S, v.z - CZ * S) / (2 * CX * S * 0.75) * 0.4) * 0.28 * 2.2;
+const COUNT = vox.length;
+let DUR, BUILD_END;
+// (re)compute start times for ANIM.order and re-sort; called again when the UI changes the order or motion
+function plan() {
+  if (ANIM.order === 'scan') {
+    // head rasters each layer in rows along z, alternating direction like a printer nozzle
+    const nx = maxX - minX + 1, nz = maxZ - minZ + 1;
+    for (const v of vox) {
+      const row = v.z - minZ, along = row % 2 ? maxX - v.x : v.x - minX;
+      v.t0 = (v.y - minY) * SCAN + (row + along / nx) / nz * SCAN * 0.9;
+    }
+  } else if (ANIM.order === 'stages') {
+    // each stage builds bottom-up from its own lowest voxel; the next starts when this one is ~80% done
+    const groups = new Map();
+    for (const v of vox) (groups.get(v.st) || groups.set(v.st, []).get(v.st)).push(v);
+    let start = 0;
+    for (const s of [...groups.keys()].sort((a, b) => a - b)) {
+      const g = groups.get(s), y0 = g.reduce((m, v) => Math.min(m, v.y), 1e9);
+      let span = 0;
+      for (const v of g) { const lt = layerT(v, y0); v.t0 = start + lt; span = Math.max(span, lt); }
+      start += span * 0.8 + 0.3;
+    }
+  } else for (const v of vox) v.t0 = layerT(v, minY);
+  vox.sort((a, b) => a.t0 - b.t0);
+  DUR = DURS[ANIM.motion] ?? 0.55;
+  BUILD_END = vox[COUNT - 1].t0 + DUR;
+}
+plan();
+document.getElementById('info').textContent = `${COUNT.toLocaleString()} voxels · F skip · D demolish · P pile · H hides UI · drag to orbit`;
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.1;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const VIEW = 46;                   // half-height of the ortho view in world units
+const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 1000);
+const controls = new OrbitControls(cam, renderer.domElement);
+controls.target.set(0, 7, 0);
+controls.enableDamping = true;
+let userMoved = false;
+controls.addEventListener('start', () => { userMoved = true; });
+const orbitBox = document.getElementById('orbit');
+const ORBIT_R = 140, ORBIT_EL = 0.36;
+function placeCamera(az) {
+  cam.position.set(Math.sin(az) * Math.cos(ORBIT_EL) * ORBIT_R, 4 + Math.sin(ORBIT_EL) * ORBIT_R, Math.cos(az) * Math.cos(ORBIT_EL) * ORBIT_R);
+}
+let camAz = -0.25;                 // 0 = looking at the +z (front) side; photo 1 is from front-left
+placeCamera(camAz);
+function resize() {
+  const a = innerWidth / innerHeight;
+  const v = a < 1 ? VIEW / a : VIEW;
+  cam.left = -v * a; cam.right = v * a; cam.top = v; cam.bottom = -v;
+  cam.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+}
+addEventListener('resize', resize); resize();
+
+const HEMI_I = 1.55, SUN_I = 1.9;
+const hemi = new THREE.HemisphereLight(0xdde8f4, 0xa8987c, HEMI_I);
+scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xfff4e2, SUN_I);
+sun.position.set(45, 75, 55);
+sun.castShadow = true;
+sun.shadow.mapSize.set(4096, 4096);
+Object.assign(sun.shadow.camera, { left: -70, right: 70, top: 70, bottom: -70, near: 1, far: 300 }); // cover the island
+sun.shadow.bias = -0.0006;
+sun.shadow.normalBias = 0.02;
+scene.add(sun);
+const W = (fx, fy, fz) => new THREE.Vector3((fx + 0.5) / S - CX, (fy + 0.5) / S - GY, (fz + 0.5) / S - CZ);   // fine -> world
+// real PointLights only for hero lamps (they light glass and moving voxels; each costs per pixel)
+const warmLights = bakedLights.filter(l => l.hero).map(({ fx, fy, fz, color }) => {
+  const l = new THREE.PointLight(color, 10, 10, 1.5); l.position.copy(W(fx, fy, fz)); l.userData.base = 10; scene.add(l); return l;
+});
+
+// soft voxel outlines
+const cv = document.createElement('canvas'); cv.width = cv.height = 32;
+const g = cv.getContext('2d');
+g.fillStyle = '#dadada'; g.fillRect(0, 0, 32, 32);
+g.fillStyle = '#ffffff'; g.fillRect(3, 3, 26, 26);
+const tex = new THREE.CanvasTexture(cv);
+tex.colorSpace = THREE.SRGBColorSpace;
+
+// three materials: lit, glowing, glass (clearly visible: blue tint, ~0.55 opacity, environment reflections)
+const pmrem = new THREE.PMREMGenerator(renderer);
+const envTex = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+const glowMat = new THREE.MeshBasicMaterial({ map: tex });
+const glassMat = new THREE.MeshPhysicalMaterial({
+  transparent: true, opacity: 0.55, roughness: 0.03, metalness: 0, envMap: envTex, envMapIntensity: 0.9,
+  specularIntensity: 1, clearcoat: 1, clearcoatRoughness: 0.05, depthWrite: false,
+});
+const geo = new THREE.BoxGeometry(1, 1, 1);
+const counts = [0, 0, 0];
+for (const v of vox) { v.m = v.e === 'glass' ? 2 : v.e ? 1 : 0; v.i = counts[v.m]++; }
+// lit material: baked lamp light (per-instance attribute `lamp`, filled by bake()) is added as emission, so it shows
+// on walls the sun and sky don't reach and at night. As albedo it got multiplied by the scene light and vanished.
+const litMat = new THREE.MeshStandardMaterial({ map: tex, roughness: 0.9 });
+const lampK = { value: 0 };
+litMat.onBeforeCompile = sh => {
+  sh.uniforms.lampK = lampK;
+  sh.vertexShader = sh.vertexShader.replace('#include <common>', '#include <common>\nattribute vec3 lamp;\nvarying vec3 vLamp;')
+    .replace('#include <begin_vertex>', '#include <begin_vertex>\nvLamp = lamp;');
+  sh.fragmentShader = sh.fragmentShader.replace('#include <common>', '#include <common>\nvarying vec3 vLamp;\nuniform float lampK;')
+    .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\ntotalEmissiveRadiance += diffuseColor.rgb * vLamp * lampK;');
+};
+const litGeo = geo.clone();
+litGeo.setAttribute('lamp', new THREE.InstancedBufferAttribute(new Float32Array(Math.max(1, counts[0]) * 3), 3));
+const meshes = [litMat, glowMat, glassMat].map((mat, m) => {
+  const mesh = new THREE.InstancedMesh(m === 0 ? litGeo : geo, mat, Math.max(1, counts[m]));
+  mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  mesh.castShadow = m === 0; mesh.receiveShadow = m === 0;
+  mesh.renderOrder = m === 2 ? 1 : 0;
+  mesh.frustumCulled = false;
+  return mesh;
+});
+const c3 = new THREE.Color();
+for (const v of vox) {
+  c3.setHex(v.c);
+  if (v.m === 0) c3.offsetHSL(0, 0, (hash(v.x, v.z, v.y + 99) - 0.5) * 0.04);
+  meshes[v.m].setColorAt(v.i, c3);
+}
+
+// ---------- bake: ambient occlusion into the lit mesh's instance colours, baked lamps into its `lamp` attribute ----------
+// AO: from every exposed face cast 9 short rays (normal ± tangents) through an occupancy grid; near hits
+// darken. Openings, eaves, porches and corners get depth for free. Glass does not occlude.
+// Returns A = weathered + AO colours; the lamp light goes to the `lamp` attribute, faded in by setLights().
+// gain: lamp emission strength (emission ignores sun/sky, so it reads the same on shaded walls and at night).
+const BAKE = { ao: 0.72, reach: 8, gain: 1 };   // bright overcast-ish day: strong AO
+// Weathering: nothing real is evenly coloured. Broad blotches, odd stones/boards off-shade, grime splashed
+// up the foot of walls, rain streaks down them, moss on what faces the sky. Strengths 0 = off.
+const WEATHER = { patch: 0.14, speckle: 0.12, grime: 0.35, grimeH: 1.8, streak: 0.14, moss: 0.15 };   // light moss: the roof is new metal
+const GRIME = new THREE.Color(0x4f4a34), MOSS = new THREE.Color(0x587a2e);
+function weather(v, fn, r, g, b) {
+  const side = fn.some(n => n[1] === 0), up = fn.some(n => n[1] === 1);
+  const h = (v.y - topAt(v.x, v.z)) / S;                        // design units above the local ground
+  let m = 1 + (vnoise(v.x + v.y * 0.7, v.z - v.y * 0.5, 7 * S, 91) - 0.5) * 2 * WEATHER.patch;
+  m *= 1 + (hash(v.x, v.z, v.y + 7) - 0.5) * 2 * WEATHER.speckle * (hash(v.x, v.y, v.z + 3) < 0.2 ? 1 : 0.3);
+  if (side && h >= WEATHER.grimeH) m *= 1 - WEATHER.streak * Math.max(0, vnoise(v.x + v.z, 0, 2.5, 93) - 0.4) * 1.7;   // vertical streaks
+  let tk = 0, tint = GRIME;
+  if (side && h >= 0.5 && h < WEATHER.grimeH + 0.5) tk = WEATHER.grime * (1 - (h - 0.5) / WEATHER.grimeH) * (0.5 + vnoise(v.x + v.z, v.y, 3, 92));
+  const mo = vnoise(v.x, v.z, 4 * S, 94);
+  if (up && h > 1 && mo > 0.6) { tk = Math.min(0.6, WEATHER.moss * (mo - 0.6) / 0.4 * 2.2); tint = MOSS; }
+  tk = Math.max(0, Math.min(0.6, tk));
+  return [r * m * (1 - tk) + tint.r * tk, g * m * (1 - tk) + tint.g * tk, b * m * (1 - tk) + tint.b * tk];
+}
+function bake() {
+  const t0 = performance.now();
+  let x0 = 1e9, y0 = 1e9, z0 = 1e9, x1 = -1e9, y1 = -1e9, z1 = -1e9;
+  for (const v of vox) { x0 = Math.min(x0, v.x); y0 = Math.min(y0, v.y); z0 = Math.min(z0, v.z); x1 = Math.max(x1, v.x); y1 = Math.max(y1, v.y); z1 = Math.max(z1, v.z); }
+  const NY = y1 - y0 + 1, NZ = z1 - z0 + 1, occ = new Uint8Array((x1 - x0 + 1) * NY * NZ);
+  const gi = (x, y, z) => ((x - x0) * NY + (y - y0)) * NZ + (z - z0);
+  const inB = (x, y, z) => x >= x0 && x <= x1 && y >= y0 && y <= y1 && z >= z0 && z <= z1;
+  const solid = (x, y, z) => inB(x, y, z) && occ[gi(x, y, z)] > 0;
+  const blocks = (x, y, z) => inB(x, y, z) && occ[gi(x, y, z)] === 1;   // glowing fixtures don't shadow their own light
+  for (const v of vox) if (v.m !== 2) occ[gi(v.x, v.y, v.z)] = v.m === 1 ? 2 : 1;
+  const N = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+  const RAYS = N.map(n => {
+    const ax = n.findIndex(c => c !== 0), [ta, tb] = [0, 1, 2].filter(i => i !== ax), out = [];
+    for (const a of [-1, 0, 1]) for (const b of [-1, 0, 1]) { const d = n.slice(); d[ta] += a; d[tb] += b; out.push(d); }
+    return out;
+  });
+  const lights = bakedLights.map(l => ({ ...l, x: l.fx, y: l.fy, z: l.fz, r: l.r * S, col: new THREE.Color(l.color) }));
+  const base = meshes[0].instanceColor.array, A = new Float32Array(base), LL = meshes[0].geometry.attributes.lamp.array;
+  const L = BAKE.reach * S / 2, hits = lights.map(() => 0);
+  for (const v of vox) {
+    if (v.m !== 0) continue;
+    const fn = [];
+    let occl = 0;
+    for (let f = 0; f < 6; f++) {
+      const n = N[f];
+      if (solid(v.x + n[0], v.y + n[1], v.z + n[2])) continue;
+      fn.push(n);
+      for (const d of RAYS[f]) for (let k = 1; k <= L; k++) if (solid(v.x + d[0] * k, v.y + d[1] * k, v.z + d[2] * k)) { occl += 1 - (k - 1) / L; break; }
+    }
+    if (!fn.length) continue;                                     // hidden voxel: leave as is
+    const ao = 1 - BAKE.ao * occl / (fn.length * 9);
+    let lr = 0, lg = 0, lb = 0;
+    for (let li = 0; li < lights.length; li++) {
+      const l = lights[li], dx = l.x - v.x, dy = l.y - v.y, dz = l.z - v.z, dist = Math.hypot(dx, dy, dz);
+      if (dist > l.r || dist < 0.5) continue;
+      let face = 0, nb = fn[0];
+      for (const n of fn) { const f = (n[0] * dx + n[1] * dy + n[2] * dz) / dist; if (f > face) { face = f; nb = n; } }
+      if (face <= 0) continue;
+      const wrap = l.wrap ?? 0.35;                                 // light on faces it barely faces (0 = strictly by angle)
+      let k = l.power * (wrap + (1 - wrap) * face) * (1 - dist / l.r) ** 2;
+      if (l.cone !== undefined) k *= Math.min(1, Math.max(0, (-(l.dir[0] * dx + l.dir[1] * dy + l.dir[2] * dz) / dist - l.cone) / (1 - l.cone) * 2));
+      if (k <= 0) continue;
+      if (l.shadow !== false) {                                   // march from just off the lit face to the lamp
+        const px = v.x + nb[0], py = v.y + nb[1], pz = v.z + nb[2], ex = l.x - px, ey = l.y - py, ez = l.z - pz, D = Math.hypot(ex, ey, ez);
+        let hit = false;
+        // stop 2.5 cells short: those are the lamp's own fixture (caps, bracket), which must not shadow it
+        for (let s = 0; s < D - 2.5; s++) if (blocks(Math.round(px + ex / D * s), Math.round(py + ey / D * s), Math.round(pz + ez / D * s))) { hit = true; break; }
+        if (hit) continue;
+      }
+      lr += l.col.r * k; lg += l.col.g * k; lb += l.col.b * k;
+      if (k > 0.05) hits[li]++;
+    }
+    const o = v.i * 3;
+    const w = weather(v, fn, base[o], base[o + 1], base[o + 2]);
+    A[o] = w[0] * ao; A[o + 1] = w[1] * ao; A[o + 2] = w[2] * ao;
+    LL[o] = lr / ao; LL[o + 1] = lg / ao; LL[o + 2] = lb / ao;      // the shader multiplies by the AO'd colour; lamps aren't occluded twice
+  }
+  const dark = hits.map((n, i) => n < 20 ? i : -1).filter(i => i >= 0);
+  console.info(`bake: ${Math.round(performance.now() - t0)} ms, ${lights.length} baked lamps, lit voxels per lamp ~${Math.round(hits.reduce((a, b) => a + b, 0) / Math.max(1, hits.length))}` + (dark.length ? `; lamps reaching almost nothing (inside geometry?): ${dark.join(', ')}` : ''));
+  return A;
+}
+const colA = bake();
+let bakeK = -1, bakeForce = null;
+function blendBake(k) {                                         // lamps off (0) .. on (1+); bakeK -1 rewrites the colours
+  if (bakeForce !== null) k = bakeForce;
+  if (bakeK < 0) { meshes[0].instanceColor.array.set(colA); meshes[0].instanceColor.needsUpdate = true; }
+  bakeK = k;
+  lampK.value = k * BAKE.gain;
+}
+const group = new THREE.Group();
+group.scale.setScalar(1 / S);
+group.position.set(-CX + 0.5 / S, 0.5 / S - GY, -CZ + 0.5 / S);
+meshes.forEach(m => group.add(m));
+scene.add(group);
+
+const MA = meshes.map(m => m.instanceMatrix.array);
+function setM(v, x, y, z, s, sy = s, sz = s) {   // scale + position; clears any rotation left by setR
+  const M = MA[v.m], o = v.i * 16;
+  M[o] = s; M[o + 5] = sy; M[o + 10] = sz;
+  M[o + 1] = M[o + 2] = M[o + 4] = M[o + 6] = M[o + 8] = M[o + 9] = 0;
+  M[o + 12] = x; M[o + 13] = y; M[o + 14] = z;
+}
+function setR(v, x, y, z, s, ax, ay, az, a) {     // uniform scale + rotation by angle a about unit axis (ax, ay, az)
+  const M = MA[v.m], o = v.i * 16, c = Math.cos(a), n = Math.sin(a), C = 1 - c;
+  M[o] = (c + ax * ax * C) * s;      M[o + 1] = (ay * ax * C + az * n) * s; M[o + 2] = (az * ax * C - ay * n) * s;
+  M[o + 4] = (ax * ay * C - az * n) * s; M[o + 5] = (c + ay * ay * C) * s;  M[o + 6] = (az * ay * C + ax * n) * s;
+  M[o + 8] = (ax * az * C + ay * n) * s; M[o + 9] = (ay * az * C - ax * n) * s; M[o + 10] = (c + az * az * C) * s;
+  M[o + 12] = x; M[o + 13] = y; M[o + 14] = z;
+}
+const easeOutCubic = p => 1 - Math.pow(1 - p, 3);
+const easeInOutCubic = p => p < 0.5 ? 4 * p * p * p : 1 - Math.pow(-2 * p + 2, 3) / 2;
+const easeOutBack = p => { const c = 1.9; return 1 + (c + 1) * Math.pow(p - 1, 3) + c * Math.pow(p - 1, 2); };
+const easeOutElastic = p => p === 0 ? 0 : Math.pow(2, -10 * p) * Math.sin((p * 10 - 0.75) * 2.094) + 1;
+const DROP = 6 * S, SWARM = 32 * S, SLIDE = 9 * S;
+// slide direction for a voxel: the open side (x+, x-, z+, z-) facing most away from the island centre
+// (so a wall's outside wins over a room's inside), else 4 = straight down from above
+const SIDES = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+function slideDir(v) {
+  if (v.sd === undefined) {
+    const ox = v.x - CX * S, oz = v.z - CZ * S;
+    let best = -Infinity; v.sd = 4;
+    for (let k = 0; k < 4; k++) {
+      if (V.has(key(v.x + SIDES[k][0], v.y, v.z + SIDES[k][1]))) continue;
+      const d = SIDES[k][0] * ox + SIDES[k][1] * oz;
+      if (d > best) { best = d; v.sd = k; }
+    }
+  }
+  return v.sd;
+}
+// flash: colour blends from hot white to the voxel's settled colour
+const BASE = meshes.map(m => m.instanceColor && new Float32Array(m.instanceColor.array));
+const HOT = [1.6, 1.35, 0.9];
+function tint(v, k) {               // k = 1 hot .. 0 settled
+  const arr = meshes[v.m].instanceColor.array, o = v.i * 3;
+  for (let c = 0; c < 3; c++) {
+    const base = v.m === 0 ? colA[o + c] : BASE[v.m][o + c];
+    arr[o + c] = base + (HOT[c] - base) * k;
+  }
+}
+function restoreColours() {
+  for (let m = 1; m < 3; m++) if (BASE[m]) { meshes[m].instanceColor.array.set(BASE[m]); meshes[m].instanceColor.needsUpdate = true; }
+  bakeK = -1;                         // forces blendBake to rewrite the lit mesh
+}
+// in-flight pose for motion progress p in [0, 1)
+const POSE = {
+  drop(v, p) {
+    const s = Math.max(0, easeOutBack(Math.min(1, p * 1.25)));
+    setM(v, v.x, v.y + (1 - easeOutCubic(p)) * DROP, v.z, s);
+  },
+  grow(v, p) {                     // stretch up from the voxel's floor, slight overshoot
+    const sy = Math.max(0.001, easeOutBack(p));
+    setM(v, v.x, v.y - 0.5 + sy / 2, v.z, 1, sy);
+  },
+  swarm(v, p) {                    // start in a cloud around and above the island, swirl in along a curve
+    const a = hash(v.x, v.z, v.y + 11) * 6.283, r = SWARM * (0.45 + hash(v.z, v.y, v.x + 12) * 0.55);
+    const k = 1 - easeInOutCubic(p), sw = a + k * 1.4;
+    const s = 0.35 + 0.65 * Math.min(1, p * 1.6);
+    setM(v, v.x + Math.cos(sw) * r * k, v.y + (0.25 + hash(v.y, v.x, v.z + 13)) * r * 0.7 * k, v.z + Math.sin(sw) * r * k, s);
+  },
+  tornado(v, p) {                  // ride a funnel around the island centre: wide and high, spiralling down and in
+    const dx = v.x - CX * S, dz = v.z - CZ * S, r0 = Math.hypot(dx, dz), a0 = Math.atan2(dz, dx);
+    const k = 1 - easeOutCubic(p), r = r0 + k * (10 + hash(v.x, v.y, v.z + 14) * 14) * S, a = a0 + k * 7;
+    setM(v, CX * S + Math.cos(a) * r, v.y + k * 26 * S, CZ * S + Math.sin(a) * r, 0.5 + 0.5 * Math.min(1, p * 2));
+  },
+  slide(v, p) {                    // walls slide in along their outward face; roofs and interiors drop in
+    const d = slideDir(v), k = 1 - easeOutBack(p) * 0.98 - 0.02 * p;
+    if (d === 4) setM(v, v.x, v.y + k * SLIDE, v.z, 1);
+    else setM(v, v.x + SIDES[d][0] * k * SLIDE, v.y, v.z + SIDES[d][1] * k * SLIDE, 1);
+  },
+  pop(v, p) {                      // no travel: an elastic scale-up in place
+    setM(v, v.x, v.y, v.z, Math.max(0, easeOutElastic(p)));
+  },
+  tumble(v, p) {                   // fall from higher while spinning about a random axis, landing square
+    const ax = hash(v.x, v.y, v.z + 15) - 0.5, ay = hash(v.y, v.z, v.x + 16) - 0.5, az = hash(v.z, v.x, v.y + 17) - 0.5, n = Math.hypot(ax, ay, az) || 1;
+    const k = 1 - easeOutCubic(p);
+    setR(v, v.x, v.y + k * DROP * 1.6, v.z, Math.min(1, 0.3 + p * 1.5), ax / n, ay / n, az / n, k * k * Math.PI * 2.5);
+  },
+  squash(v, p) {                   // accelerate down (stretched), then flatten on impact and spring back
+    if (p < 0.5) {
+      const q = p / 0.5;
+      setM(v, v.x, v.y + (1 - q * q) * DROP, v.z, 0.9, 1.15);
+    } else {
+      const q = (p - 0.5) / 0.5, sy = 1 - 0.45 * Math.cos(q * Math.PI * 2.5) * (1 - q) * (1 - q), sx = 1 / Math.sqrt(sy);
+      setM(v, v.x, v.y - 0.5 + sy / 2, v.z, sx, sy);
+    }
+  },
+  flash(v, p) {                    // drop in glowing hot, cool to the real colour
+    POSE.drop(v, Math.min(1, p * 1.6));
+    tint(v, (1 - p) * (1 - p));
+  },
+};
+POSE.flash.done = v => tint(v, 0);  // runs when a voxel settles
+let pose = POSE[ANIM.motion] || POSE.drop;
+
+// 3D-printer head for order=scan: a glowing plate riding on the layer being printed
+const head = new THREE.Mesh(new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2),
+  new THREE.MeshBasicMaterial({ color: 0xff8a2a, transparent: true, opacity: 0.16, depthWrite: false, side: THREE.DoubleSide }));
+head.scale.set(maxX - minX + 8, 1, maxZ - minZ + 8);
+head.position.set((minX + maxX) / 2, 0, (minZ + maxZ) / 2);
+head.renderOrder = 2;
+head.visible = false;
+group.add(head);
+
+// blueprint intro: an outline of every exposed voxel above the ground, shown for BLUEPRINT s before the build.
+// Slightly smaller than a voxel, so once the real ones land they hide it.
+const BLUEPRINT = 2.5;
+const ghost = (() => {
+  const c = document.createElement('canvas'); c.width = c.height = 32;
+  const x = c.getContext('2d');
+  x.fillStyle = 'rgba(40,120,230,0.10)'; x.fillRect(0, 0, 32, 32);
+  x.strokeStyle = 'rgba(30,105,220,0.9)'; x.lineWidth = 2.5; x.strokeRect(1.25, 1.25, 29.5, 29.5);
+  const map = new THREE.CanvasTexture(c); map.colorSpace = THREE.SRGBColorSpace;
+  const cells = vox.filter(v => v.y > topAt(v.x, v.z) && [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]].some(([a, b, d]) => !V.has(key(v.x + a, v.y + b, v.z + d))));
+  // depthWrite on + drawn last: only the nearest outline shows (with it off, hundreds of faces stacked into a milky blob)
+  const mesh = new THREE.InstancedMesh(geo, new THREE.MeshBasicMaterial({ map, transparent: true, opacity: 0 }), Math.max(1, cells.length));
+  const m4 = new THREE.Matrix4();
+  cells.forEach((v, i) => mesh.setMatrixAt(i, m4.makeScale(0.96, 0.96, 0.96).setPosition(v.x, v.y, v.z)));
+  mesh.count = cells.length; mesh.frustumCulled = false; mesh.renderOrder = 3; mesh.visible = false;
+  group.add(mesh);
+  return mesh;
+})();
+
+let t = 0, first = 0, paused = false, doneAt = -1, demoAt = -1, pileAt = -1;
+function reset() {
+  for (const v of vox) setM(v, 0, -9999, 0, 0);
+  meshes.forEach(m => { m.instanceMatrix.needsUpdate = true; });
+  t = ANIM.intro === 'blueprint' ? -BLUEPRINT : 0; first = 0; doneAt = -1; demoAt = -1; pileAt = -1;
+}
+reset();
+function step() {
+  let i = first;
+  while (i < COUNT && vox[i].t0 <= t) {
+    const v = vox[i];
+    const p = (t - v.t0) / DUR;
+    if (p >= 1) {
+      setM(v, v.x, v.y, v.z, 1);
+      if (pose.done) pose.done(v);
+      if (i === first) first++;
+    } else pose(v, p);
+    i++;
+  }
+  meshes.forEach(m => { m.instanceMatrix.needsUpdate = true; if (pose.done && m.instanceColor) m.instanceColor.needsUpdate = true; });
+}
+
+// demolish outro: the scene comes apart in reverse build order, pieces thrown outward under gravity, then the build replays
+const DEMO = { span: 4.5, fall: 1.5, g: 45 * S };
+let REL, VX, VY, VZ;
+function startDemolish() {
+  if (!REL) {
+    REL = new Float32Array(COUNT); VX = new Float32Array(COUNT); VY = new Float32Array(COUNT); VZ = new Float32Array(COUNT);
+    for (let i = 0; i < COUNT; i++) {
+      const v = vox[i], dx = v.x - CX * S, dz = v.z - CZ * S, d = Math.hypot(dx, dz) || 1, sp = (1.5 + hash(v.x, v.y, v.z + 21) * 5) * S;
+      REL[i] = (1 - v.t0 / vox[COUNT - 1].t0) * DEMO.span * 0.9 + hash(v.z, v.x, v.y + 22) * DEMO.span * 0.1;   // build order reversed
+      VX[i] = dx / d * sp; VZ[i] = dz / d * sp; VY[i] = hash(v.y, v.z, v.x + 23) * 4 * S;
+    }
+  }
+  for (const v of vox) setM(v, v.x, v.y, v.z, 1);   // also when triggered mid-build
+  first = COUNT; if (doneAt < 0) doneAt = t;
+  demoAt = t;
+}
+function demolish(d) {               // returns false once everything has fallen
+  let live = false;
+  for (let i = 0; i < COUNT; i++) {
+    const r = d - REL[i];
+    if (r <= 0) { live = true; continue; }
+    const v = vox[i];
+    if (r >= DEMO.fall) { setM(v, 0, -9999, 0, 0); continue; }
+    live = true;
+    const s = 1 - Math.max(0, (r - DEMO.fall * 0.5) / (DEMO.fall * 0.5));
+    setM(v, v.x + VX[i] * r, v.y + VY[i] * r - 0.5 * DEMO.g * r * r, v.z + VZ[i] * r, s);
+  }
+  meshes.forEach(m => { m.instanceMatrix.needsUpdate = true; });
+  return live;
+}
+// pile outro: everything above the ground flies onto a heap where the building stood (last built lands first, at
+// the bottom), holds, then flies back in build order, so the heap unstacks from the top. The same pairing of
+// voxels to slots would morph into another scene if that scene's voxels were the targets.
+const PILE = { fall: 3, hold: 1.2, rise: 4, fly: 1 };
+let PV, SX, SY, SZ;
+function startPile() {
+  const idx = [];
+  for (let i = 0; i < COUNT; i++) if (vox[i].y > topAt(vox[i].x, vox[i].z)) idx.push(i);   // not terrain: hummocks would leave holes
+  idx.sort((a, b) => vox[b].t0 - vox[a].t0);           // reverse build order -> bottom of the heap first
+  const N = idx.length;
+  PV = Int32Array.from(idx); SX = new Float32Array(N); SY = new Float32Array(N); SZ = new Float32Array(N);
+  const R = Math.cbrt(3 * N / (0.55 * Math.PI)) * 1.05, H = R * 0.55, cx = Math.round(CX * S), cz = Math.round(CZ * S);
+  let n = 0;
+  for (let y = 0; n < N; y++) {                         // cone layers; past the tip keep stacking a column
+    const r = Math.max(1.5, R * (1 - y / H)), ring = [];
+    for (let x = -Math.ceil(r); x <= Math.ceil(r); x++) for (let z = -Math.ceil(r); z <= Math.ceil(r); z++) {
+      const d = Math.hypot(x, z) + (hash(x, z, y + 31) - 0.5) * 1.2;   // ragged outline
+      if (d <= r) ring.push([x, z, d]);
+    }
+    ring.sort((a, b) => a[2] - b[2]);
+    for (const [x, z] of ring) { if (n >= N) break; SX[n] = cx + x; SY[n] = topAt(cx + x, cz + z) + 1 + y; SZ[n] = cz + z; n++; }
+  }
+  for (const v of vox) setM(v, v.x, v.y, v.z, 1);      // also when triggered mid-build
+  first = COUNT; if (doneAt < 0) doneAt = t;
+  pileAt = t;
+}
+function pile(d) {                  // returns false when the heap has rebuilt the scene
+  const N = PV.length, back = PILE.fall + PILE.fly + PILE.hold;
+  if (d > back + PILE.rise + PILE.fly) return false;
+  for (let j = 0; j < N; j++) {
+    const v = vox[PV[j]], r = j / N;
+    let a = (d - r * PILE.fall) / PILE.fly, fx = v.x, fy = v.y, fz = v.z, tx = SX[j], ty = SY[j], tz = SZ[j];
+    if (d > back) { a = (d - back - (1 - r) * PILE.rise) / PILE.fly; [fx, fy, fz, tx, ty, tz] = [tx, ty, tz, fx, fy, fz]; }
+    a = Math.max(0, Math.min(1, a));
+    if (d > back && a === 0) { setM(v, SX[j], SY[j], SZ[j], 1); continue; }
+    const e = easeInOutCubic(a), arc = Math.sin(Math.PI * e) * (4 * S + Math.hypot(tx - fx, tz - fz) * 0.35);
+    setM(v, fx + (tx - fx) * e, fy + (ty - fy) * e + arc, fz + (tz - fz) * e, 1);
+  }
+  meshes.forEach(m => { m.instanceMatrix.needsUpdate = true; });
+  return true;
+}
+// sky=night: dusk falls a couple of seconds after the build; glow and hero lights are pushed past 1 to stay bright
+const nightDiv = document.getElementById('night'), DAY_HEMI = hemi.color.clone(), NIGHT_HEMI = new THREE.Color(0x8ea4d6);
+let night = 0;
+function setSky(dt) {
+  const want = ANIM.sky === 'night' && doneAt >= 0 && demoAt < 0 && pileAt < 0 && t - doneAt > 2 ? 1 : 0;
+  night += (want - night) * Math.min(1, dt * 0.45);
+  nightDiv.style.opacity = night.toFixed(3);
+  document.body.classList.toggle('dark', night > 0.5);
+  hemi.intensity = HEMI_I * (1 - 0.72 * night);
+  hemi.color.copy(DAY_HEMI).lerp(NIGHT_HEMI, night);
+  sun.intensity = SUN_I * (1 - 0.88 * night);
+  glassMat.envMapIntensity = 0.9 * (1 - 0.85 * night);          // the studio env's light bars read as things behind the glass at night
+}
+function setLights(k) {            // dim while building, full once complete
+  warmLights.forEach(l => { l.intensity = l.userData.base * k; });
+  glowMat.color.setScalar(0.35 + 0.65 * k);
+  blendBake(Math.min(1, k));       // baked lamps are emissive: no night boost needed, the dark around them does it
+}
+
+const bar = document.querySelector('#bar i');
+const loopBox = document.getElementById('loop');
+document.getElementById('replay').onclick = reset;
+const pauseBtn = document.getElementById('pause');
+const togglePause = () => { paused = !paused; pauseBtn.textContent = paused ? 'Play (Space)' : 'Pause (Space)'; };
+pauseBtn.onclick = togglePause;
+addEventListener('keydown', e => {
+  if (e.code === 'KeyR') reset();
+  else if (e.code === 'KeyF') t = BUILD_END;
+  else if (e.code === 'KeyD' && demoAt < 0 && pileAt < 0) startDemolish();
+  else if (e.code === 'KeyP' && demoAt < 0 && pileAt < 0) startPile();
+  else if (e.code === 'Space') { e.preventDefault(); togglePause(); }
+  else if (e.code === 'KeyH') document.getElementById('ui').classList.toggle('hidden');
+});
+// detail (voxel subdivision) changes the whole grid, so it reloads the page with ?res=
+const resSel = document.getElementById('res');
+resSel.value = S;
+resSel.onchange = () => { Q.set('res', resSel.value); location.search = '?' + Q; };
+// animation mode pickers: replan + replay on change, and keep the URL in sync so the combination can be shared
+for (const k in ANIM) {
+  const sel = document.getElementById(k);
+  sel.value = ANIM[k];
+  sel.onchange = () => {
+    ANIM[k] = sel.value;
+    if (k === 'order' && sel.value === 'scan') ANIM.motion = document.getElementById('motion').value = 'grow';
+    sel.blur();                        // keep Space/R/F going to the page, not the select
+    if (k === 'order' || k === 'motion') { plan(); pose = POSE[ANIM.motion]; REL = null; restoreColours(); reset(); }
+    else if (k === 'intro') reset();
+    for (const j in ANIM) Q.set(j, ANIM[j]);
+    history.replaceState(null, '', '?' + Q);
+  };
+}
+window.__seeAz = az => { camAz = az; placeCamera(az); };   // frame any side when testing
+window.__zoom = (z, x = 0, y = 4, zz = 0) => { cam.zoom = z; cam.updateProjectionMatrix(); controls.target.set(x, y, zz); };   // close-ups (world units)
+window.__lamps = bakedLights;                                    // the lamps that made it into the bake
+window.__hero = on => warmLights.forEach(l => { l.visible = on; });   // hero PointLights on/off for comparison
+window.__bake = on => { bakeForce = on === undefined ? null : on ? 1 : 0; };   // force baked lamps on/off for comparison (no arg: auto)
+
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.1);
+  if (!paused) {
+    t += dt;
+    if (demoAt >= 0) { if (!demolish(t - demoAt)) reset(); }
+    else if (pileAt >= 0) { if (!pile(t - pileAt)) { for (const v of vox) setM(v, v.x, v.y, v.z, 1); meshes.forEach(m => { m.instanceMatrix.needsUpdate = true; }); pileAt = -1; doneAt = t; } }
+    else if (first < COUNT) step();
+    else if (doneAt < 0) doneAt = t;
+    else if (loopBox.checked && t - doneAt > 30) ({ demolish: startDemolish, pile: startPile }[ANIM.outro] || reset)();   // long hold so a full orbit shows every side
+    bar.style.width = Math.max(0, Math.min(100, (t / BUILD_END) * 100)) + '%';
+    if (!userMoved && orbitBox.checked) { camAz += dt * 0.12; placeCamera(camAz); }
+  }
+  head.visible = ANIM.order === 'scan' && t >= 0 && first < COUNT && demoAt < 0;
+  if (head.visible) head.position.y = minY + Math.min(maxY - minY, Math.floor(t / SCAN)) + 0.55;
+  // blueprint: fade in during the lead-in, hold through the build, fade out once complete
+  const bp = ANIM.intro !== 'blueprint' || demoAt >= 0 || pileAt >= 0 ? 0
+    : t < 0 ? Math.min(1, (t + BLUEPRINT) / 0.8) : doneAt < 0 ? 1 : Math.max(0, 1 - (t - doneAt) / 1.2);
+  ghost.visible = bp > 0; ghost.material.opacity = bp;
+  setSky(dt);
+  const out = demoAt >= 0 ? demoAt : pileAt;
+  setLights((out >= 0 ? Math.max(0.15, 1 - (t - out) * 0.85)
+    : doneAt < 0 ? 0.15 : 0.15 + 0.85 * Math.min(1, (t - doneAt) / 1.5)) * (1 + 1.2 * night));
+  controls.update();
+  renderer.render(scene, cam);
+});
+</script>
+</body>
+</html>

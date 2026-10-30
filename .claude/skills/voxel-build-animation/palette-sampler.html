@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Palette Sampler</title>
+<style>
+  body { margin: 16px; font: 13px system-ui, sans-serif; background: #f4f2ee; color: #222; }
+  #wrap { position: relative; display: inline-block; max-width: 100%; }
+  #wrap canvas { max-width: 100%; display: block; }
+  .crop { position: absolute; border: 2px solid #ff2d6f; color: #fff; background: rgba(255,45,111,.12); font-weight: 600; text-shadow: 0 0 3px #000; padding: 1px 3px; box-sizing: border-box; }
+  .row { display: flex; gap: 6px; align-items: center; margin: 4px 0; }
+  .sw { width: 64px; height: 22px; border-radius: 3px; font-size: 10px; display: flex; align-items: end; justify-content: center; color: #fff; text-shadow: 0 0 2px #000; }
+  pre { background: #fff; padding: 8px; border-radius: 6px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<!--
+  Samples a reference photo into palettes, so scene colours come from the photo instead of guesses.
+  Usage (served from the project folder; copy the photo next to the scene first, e.g. ref/house.webp):
+    palette-sampler.html?img=../../../ref/house.webp
+      &crops=stone:0.20,0.45,0.30,0.60;roof:0.35,0.36,0.45,0.40;lawn:0.10,0.82,0.90,0.98
+      &sky=0.40,0.60,0.45     (x range to average for the sky gradient, optional bottom y; default: down to the first crop)
+      &k=4                    (clusters per crop)
+  Crops are fractions of width/height: x0,y0,x1,y1. Result: on the page, and as JSON in window.__palette.
+-->
+<div id="wrap"><canvas id="cv"></canvas></div>
+<div id="out"></div>
+<pre id="json"></pre>
+<script>
+const q = new URLSearchParams(location.search);
+const hex = c => '#' + c.map(v => Math.round(v).toString(16).padStart(2, '0')).join('');
+const lum = c => 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+function kmeans(px, k) {                       // px: [[r,g,b]], returns [{c, share}] sorted by share
+  if (!px.length) return [];
+  const sorted = [...px].sort((a, b) => lum(a) - lum(b));
+  let cs = Array.from({ length: k }, (_, i) => sorted[Math.floor((i + 0.5) / k * sorted.length)].slice());
+  let lab = new Array(px.length).fill(0);
+  for (let it = 0; it < 12; it++) {
+    for (let i = 0; i < px.length; i++) {
+      let best = 0, bd = 1e9;
+      for (let j = 0; j < k; j++) { const d = (px[i][0] - cs[j][0]) ** 2 + (px[i][1] - cs[j][1]) ** 2 + (px[i][2] - cs[j][2]) ** 2; if (d < bd) { bd = d; best = j; } }
+      lab[i] = best;
+    }
+    const sum = cs.map(() => [0, 0, 0, 0]);
+    px.forEach((p, i) => { const s = sum[lab[i]]; s[0] += p[0]; s[1] += p[1]; s[2] += p[2]; s[3]++; });
+    cs = sum.map((s, j) => s[3] ? [s[0] / s[3], s[1] / s[3], s[2] / s[3]] : cs[j]);
+  }
+  const n = cs.map(() => 0); lab.forEach(l => n[l]++);
+  return cs.map((c, j) => ({ hex: hex(c), share: +(n[j] / px.length).toFixed(2) })).filter(c => c.share > 0.03).sort((a, b) => b.share - a.share);
+}
+const img = new Image();
+img.onload = () => {
+  const cv = document.getElementById('cv'), g = cv.getContext('2d', { willReadFrequently: true });
+  cv.width = img.naturalWidth; cv.height = img.naturalHeight;
+  g.drawImage(img, 0, 0);
+  const W = cv.width, H = cv.height, data = g.getImageData(0, 0, W, H).data;
+  const at = (x, y) => { const o = (y * W + x) * 4; return [data[o], data[o + 1], data[o + 2]]; };
+  const result = { crops: {}, sky: [] };
+  const out = document.getElementById('out'), wrap = document.getElementById('wrap');
+  const k = parseInt(q.get('k')) || 4;
+  let firstY = 1;
+  for (const part of (q.get('crops') || '').split(';').filter(Boolean)) {
+    const [name, r] = part.split(':'), [x0, y0, x1, y1] = r.split(',').map(Number);
+    firstY = Math.min(firstY, y0);
+    const px = [], step = Math.max(1, Math.round(Math.sqrt((x1 - x0) * W * (y1 - y0) * H / 5000)));
+    for (let y = Math.round(y0 * H); y < y1 * H; y += step) for (let x = Math.round(x0 * W); x < x1 * W; x += step) px.push(at(x, y));
+    result.crops[name] = kmeans(px, k);
+    const d = document.createElement('div');
+    d.className = 'crop'; d.textContent = name;
+    Object.assign(d.style, { left: x0 * 100 + '%', top: y0 * 100 + '%', width: (x1 - x0) * 100 + '%', height: (y1 - y0) * 100 + '%' });
+    wrap.appendChild(d);
+    out.insertAdjacentHTML('beforeend', `<div class="row"><b style="width:70px">${name}</b>${result.crops[name].map(c => `<div class="sw" style="background:${c.hex}">${c.hex} ${Math.round(c.share * 100)}%</div>`).join('')}</div>`);
+  }
+  const sky = q.get('sky');
+  if (sky) {                                    // 8 gradient stops from the top of the photo down to the first crop
+    const [sx0, sx1, sy1] = sky.split(",").map(Number), yEnd = sy1 || Math.max(0.05, firstY - 0.01);
+    for (let i = 0; i < 8; i++) {
+      const y = Math.round(i / 7 * yEnd * (H - 1)), acc = [0, 0, 0];
+      let n = 0;
+      for (let x = Math.round(sx0 * W); x < sx1 * W; x += 2) { const c = at(x, y); acc[0] += c[0]; acc[1] += c[1]; acc[2] += c[2]; n++; }
+      result.sky.push({ at: Math.round(i / 7 * 100) + '%', hex: hex(acc.map(v => v / n)) });
+    }
+    out.insertAdjacentHTML('beforeend', `<div class="row"><b style="width:70px">sky</b>${result.sky.map(s => `<div class="sw" style="background:${s.hex}">${s.hex}</div>`).join('')}</div>`);
+    result.css = `linear-gradient(${result.sky.map(s => `${s.hex} ${s.at}`).join(', ')})`;
+  }
+  window.__palette = result;
+  document.getElementById('json').textContent = JSON.stringify(result, null, 1);
+};
+img.onerror = () => { document.getElementById('json').textContent = 'could not load ' + q.get('img'); window.__palette = { error: 'load' }; };
+img.src = q.get('img');
+</script>
+</body>
+</html>

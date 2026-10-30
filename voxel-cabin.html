@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voxel Hill Cabin</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; font-family: system-ui, sans-serif; }
+  body { background: linear-gradient(#7f888d 0%, #a9b0b3 45%, #d3d6d6 100%); }
+  canvas { display: block; }
+  #ui { position: fixed; left: 16px; bottom: 16px; display: flex; gap: 8px; align-items: center; color: #2c3336; font-size: 13px; flex-wrap: wrap; }
+  #ui button { background: rgba(255,255,255,.5); color: #222; border: 1px solid rgba(0,0,0,.15); border-radius: 6px; padding: 6px 12px; cursor: pointer; font: inherit; }
+  #ui button:hover { background: rgba(255,255,255,.75); }
+  #bar { width: 160px; height: 4px; background: rgba(0,0,0,.15); border-radius: 2px; overflow: hidden; }
+  #bar i { display: block; height: 100%; width: 0; background: #a45f2e; }
+  #ui.hidden { display: none; }
+  label { display: flex; gap: 4px; align-items: center; user-select: none; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="ui">
+  <button id="replay">Replay (R)</button>
+  <button id="pause">Pause (Space)</button>
+  <label><input type="checkbox" id="loop" checked> Loop</label>
+  <div id="bar"><i></i></div>
+  <span id="info" style="opacity:.75"></span>
+</div>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// Voxel subdivision: each design unit is S×S×S small voxels. Override with ?res=1..4
+const S = Math.max(1, Math.min(4, parseInt(new URLSearchParams(location.search).get('res')) || 2));
+
+// ---------- helpers ----------
+function hash(x, z, s = 0) {
+  let h = Math.imul(x | 0, 374761393) ^ Math.imul(z | 0, 668265263) ^ Math.imul(s | 0, 1442695041);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  h ^= h >>> 16;
+  return (h >>> 0) / 4294967295;
+}
+function vnoise(x, z, sc, s = 0) {
+  x /= sc; z /= sc;
+  const xi = Math.floor(x), zi = Math.floor(z), xf = x - xi, zf = z - zi;
+  const u = xf * xf * (3 - 2 * xf), v = zf * zf * (3 - 2 * zf);
+  const a = hash(xi, zi, s), b = hash(xi + 1, zi, s), c = hash(xi, zi + 1, s), d = hash(xi + 1, zi + 1, s);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+let seed = 2718;
+const rnd = () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+const pick = a => a[Math.floor(rnd() * a.length)];
+const smooth = (a, b, x) => { const t = Math.max(0, Math.min(1, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+
+// Fine-grid voxel store. Design coords are multiplied by S; dc() maps a fine cell back to design space.
+const V = new Map();
+const key = (x, y, z) => ((x + 256) * 1024 + (y + 256)) * 1024 + (z + 256);
+const fset = (x, y, z, c) => V.set(key(x, y, z), { x, y, z, c });
+const dc = f => (f - (S - 1) / 2) / S;
+
+// ---------- palette ----------
+const P = {
+  moss: [0x6f8f3a, 0x7d9c40, 0x5e7d32, 0x8aa64a, 0x67863a],
+  dry: [0xa0784a, 0x8f6a40, 0xb08a5a, 0x9a7a52],
+  heather: [0x7d5040, 0x6e4436, 0x8a6050],
+  topsoil: [0x4a3b2a, 0x40331f],
+  under: [0x7c776c, 0x6d685e, 0x5f5a51, 0x524e46],
+  rock: [0x7d7f7a, 0x6a6c67, 0x8a8c86],
+  clad: [0xb06a35, 0xa45f2e, 0xbb7840, 0x96562a, 0xa86834],
+  frame: 0x1e1e1e,
+  plinth: [0x55524c, 0x4a4843],
+  roof: 0x3c342c,
+  pine: [0x2f4a2a, 0x3a5a32, 0x26402a, 0x34522f],
+  bark: [0x6b4a32, 0x5c3e2a, 0x7a5638],
+  juniper: [0x3d5a35, 0x34502e, 0x46663c],
+};
+
+const N = 60, TC = N / 2;
+const GY = 3, TOP = GY * S;   // base terrain level (fine) before the hill
+
+// ---------- island: thorny rim, mossy hill on top, iceberg rock mass below ----------
+function edgeR(x, z) {
+  const th = Math.atan2(z - TC, x - TC), K = 26;
+  const u = (th / (2 * Math.PI) + 0.5) * K + (vnoise(th * 4 + 9, 3, 1, 8) - 0.5) * 0.5;
+  const k = Math.floor(u), f = u - k, tri = 1 - Math.abs(2 * f - 1);
+  const amp = 1.5 + hash(((k % K) + K) % K, 0, 61) * 6;
+  return 24 + (vnoise(x, z, 6, 62) - 0.5) * 2 + amp * Math.pow(tri, 3.5);
+}
+const HILL_X = 32, HILL_Z = 26;
+const LO = -12 * S, WD = (N + 24) * S, OUT = 1 << 14;
+const bottom = new Int32Array(WD * WD).fill(OUT), top = new Int32Array(WD * WD).fill(-OUT);
+const idx = (fx, fz) => (fx - LO) * WD + (fz - LO);
+const inGrid = (fx, fz) => fx >= LO && fz >= LO && fx < LO + WD && fz < LO + WD;
+const botAt = (fx, fz) => inGrid(fx, fz) ? bottom[idx(fx, fz)] : OUT;
+const topAt = (fx, fz) => inGrid(fx, fz) ? top[idx(fx, fz)] : -OUT;
+for (let fx = LO; fx < LO + WD; fx++) for (let fz = LO; fz < LO + WD; fz++) {
+  const x = dc(fx), z = dc(fz), dx = x - TC, dz = z - TC;
+  const e = edgeR(x, z) - Math.pow(dx ** 4 + dz ** 4, 0.25);
+  if (e < 0) continue;
+  const hill = 14 * Math.exp(-((x - HILL_X) ** 2 + (z - HILL_Z) ** 2) / (2 * 11 * 11));
+  const bumps = (vnoise(x, z, 4, 3) - 0.5) * 1.8 + (vnoise(x, z, 1.5, 4) - 0.5) * 0.7;
+  const hd = Math.max(0, (hill + 1 + bumps) * smooth(0, 7, e));
+  top[idx(fx, fz)] = TOP - 1 + Math.round(hd * S);
+  const ra = Math.min(1, Math.hypot(x - TC - 2, z - TC + 2) / 34);
+  const facet = (Math.floor(vnoise(x, z, 6, 51) * 5) / 5 - 0.4) * 5;
+  const depth = 2 + Math.min(1, e / 4) * (24 * Math.pow(1 - ra, 1.4) + facet * (1 - ra));
+  bottom[idx(fx, fz)] = TOP - 1 - Math.max(S, Math.round(depth * S));
+}
+function surfaceC(x, z) {
+  return vnoise(x, z, 5, 21) > 0.68 ? pick(P.dry) : pick(P.moss);
+}
+for (let fx = LO; fx < LO + WD; fx++) for (let fz = LO; fz < LO + WD; fz++) {
+  const b = botAt(fx, fz);
+  if (b === OUT) continue;
+  const t = topAt(fx, fz), x = dc(fx), z = dc(fz);
+  const nb = [[1, 0], [-1, 0], [0, 1], [0, -1]].map(([a, c]) => [botAt(fx + a, fz + c), topAt(fx + a, fz + c)]);
+  for (let fy = b; fy <= t; fy++) {
+    // hidden when every neighbour column covers this height (one layer of overlap keeps shells face-connected)
+    if (fy !== b && fy !== t && nb.every(([nbot, ntop]) => nbot < fy && ntop > fy)) continue;
+    let c;
+    if (fy === t) c = surfaceC(x, z);
+    else if (fy > t - 2 * S) c = surfaceC(x, z);                 // grass wraps over slope steps, no dark gaps
+    else if (fy >= TOP - 1) c = pick(P.topsoil);
+    else c = P.under[Math.min(3, Math.floor((TOP - fy) / (6 * S)))];
+    fset(fx, fy, fz, c);
+  }
+  // grass tufts and moss lumps
+  const h = hash(fx, fz, 41), dryness = vnoise(x, z, 5, 21);
+  if (h < 0.045) {
+    const tall = 1 + Math.floor(hash(fx, fz, 42) * (dryness > 0.6 ? 3 : 1.5));
+    for (let i = 1; i <= tall; i++) fset(fx, t + i, fz, dryness > 0.6 ? pick(P.dry) : pick(P.moss));
+  }
+}
+
+// ---------- the cabin: larch-clad box with corner glazing, on a plinth at the hilltop ----------
+const X0 = 27 * S, X1 = 39 * S - 1, Z0 = 21 * S, Z1 = 30 * S - 1;
+let FL = 0;
+for (let fx = X0; fx <= X1; fx++) for (let fz = Z0; fz <= Z1; fz++) FL = Math.max(FL, topAt(fx, fz));
+FL += S;                                   // cabin floor sits just above the highest ground under it
+const H = 8 * S, RY = FL + H;
+for (let fx = X0; fx <= X1; fx++) for (let fz = Z0; fz <= Z1; fz++)
+  for (let fy = topAt(fx, fz) + 1; fy < FL; fy++) fset(fx, fy, fz, pick(P.plinth));
+const clad = a => P.clad[Math.floor(hash(Math.floor(a / S), 0, 5) * P.clad.length)];
+for (let fy = FL; fy < RY; fy++) {
+  for (let fx = X0; fx <= X1; fx++) { fset(fx, fy, Z0, clad(fx)); fset(fx, fy, Z1, clad(fx)); }
+  for (let fz = Z0; fz <= Z1; fz++) { fset(X0, fy, fz, clad(fz)); fset(X1, fy, fz, clad(fz)); }
+}
+for (let fx = X0; fx <= X1; fx++) for (let fz = Z0; fz <= Z1; fz++) fset(fx, FL, fz, P.plinth[0]);
+// flat roof with a thin overhang and dark edge
+for (let fx = X0 - 1; fx <= X1 + 1; fx++) for (let fz = Z0 - 1; fz <= Z1 + 1; fz++) {
+  const edge = fx === X0 - 1 || fx === X1 + 1 || fz === Z0 - 1 || fz === Z1 + 1;
+  fset(fx, RY, fz, edge ? 0x6b4a2e : P.roof);
+  if (edge) fset(fx, RY - 1, fz, 0x6b4a2e);
+}
+// glass: overcast sky reflected in dark panes, lighter towards the top, with a diagonal sheen
+const cA = new THREE.Color(), cB = new THREE.Color(0x8796a0);
+function glassC(a, y, y0, y1) {
+  const t = (y - y0) / (y1 - y0);
+  cA.set(0x2b343a).lerp(cB, Math.pow(t, 1.6) * 0.8);
+  if ((((a + y) % (9 * S)) + 9 * S) % (9 * S) < S) cA.lerp(new THREE.Color(0xb7c3c9), 0.18);
+  return cA.getHex();
+}
+// window band on a wall: axis 'x' = wall at fixed fine z, 'z' = wall at fixed fine x; mullions every `pitch` fine cells
+function glazing(axis, l, a0, a1, y0, y1, pitch) {
+  for (let a = a0; a <= a1; a++) for (let y = y0; y <= y1; y++) {
+    const frame = a === a0 || a === a1 || y === y0 || y === y1 || (a - a0) % pitch === 0;
+    const c = frame ? P.frame : glassC(a, y, y0, y1);
+    axis === 'x' ? fset(a, y, l, c) : fset(l, y, a, c);
+  }
+}
+const wy0 = FL + S, wy1 = FL + Math.round(6.5 * S);
+glazing('x', Z1, 31 * S, X1, wy0, wy1, 4 * S);       // front: three big panes running to the corner
+glazing('z', X1, 24 * S, Z1, wy0, wy1, 3 * S);       // side: corner glazing
+for (let fy = wy0; fy <= wy1; fy++) fset(X1, fy, Z1, P.frame); // slim corner post
+// entrance step on the side
+for (let fz = 22 * S; fz < 24 * S; fz++) for (let fx = X1 + 1; fx <= X1 + S; fx++)
+  for (let fy = topAt(fx, fz) + 1; fy < FL; fy++) fset(fx, fy, fz, 0x7a5232);
+
+// ---------- vegetation and rocks ----------
+function blob(cx, cy, cz, r, pal, sy = 1, rough = 0.6) {
+  const R = r + 1;
+  for (let fx = Math.floor((cx - R) * S); fx <= Math.ceil((cx + R) * S); fx++)
+    for (let fy = Math.floor((cy - R * sy) * S); fy <= Math.ceil((cy + R * sy) * S); fy++)
+      for (let fz = Math.floor((cz - R) * S); fz <= Math.ceil((cz + R) * S); fz++) {
+        const d = Math.hypot(dc(fx) - cx, (dc(fy) - cy) / sy, dc(fz) - cz);
+        if (d <= r + (rnd() - 0.5) * rough) fset(fx, fy, fz, typeof pal === 'function' ? pal(fx, fy, fz, cy) : pick(pal));
+      }
+}
+const groundY = (x, z) => topAt(Math.round(x * S), Math.round(z * S)) / S;
+// Scots pine left of the cabin: bare reddish trunk, irregular layered crown
+{
+  const px = 23, pz = 27, gy = groundY(px, pz);
+  for (let fy = Math.round(gy * S); fy < Math.round((gy + 13) * S); fy++)
+    for (let i = 0; i < S; i++) for (let j = 0; j < S; j++) fset(px * S + i, fy, pz * S + j, pick(P.bark));
+  const crown = [[0, 6, 0, 3.4], [-1.8, 7.5, 1.2, 3], [1.6, 9.5, -1, 2.8], [0, 11.5, 0.5, 2.5], [-2.4, 5.2, -1.5, 2.4], [2.4, 7, 2, 2.6], [0.5, 13.5, 0, 1.8]];
+  for (const [dx, dy, dz, r] of crown) {
+    // short branch from the trunk to each clump keeps the crown attached
+    const steps = Math.ceil(Math.hypot(dx, dz) * S);
+    for (let s = 0; s <= steps; s++) fset(Math.round((px + 0.5 + dx * s / steps) * S), Math.round((gy + dy - 0.6) * S), Math.round((pz + 0.5 + dz * s / steps) * S), pick(P.bark));
+    blob(px + 0.5 + dx, gy + dy, pz + 0.5 + dz, r, P.pine, 0.65, 1);
+  }
+}
+// boulders with moss on top
+for (const [x, z, r] of [[17, 35, 2.2], [21, 39, 1.6], [25, 37, 1.4], [44, 36, 1.8], [12, 28, 1.6]]) {
+  const gy = groundY(x, z);
+  blob(x, gy + r * 0.35, z, r, (fx, fy, fz, cy) => (dc(fy) > cy + r * 0.3 && hash(fx, fz, 9) > 0.35 ? pick(P.moss) : pick(P.rock)), 0.75, 0.7);
+}
+// juniper and heather clumps around the hilltop
+for (const [x, z, r, pal] of [[41, 24, 1.8, P.juniper], [43, 28, 1.5, P.juniper], [40, 32, 1.4, P.heather], [36, 33, 1.5, P.juniper], [24, 30, 1.6, P.heather], [33, 18, 1.5, P.juniper], [46, 31, 1.3, P.heather], [15, 22, 1.5, P.juniper]]) {
+  const gy = groundY(x, z);
+  blob(x, gy + r * 0.45, z, r, pal, 0.7, 0.8);
+}
+
+// ---------- keep only what is connected to the ground ----------
+{
+  const seen = new Set(), stack = [];
+  const k0 = key(Math.round(TC * S), topAt(Math.round(TC * S), Math.round(TC * S)), Math.round(TC * S));
+  seen.add(k0); stack.push(V.get(k0));
+  const D = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+  while (stack.length) {
+    const v = stack.pop();
+    for (const [dx, dy, dz] of D) {
+      const k = key(v.x + dx, v.y + dy, v.z + dz);
+      if (!seen.has(k) && V.has(k)) { seen.add(k); stack.push(V.get(k)); }
+    }
+  }
+  let removed = 0;
+  for (const k of [...V.keys()]) if (!seen.has(k)) { V.delete(k); removed++; }
+  console.info(`connectivity: removed ${removed} floating voxels`);
+}
+
+// ---------- instanced mesh ----------
+const vox = [...V.values()];
+const LAYER = 0.3 / S;
+const DUR = 0.55;
+const minY = vox.reduce((m, v) => Math.min(m, v.y), 0);
+for (const v of vox) {
+  const radial = Math.hypot(v.x - TC * S, v.z - TC * S) / (N * S * 0.75);
+  v.t0 = (v.y - minY) * LAYER + (hash(v.x, v.z, v.y) * 0.6 + radial * 0.4) * 0.3 * 2.2;
+}
+vox.sort((a, b) => a.t0 - b.t0);
+const COUNT = vox.length;
+const BUILD_END = vox[COUNT - 1].t0 + DUR;
+document.getElementById('info').textContent = `${COUNT.toLocaleString()} voxels · F skip · H hides UI · drag to orbit · ?res=1-4`;
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const VIEW = 38;
+const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 1000);
+const controls = new OrbitControls(cam, renderer.domElement);
+controls.target.set(0, 7, 0);
+controls.enableDamping = true;
+let userMoved = false;
+controls.addEventListener('start', () => { userMoved = true; });
+const ORBIT_R = 120, ORBIT_EL = 0.3;
+function swayCamera(time) {
+  const az = Math.PI / 4 + Math.sin(time * 0.13) * 0.3;
+  cam.position.set(Math.sin(az) * Math.cos(ORBIT_EL) * ORBIT_R, 7 + Math.sin(ORBIT_EL) * ORBIT_R, Math.cos(az) * Math.cos(ORBIT_EL) * ORBIT_R);
+}
+swayCamera(0);
+function resize() {
+  const a = innerWidth / innerHeight;
+  const v = a < 1 ? VIEW / a : VIEW;
+  cam.left = -v * a; cam.right = v * a; cam.top = v; cam.bottom = -v;
+  cam.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+}
+addEventListener('resize', resize); resize();
+
+// overcast daylight: strong soft sky fill, weak diffuse sun
+scene.add(new THREE.HemisphereLight(0xe3e9ec, 0x6a6452, 2.1));
+const sun = new THREE.DirectionalLight(0xfff6ea, 1.1);
+sun.position.set(-45, 80, 35);
+sun.castShadow = true;
+sun.shadow.mapSize.set(4096, 4096);
+Object.assign(sun.shadow.camera, { left: -70, right: 70, top: 70, bottom: -70, near: 1, far: 250 });
+sun.shadow.bias = -0.0006;
+sun.shadow.normalBias = 0.02;
+sun.shadow.radius = 4;
+scene.add(sun);
+
+// soft voxel edge texture
+const cv = document.createElement('canvas'); cv.width = cv.height = 32;
+const g = cv.getContext('2d');
+g.fillStyle = '#dadada'; g.fillRect(0, 0, 32, 32);
+g.fillStyle = '#ffffff'; g.fillRect(3, 3, 26, 26);
+const tex = new THREE.CanvasTexture(cv);
+tex.colorSpace = THREE.SRGBColorSpace;
+
+const mesh = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshStandardMaterial({ map: tex, roughness: 0.9 }), COUNT);
+mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+mesh.castShadow = mesh.receiveShadow = true;
+mesh.frustumCulled = false;
+const c3 = new THREE.Color();
+vox.forEach((v, i) => {
+  c3.setHex(v.c).offsetHSL(0, 0, (hash(v.x, v.z, v.y + 99) - 0.5) * 0.05);
+  mesh.setColorAt(i, c3);
+});
+const group = new THREE.Group();
+group.scale.setScalar(1 / S);
+group.position.set(-TC + 0.5 / S, 0.5 / S - GY, -TC + 0.5 / S);
+group.add(mesh);
+scene.add(group);
+
+// ---------- animation ----------
+const M = mesh.instanceMatrix.array;
+function setM(i, x, y, z, s) {
+  const o = i * 16;
+  M[o] = s; M[o + 5] = s; M[o + 10] = s;
+  M[o + 12] = x; M[o + 13] = y; M[o + 14] = z;
+}
+const easeOutCubic = p => 1 - Math.pow(1 - p, 3);
+const easeOutBack = p => { const c = 1.9; return 1 + (c + 1) * Math.pow(p - 1, 3) + c * Math.pow(p - 1, 2); };
+const DROP = 6 * S;
+
+let t = 0, first = 0, paused = false, doneAt = -1, camT = 0;
+function reset() {
+  for (let i = 0; i < COUNT; i++) setM(i, 0, -9999, 0, 0);
+  mesh.instanceMatrix.needsUpdate = true;
+  t = 0; first = 0; doneAt = -1;
+}
+reset();
+
+function step() {
+  let i = first;
+  while (i < COUNT && vox[i].t0 <= t) {
+    const v = vox[i];
+    const p = (t - v.t0) / DUR;
+    if (p >= 1) {
+      setM(i, v.x, v.y, v.z, 1);
+      if (i === first) first++;
+    } else {
+      const s = Math.max(0, easeOutBack(Math.min(1, p * 1.25)));
+      setM(i, v.x, v.y + (1 - easeOutCubic(p)) * DROP, v.z, s);
+    }
+    i++;
+  }
+  mesh.instanceMatrix.needsUpdate = true;
+}
+
+const bar = document.querySelector('#bar i');
+const loopBox = document.getElementById('loop');
+document.getElementById('replay').onclick = reset;
+const pauseBtn = document.getElementById('pause');
+const togglePause = () => { paused = !paused; pauseBtn.textContent = paused ? 'Play (Space)' : 'Pause (Space)'; };
+pauseBtn.onclick = togglePause;
+addEventListener('keydown', e => {
+  if (e.code === 'KeyR') reset();
+  else if (e.code === 'KeyF') t = BUILD_END;
+  else if (e.code === 'Space') { e.preventDefault(); togglePause(); }
+  else if (e.code === 'KeyH') document.getElementById('ui').classList.toggle('hidden');
+});
+
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.1);
+  if (!paused) {
+    t += dt; camT += dt;
+    if (first < COUNT) step();
+    else if (doneAt < 0) doneAt = t;
+    else if (loopBox.checked && t - doneAt > 6) reset();
+    bar.style.width = Math.min(100, (t / BUILD_END) * 100) + '%';
+    if (!userMoved) swayCamera(camT);
+  }
+  controls.update();
+  renderer.render(scene, cam);
+});
+</script>
+</body>
+</html>

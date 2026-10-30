@@ -1,0 +1,1121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Starship Launch</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; font-family: system-ui, sans-serif; }
+  body { background: linear-gradient(#9e9194 0%, #978f97 45%, #8f9099 80%, #a39a98 100%); } /* sky sampled from the photo */
+  canvas { display: block; }
+  #ui { position: fixed; left: 16px; bottom: 16px; display: flex; gap: 8px; align-items: center; color: #2c3336; font-size: 13px; flex-wrap: wrap; }
+  #ui button { background: rgba(255,255,255,.5); color: #222; border: 1px solid rgba(0,0,0,.15); border-radius: 6px; padding: 6px 12px; cursor: pointer; font: inherit; }
+  #ui button:hover { background: rgba(255,255,255,.75); }
+  #bar { width: 160px; height: 4px; background: rgba(0,0,0,.15); border-radius: 2px; overflow: hidden; }
+  #bar i { display: block; height: 100%; width: 0; background: #d98a2e; }
+  #ui.hidden { display: none; }
+  label { display: flex; gap: 4px; align-items: center; user-select: none; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="ui">
+  <button id="replay">Replay (R)</button>
+  <button id="pause">Pause (Space)</button>
+  <label><input type="checkbox" id="loop" checked> Loop</label>
+  <label><input type="checkbox" id="orbit" checked> Orbit</label>
+  <div id="bar"><i></i></div>
+  <span id="info" style="opacity:.75"></span>
+</div>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+// Voxel subdivision: each design unit is S×S×S small voxels. Override with ?res=1..4
+const S = Math.max(1, Math.min(4, parseInt(new URLSearchParams(location.search).get('res')) || 3));
+
+// =====================================================================================================
+// ENGINE: helpers (keep as is)
+// =====================================================================================================
+function hash(x, z, s = 0) {
+  let h = Math.imul(x | 0, 374761393) ^ Math.imul(z | 0, 668265263) ^ Math.imul(s | 0, 1442695041);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  h ^= h >>> 16;
+  return (h >>> 0) / 4294967295;
+}
+function vnoise(x, z, sc, s = 0) {
+  x /= sc; z /= sc;
+  const xi = Math.floor(x), zi = Math.floor(z), xf = x - xi, zf = z - zi;
+  const u = xf * xf * (3 - 2 * xf), v = zf * zf * (3 - 2 * zf);
+  const a = hash(xi, zi, s), b = hash(xi + 1, zi, s), c = hash(xi, zi + 1, s), d = hash(xi + 1, zi + 1, s);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+let seed = 1234;
+const rnd = () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+const pick = a => a[Math.floor(rnd() * a.length)];
+
+// Fine-grid voxel store; e = false (lit), true (glowing), 'glass' (semi-transparent).
+// The +256 key offset matters: the island underside goes to negative y.
+const V = new Map();
+const key = (x, y, z) => ((x + 256) * 1024 + (y + 256)) * 1024 + (z + 256);
+// TAG marks what a voxel is (0 prop, 1 smoke, 2 rocket, 3 steel, 4 terrain, 5 flame): weathering and smoke use it
+let TAG = 0;
+const fset = (x, y, z, c, e = false) => V.set(key(x, y, z), { x, y, z, c, e, g: TAG });
+const fdel = (x, y, z) => V.delete(key(x, y, z));
+const fhas = (x, y, z) => V.has(key(x, y, z));
+const dc = f => (f - (S - 1) / 2) / S;                 // fine cell -> design coordinate
+const col = (c, x, y, z) => typeof c === 'function' ? c(x, y, z) : Array.isArray(c) ? c[Math.floor(hash(x * 7 + y, z, 3) * c.length)] : c;
+function fbox(x0, y0, z0, x1, y1, z1, c, e = false) {
+  for (let x = x0; x <= x1; x++) for (let y = y0; y <= y1; y++) for (let z = z0; z <= z1; z++) fset(x, y, z, col(c, x, y, z), e);
+}
+const box = (x0, y0, z0, x1, y1, z1, c, e) => fbox(x0 * S, y0 * S, z0 * S, x1 * S + S - 1, y1 * S + S - 1, z1 * S + S - 1, c, e);
+function shell(x0, y0, z0, x1, y1, z1, c) {            // hollow box, one fine voxel thick (design units)
+  const X0 = x0 * S, X1 = x1 * S + S - 1, Y0 = y0 * S, Y1 = y1 * S + S - 1, Z0 = z0 * S, Z1 = z1 * S + S - 1;
+  for (let x = X0; x <= X1; x++) for (let y = Y0; y <= Y1; y++) for (let z = Z0; z <= Z1; z++)
+    if (x === X0 || x === X1 || y === Y0 || y === Y1 || z === Z0 || z === Z1) fset(x, y, z, col(c, x, y, z));
+}
+// plane helpers: axis 'x' = wall at fixed fine z (a runs along x), 'z' = wall at fixed fine x (a runs along z)
+const pset = (axis, a, y, l, c, e) => axis === 'x' ? fset(a, y, l, c, e) : fset(l, y, a, c, e);
+const pdel = (axis, a, y, l) => axis === 'x' ? fdel(a, y, l) : fdel(l, y, a);
+function disc(cx, cz, r0, r1, fy0, fy1, c, e) {        // ring/disc, design centre + radii, fine y range
+  for (let fx = Math.floor((cx - r1 - 1) * S); fx <= Math.ceil((cx + r1 + 1) * S); fx++)
+    for (let fz = Math.floor((cz - r1 - 1) * S); fz <= Math.ceil((cz + r1 + 1) * S); fz++) {
+      const d = Math.hypot(dc(fx) - cx, dc(fz) - cz);
+      if (d >= r0 && d <= r1) for (let fy = fy0; fy <= fy1; fy++) fset(fx, fy, fz, col(c, fx, fy, fz), e);
+    }
+}
+function blob(cx, cy, cz, r, pal, sy = 1, rough = 0.6, e = false) {   // noisy ellipsoid (leaves, bushes, smoke)
+  const R = r + 1;
+  for (let fx = Math.floor((cx - R) * S); fx <= Math.ceil((cx + R) * S); fx++)
+    for (let fy = Math.floor((cy - R * sy) * S); fy <= Math.ceil((cy + R * sy) * S); fy++)
+      for (let fz = Math.floor((cz - R) * S); fz <= Math.ceil((cz + R) * S); fz++) {
+        const d = Math.hypot(dc(fx) - cx, (dc(fy) - cy) / sy, dc(fz) - cz);
+        if (d <= r + (rnd() - 0.5) * rough) fset(fx, fy, fz, pick(pal), e);
+      }
+}
+// face-connected line between two design points (trunks, branches, poles): steps one axis at a time
+function limb(x0, y0, z0, x1, y1, z1, pal, thick = 1) {
+  const n = Math.ceil(Math.hypot(x1 - x0, y1 - y0, z1 - z0) * S * 1.5);
+  const put = (fx, fy, fz) => { for (let a = 0; a < thick; a++) for (let b = 0; b < thick; b++) fset(fx + a, fy, fz + b, col(pal, fx + a, fy, fz + b)); };
+  let px = Math.round(x0 * S), py = Math.round(y0 * S), pz = Math.round(z0 * S);
+  put(px, py, pz);
+  for (let i = 1; i <= n; i++) {
+    const t = i / n, fx = Math.round((x0 + (x1 - x0) * t) * S), fy = Math.round((y0 + (y1 - y0) * t) * S), fz = Math.round((z0 + (z1 - z0) * t) * S);
+    while (px !== fx) { px += Math.sign(fx - px); put(px, py, pz); }
+    while (pz !== fz) { pz += Math.sign(fz - pz); put(px, py, pz); }
+    while (py !== fy) { py += Math.sign(fy - py); put(px, py, pz); }
+  }
+}
+
+// =====================================================================================================
+// SCENE: palette, ground, buildings, props (replace with your scene)
+// =====================================================================================================
+// Scale: this is not a house, so the house scale table does not apply. 1 design unit ≈ 1.2 m, proportions taken
+// from the photo (ship nose ≈ 112 units above the pad, tower ≈ 117, rocket diameter 9, tower 11 square).
+const P = {
+  lawn: [0x58603f, 0x4f5838, 0x626a46],                // coastal scrub grass at dusk
+  lawnDry: [0x86805e, 0x7a7656],
+  topsoil: [0x4a3f30, 0x40362a],
+  under: [0x7c776c, 0x6d685e, 0x5f5a51, 0x524e46],
+  concrete: [0x9a958f, 0x928d87, 0xa29d96],
+  joint: 0x7a756f,
+  scorch: [0x6e6760, 0x76706a, 0x625c56],
+  gravel: [0x8f8a82, 0x857f78, 0x99938a],
+  water: [0x3c4652, 0x46505c, 0x414b57],
+  waterHi: [0x8f8486, 0x7d7579],                       // fire glow reflected on the lagoon
+  steel: [0x6e7484, 0x676d7d, 0x737a8a],               // tower lattice (sampled #414756 / #333847)
+  steelHi: [0x80869a, 0x8a90a2],
+  olm: [0x6a6c74, 0x5e6068, 0x74767c],
+  frost: [0xebe7df, 0xe1ddd5, 0xf2eee6, 0xd9d4cb],     // frosted booster, lit warm by the flames
+  bsteel: [0xaaa7aa, 0x9f9ca0, 0xb3b0b2],
+  ssteel: [0xa9a5ab, 0x9e9aa2, 0xb2aeb3],              // ship stainless
+  tile: [0x2f2c33, 0x37343b, 0x2a282e, 0x3d3a41],      // heat-shield tiles
+  smoke: [0xe2dedc, 0xd8d4d3, 0xcdc8c8, 0xeae6e2],
+  tank: [0xd2d0ce, 0xc6c4c4, 0xdad8d6],
+  shrub: [0x3f4c35, 0x48563b, 0x52603f, 0x394531],
+  palm: [0x4d5e33, 0x58693a, 0x44552e],
+  weed: [0x55603a, 0x6a7343, 0x46522f, 0x7d8450],
+  litter: [0x7a6a44, 0x6f6440, 0x5f6038],
+  bark: [0x5a4c3c, 0x4d4033],
+  trim: 0xd4cfc6,
+  black: 0x1e1e22,
+  roof: [0x5a5550], roofCap: 0x44403c, leaf: [0x48563b],
+};
+const GLOW = 0xffd27a;
+const GLASS = 0x5f9cc4;
+const RED = 0xff3020;
+const FLAME = [0xfffdf2, 0xfff6cc, 0xffe7a0, 0xffd07a, 0xffb45a, 0xff9a48];
+
+const CX = 50, CZ = 50;            // island centre (design units)
+const GY = 3, TOP = GY * S;        // ground surface is fine layer TOP-1; things stand from TOP
+const F = v => Math.round(v * S);                       // design -> fine (box-style, like limb)
+const fi = v => Math.round(v * S + (S - 1) / 2);        // continuous design position -> nearest fine cell
+
+// key layout (design units)
+const RX = 56, RZ = 50, RR = 4.5;                       // rocket axis and radius
+const RB = GY + 16, HS0 = GY + 66, SH0 = GY + 68, NOSE0 = GY + 102, NOSE1 = GY + 113;
+const TWX0 = 35, TWX1 = 46, TWZ0 = 45, TWZ1 = 56, TWTOP = GY + 117;   // tower footprint [x0, x1) and top
+const ARMY0 = GY + 99, ARMY1 = GY + 107;                // chopstick carriage
+const QDY = GY + 70;                                    // ship quick-disconnect arm
+// regions on the ground
+const apron = (x, z) => ((x - 55) / 28) ** 4 + ((z - 50) / 16) ** 4 + (vnoise(x, z, 4, 31) - 0.5) * 0.3 < 1;
+const pond = (x, z) => ((x - 42) / 24) ** 2 + ((z - 84) / 6.5) ** 2 + (vnoise(x, z, 5, 32) - 0.5) * 0.6 < 1;
+const road = (x, z) => (Math.abs(x - 47 - (vnoise(0, z, 8, 33) - 0.5) * 2) < 2.2 && z < 36 && z > 6)
+  || (Math.abs(z - 33 - (vnoise(x, 0, 8, 34) - 0.5) * 2) < 2 && x > 18 && x < 47);
+
+// ---------- island: irregular lobed outline, rounded rim bumps, one iceberg rock mass underneath ----------
+const ISLAND = 7;
+const LOBES = [2, 3, 5].map((n, i) => ({ n, a: [3.2, 2.4, 1.3][i] * (0.6 + hash(n, i, ISLAND) * 0.8), p: hash(i, n, ISLAND + 1) * 6.283 }));
+function edgeR(x, z) {
+  const th = Math.atan2(z - CZ, x - CX), K = 14;
+  const u = (th / (2 * Math.PI) + 0.5) * K + (vnoise(th * 4 + 9, 3, 1, 8) - 0.5) * 0.5;
+  const k = Math.floor(u), f = u - k, bump = Math.sin(Math.PI * f) ** 2;
+  const amp = 0.6 + Math.pow(hash(((k % K) + K) % K, 0, 61 + ISLAND), 2) * 5;
+  const lobe = LOBES.reduce((s, l) => s + l.a * Math.sin(l.n * th + l.p), 0);
+  const ragged = (vnoise(x, z, 9, 62 + ISLAND) - 0.5) * 5 + (vnoise(x, z, 3.5, 63) - 0.5) * 1.6;
+  return 47 + lobe + ragged + amp * bump;
+}
+const LO = -16 * S, WD = (2 * CX + 32) * S, OUT = 1 << 14;
+const bottom = new Int32Array(WD * WD).fill(OUT), top = new Int32Array(WD * WD).fill(-OUT);
+const idx = (fx, fz) => (fx - LO) * WD + (fz - LO);
+const inGrid = (fx, fz) => fx >= LO && fz >= LO && fx < LO + WD && fz < LO + WD;
+const botAt = (fx, fz) => inGrid(fx, fz) ? bottom[idx(fx, fz)] : OUT;
+const topAt = (fx, fz) => inGrid(fx, fz) ? top[idx(fx, fz)] : -OUT;
+const edgeE = (x, z) => edgeR(x, z) - Math.pow((x - CX) ** 4 + (z - CZ) ** 4, 0.25);
+const isPond = (x, z) => pond(x, z) && edgeE(x, z) > 3;
+const heightAt = (x, z) => apron(x, z) || road(x, z) ? 0 : isPond(x, z) ? -1 / S : vnoise(x, z, 6, 71) > 0.7 ? 0.5 : 0;
+for (let fx = LO; fx < LO + WD; fx++) for (let fz = LO; fz < LO + WD; fz++) {
+  const x = dc(fx), z = dc(fz);
+  const e = edgeE(x, z);
+  if (e < 0) continue;
+  top[idx(fx, fz)] = TOP - 1 + Math.round(heightAt(x, z) * S);
+  const ra = Math.min(1, Math.hypot(x - CX - 3, z - CZ + 2) / 58);
+  const facet = (Math.floor(vnoise(x, z, 7, 51) * 5) / 5 - 0.4) * 6;
+  const depth = 2 + Math.min(1, e / 4) * (34 * Math.pow(1 - ra, 1.4) + facet * (1 - ra));
+  bottom[idx(fx, fz)] = TOP - 1 - Math.max(S, Math.round(depth * S));
+}
+function surfaceC(x, z, fx, fz) {
+  if (isPond(x, z)) return Math.abs(x - 52 + (z - 84) * 0.3) < 3 + vnoise(x, z, 2, 35) * 3 && hash(fx, fz, 36) < 0.6 ? pick(P.waterHi) : pick(P.water);
+  if (apron(x, z)) {
+    const d = Math.hypot(x - RX, z - RZ);
+    if (d < 15 && vnoise(x, z, 3, 37) + (15 - d) / 30 > 0.75) return pick(P.scorch);                  // scorch fan
+    if (((fx % (5 * S)) + 5 * S) % (5 * S) === 0 || ((fz % (5 * S)) + 5 * S) % (5 * S) === 0) return P.joint;   // slab joints
+    return hash(fx >> 2, fz >> 2, 38) < 0.05 ? 0x8a857f : pick(P.concrete);                              // repaired slabs
+  }
+  if (road(x, z)) return pick(P.gravel);
+  return vnoise(x, z, 5, 72) > 0.72 && hash(fx, fz, 73) < 0.8 ? pick(P.lawnDry)
+    : P.lawn[(Math.floor((x + z * 0.15) / 3) % 2 + 2) % 2 + (hash(fx, fz, 2) > 0.85 ? 1 : 0)];
+}
+TAG = 4;
+for (let fx = LO; fx < LO + WD; fx++) for (let fz = LO; fz < LO + WD; fz++) {
+  const b = botAt(fx, fz);
+  if (b === OUT) continue;
+  const t = topAt(fx, fz), x = dc(fx), z = dc(fz);
+  const nb = [[1, 0], [-1, 0], [0, 1], [0, -1]].map(([a, c]) => [botAt(fx + a, fz + c), topAt(fx + a, fz + c)]);
+  for (let fy = b; fy <= t; fy++) {
+    if (fy !== b && fy !== t && nb.every(([nbot, ntop]) => nbot < fy && ntop > fy)) continue;
+    let c;
+    if (fy > t - 2 * S) c = fy === t || nb.some(([n]) => n === OUT) ? surfaceC(x, z, fx, fz) : pick(P.topsoil);
+    else c = P.under[Math.min(3, Math.floor((TOP - fy) / (7 * S)))];
+    fset(fx, fy, fz, c);
+  }
+  if (!apron(x, z) && !road(x, z) && !isPond(x, z) && hash(fx, fz, 41) < 0.015) fset(fx, t + 1, fz, pick([0x6a7350, 0x76805a, 0x5f6a46]));
+}
+TAG = 0;
+
+// ---------- generic parts ----------
+const tmp = new THREE.Color();
+function win(axis, l, dir, a0, a1, y0, y1, o = {}) {
+  const A0 = a0 * S, A1 = a1 * S + S - 1, Y0 = y0 * S, Y1 = y1 * S + S - 1, ym = Math.floor((Y0 + Y1) / 2);
+  const lit = o.lit ?? hash(a0 * 3 + l, y0, 9) > 0.5;
+  for (let a = A0; a <= A1; a++) for (let y = Y0; y <= Y1; y++) {
+    if (a === A0 || a === A1 || y === Y0 || y === Y1 || (!o.door && (a - A0) % 4 === 0) || y === ym) {
+      pset(axis, a, y, l, P.trim);
+      if (a === A0 || a === A1 || y === Y0 || y === Y1) for (let k = 1; k <= 3; k++) pset(axis, a, y, l - k * dir, 0xb8ac94);   // reveal holds the room back
+      continue;
+    }
+    pdel(axis, a, y, l);
+    pset(axis, a, y, l - dir, GLASS, 'glass');
+    const t = (y - Y0) / Math.max(1, Y1 - Y0);
+    pset(axis, a, y, l - 3 * dir, lit || o.door ? tmp.set(0xf0c070).lerp(new THREE.Color(0xfff0c0), t).getHex() : 0x2c2a2e, lit || o.door);
+  }
+  for (let a = A0 - 1; a <= A1 + 1; a++) pset(axis, a, Y1 + 1, l, P.trim);
+}
+// square lattice tower section: corner columns, ring beams every seg fine layers, X braces on all four faces
+function lattice(X0, X1, Z0, Z1, Y0, Y1, seg, cc, cb, ct) {
+  for (const [x, z] of [[X0, Z0], [X1 - ct + 1, Z0], [X0, Z1 - ct + 1], [X1 - ct + 1, Z1 - ct + 1]]) fbox(x, Y0, z, x + ct - 1, Y1, z + ct - 1, cc);
+  for (let y = Y0; y <= Y1; y += seg) {
+    const y1 = Math.min(Y1, y + 1);
+    fbox(X0, y, Z0, X1, y1, Z0, cc); fbox(X0, y, Z1, X1, y1, Z1, cc);
+    fbox(X0, y, Z0, X0, y1, Z1, cc); fbox(X1, y, Z0, X1, y1, Z1, cc);
+  }
+  const L = (a, b, c, d, e, f) => limb(a / S, b / S, c / S, d / S, e / S, f / S, cb, 1);
+  for (let y = Y0; y + seg <= Y1; y += seg) {
+    const ya = y + 2, yb = y + seg - 1;
+    for (const z of [Z0, Z1]) { L(X0, ya, z, X1, yb, z); L(X1, ya, z, X0, yb, z); }
+    for (const x of [X0, X1]) { L(x, ya, Z0, x, yb, Z1); L(x, ya, Z1, x, yb, Z0); }
+  }
+}
+// truss beam along +x between fine x0..x1: top and bottom chords (bottom may slope), verticals and diagonals
+function trussX(x0, x1, z0, z1, yt, yb0, yb1, c) {
+  fbox(x0, yt - 1, z0, x1, yt, z1, c);
+  const yb = x => Math.round(yb0 + (yb1 - yb0) * (x - x0) / Math.max(1, x1 - x0));
+  for (let x = x0; x <= x1; x++) fbox(x, yb(x), z0, x, yb(x) + 1, z1, c);
+  for (let x = x0; x <= x1; x += 6) {
+    fbox(x, yb(x), z0, x, yt, z0, c); fbox(x, yb(x), z1, x, yt, z1, c);
+    const xn = Math.min(x1, x + 6);
+    for (const z of [z0, z1]) limb(x / S, (yb(x) + 1) / S, z / S, xn / S, (yt - 1) / S, z / S, c, 1);
+  }
+}
+function puffBase(cx, cy, cz, r, sy, put) {
+  const R = r * 1.4 + 1;
+  for (let fx = fi(cx - R); fx <= fi(cx + R); fx++)
+    for (let fy = Math.max(TOP, fi(cy - R * sy)); fy <= fi(cy + R * sy); fy++)
+      for (let fz = fi(cz - R); fz <= fi(cz + R); fz++) {
+        const x = dc(fx), y = dc(fy), z = dc(fz);
+        const d = Math.hypot(x - cx, (y - cy) / sy, z - cz);
+        const n = (vnoise(x + y * 0.6, z - y * 0.4, 2.2, 21) - 0.5) + (vnoise(x - y * 0.8, z + y * 0.7, 5, 22) - 0.5) * 1.2;
+        if (d <= r * (1 + n * 0.4)) put(fx, fy, fz, d / r);
+      }
+}
+// smoke never overwrites structures or flames, only terrain and other smoke
+function puff(cx, cy, cz, r, sy = 0.8) {
+  TAG = 1;
+  puffBase(cx, cy, cz, r, sy, (fx, fy, fz) => {
+    const ex = V.get(key(fx, fy, fz));
+    if (ex && ex.g !== 4 && ex.g !== 1) return;
+    fset(fx, fy, fz, P.smoke[Math.floor(hash(fx >> 1, fy >> 1, fz >> 1) * 4)]);
+  });
+  TAG = 0;
+}
+function fire(cx, cy, cz, r, sy = 0.8, heat = 0.3) {          // heat 0 = white-hot near the engines, 1 = orange tail
+  TAG = 5;
+  puffBase(cx, cy, cz, r, sy, (fx, fy, fz, t) => {
+    const ex = V.get(key(fx, fy, fz));
+    if (ex && ex.g !== 4 && ex.g !== 1 && ex.g !== 5) return;
+    fset(fx, fy, fz, FLAME[Math.min(5, Math.floor(heat * 4 + Math.max(0, t) * 1.6 + hash(fx, fy, fz) * 1.2))], true);
+  });
+  TAG = 0;
+}
+function hcyl(x0, x1, cy, cz, r, c) {                  // horizontal tank along x with rounded ends
+  for (let fx = F(x0); fx <= F(x1); fx++) {
+    const x = dc(fx), end = Math.max(0, Math.max(x0 + r * 0.8 - x, x - (x1 - r * 0.8)));
+    const rr = Math.sqrt(Math.max(0, r * r - (end / 0.8) ** 2));
+    for (let fy = fi(cy - r - 1); fy <= fi(cy + r + 1); fy++) for (let fz = fi(cz - r - 1); fz <= fi(cz + r + 1); fz++) {
+      const d = Math.hypot(dc(fy) - cy, dc(fz) - cz);
+      if (d <= rr && (d > rr - 1.1 || end > 0)) fset(fx, fy, fz, col(c, fx, fy, fz));
+    }
+  }
+}
+function vtank(cx, cz, r, h, c) {
+  disc(cx, cz, r - 0.8, r, TOP, F(GY + h), c);
+  for (let k = 0; k <= 3; k++) disc(cx, cz, 0, r - 0.4 * k, F(GY + h) + 1 + k, F(GY + h) + 1 + k, c);   // domed top
+  disc(cx, cz, r - 0.2, r + 0.1, F(GY + h * 0.5), F(GY + h * 0.5), 0xa8a6a6);                              // weld band
+}
+const CANOPY = [];                                       // (no deciduous trees here; scruff still expects it)
+function lantern(axis, l, dir, a, y) {
+  pset(axis, a, y + 2, l + dir, P.black);
+  for (let i = 0; i < 2; i++) for (let k = 0; k < 2; k++) pset(axis, a + i, y + k, l + 2 * dir, GLOW, true);
+  for (let i = 0; i < 2; i++) { pset(axis, a + i, y + 2, l + 2 * dir, P.black); pset(axis, a + i, y - 1, l + 2 * dir, P.black); }
+}
+function shrub(x, z, r) {
+  const t = topAt(fi(x), fi(z));
+  if (t === -OUT) return;
+  blob(x, dc(t) + r * 0.4, z, r, P.shrub, 0.7, 1.2);
+}
+function palm(x, z, h) {
+  const lx = (rnd() - 0.5) * 3, lz = (rnd() - 0.5) * 3, tx = x + lx, tz = z + lz, ty = GY + h;
+  limb(x, GY, z, x + lx * 0.4, GY + h * 0.55, z + lz * 0.4, P.bark, 1);
+  limb(x + lx * 0.4, GY + h * 0.55, z + lz * 0.4, tx, ty, tz, P.bark, 1);
+  for (let i = 0; i < 7; i++) {
+    const a = i / 7 * 6.283 + rnd(), L = 3 + rnd() * 1.5;
+    const mx = tx + Math.cos(a) * L * 0.55, mz = tz + Math.sin(a) * L * 0.55;
+    limb(tx, ty, tz, mx, ty + 0.8, mz, P.palm, 1);
+    limb(mx, ty + 0.8, mz, tx + Math.cos(a) * L, ty - 1.2 - rnd(), tz + Math.sin(a) * L, P.palm, 1);
+  }
+  blob(tx, ty + 0.3, tz, 0.8, P.palm, 1, 0.3);
+}
+
+// ---------- launch tower ("chopsticks" tower) ----------
+const TX0 = F(TWX0), TX1 = F(TWX1) - 1, TZ0 = F(TWZ0), TZ1 = F(TWZ1) - 1, TY1 = F(TWTOP);
+box(TWX0 - 1, GY, TWZ0 - 1, TWX1, GY + 1, TWZ1, P.concrete);                    // footing
+TAG = 3;
+lattice(TX0, TX1, TZ0, TZ1, TOP, TY1, 6 * S, P.steelHi, P.steel, Math.max(1, Math.round(1.5 * S)));
+lattice(F(39), F(42) - 1, F(49), F(52) - 1, TOP, TY1, 12 * S, P.steel, P.steel, 1);   // elevator core
+for (let y = TOP + 24 * S; y < TY1; y += 24 * S)                                  // gratings tie core and frame together
+  for (let x = TX0; x <= TX1; x++) for (let z = TZ0; z <= TZ1; z++) if (hash(x, z, y) > 0.25 || x === TX0 || z === TZ0) fset(x, y, z, pick(P.steel));
+fbox(TX0 - 2, TY1, TZ0 - 2, TX1 + 2, TY1 + 1, TZ1 + 2, P.steelHi);                 // crown deck
+for (let x = TX0 - 2; x <= TX1 + 2; x++) for (const z of [TZ0 - 2, TZ1 + 2]) { if ((x - TX0) % 4 === 0) fbox(x, TY1 + 2, z, x, TY1 + 3, z, P.steel); fset(x, TY1 + 4, z, P.steel); }
+for (let z = TZ0 - 2; z <= TZ1 + 2; z++) for (const x of [TX0 - 2, TX1 + 2]) { if ((z - TZ0) % 4 === 0) fbox(x, TY1 + 2, z, x, TY1 + 3, z, P.steel); fset(x, TY1 + 4, z, P.steel); }
+const MX = Math.round((TX0 + TX1) / 2) - 3, MZ = Math.round((TZ0 + TZ1) / 2);
+fbox(MX, TY1 + 2, MZ, MX + 1, TY1 + 2 + 10 * S, MZ + 1, P.steelHi);                 // lightning mast
+fbox(MX, TY1 + 3 + 10 * S, MZ, MX, TY1 + 3 + 14 * S, MZ, P.steelHi);
+fset(MX, TY1 + 4 + 14 * S, MZ, RED, true);
+for (const [x, z] of [[TX0 - 2, TZ0 - 2], [TX1 + 2, TZ0 - 2], [TX0 - 2, TZ1 + 2], [TX1 + 2, TZ1 + 2]]) fset(x, TY1 + 5, z, RED, true);
+// chopstick carriage wrapped around the tower, two arms either side of the ship, counterweight truss on the left
+for (let x = TX0 - 1; x <= TX1 + 1; x++) for (let y = F(ARMY0); y <= F(ARMY1); y++) for (let z = TZ0 - 1; z <= TZ1 + 1; z++)
+  if (x === TX0 - 1 || x === TX1 + 1 || z === TZ0 - 1 || z === TZ1 + 1) fset(x, y, z, (y - F(ARMY0)) % 4 === 0 ? P.steelHi[0] : pick(P.steel));
+const ARMZ = [[TZ0 - 4, TZ0 - 2], [TZ1 + 2, TZ1 + 4]];
+for (const [z0, z1] of ARMZ) {
+  trussX(TX1 + 2, F(RX + 18), z0, z1, F(ARMY1) - 1, F(ARMY0) + 1, F(ARMY0 + 4), P.steelHi);
+  fbox(TX1 - 3, F(ARMY0), z0, TX1 + 3, F(ARMY1), z1, P.steel);                    // arm root plate, bolted to the carriage side
+  fbox(F(RX + 18) - 1, F(ARMY0 + 4), z0, F(RX + 18), F(ARMY1) - 1, z1, P.steel);   // arm tip
+}
+fbox(TX1 + 2, F(ARMY0), TZ0 - 4, TX1 + 2, F(ARMY1), TZ0 - 2, P.steel);
+trussX(F(TWX0 - 11), TX0 - 2, F(47), F(47) + 2, F(ARMY1) - 2, F(ARMY0 + 3), F(ARMY0 + 1), P.steel);
+trussX(F(TWX0 - 11), TX0 - 2, F(54) - 2, F(54), F(ARMY1) - 2, F(ARMY0 + 3), F(ARMY0 + 1), P.steel);
+fbox(F(TWX0 - 11), F(ARMY0 + 3), F(47), F(TWX0 - 11) + 1, F(ARMY1) - 2, F(54), P.steelHi);   // counterweight block
+// ---------- the rocket ----------
+TAG = 2;
+const ang = (fx, fz) => Math.atan2(dc(fz) - RZ, dc(fx) - RX);
+const RACE = 2.5;                                                                // raceway angle (front-left)
+const boosterC = (fx, fy, fz) => {
+  const y = dc(fy), th = ang(fx, fz);
+  if (y < RB + 3) return pick(P.bsteel.map(c => c - 0x101010));                  // aft skirt
+  if (fy % (4 * S) === 0) return 0xc9c4bd;                                        // weld rings
+  const frost = y < GY + 58 && Math.abs(y - (GY + 40)) > 1 && vnoise(th * 9 + 20, y, 2.5, 25) > 0.2;
+  return frost ? P.frost[Math.floor(hash(fx, fy, fz) * 4)] : pick(P.bsteel);
+};
+for (let fy = F(RB); fy < F(HS0); fy++) disc(RX, RZ, RR - 0.9, RR, fy, fy, boosterC);
+disc(RX, RZ, 0, RR, F(RB), F(RB), 0x3a3634);                                     // thrust plate
+for (let fy = F(RB + 3); fy < F(HS0 - 2); fy++)                                   // raceway (chine conduit)
+  for (const rr of [RR - 0.2, RR + 0.2]) fset(fi(RX + Math.cos(RACE) * rr), fy, fi(RZ + Math.sin(RACE) * rr), 0x8e8a86);
+for (let k = 0; k < 4; k++) {                                                    // grid fins
+  const th = Math.PI / 4 + k * Math.PI / 2;
+  for (let a = -1.4; a <= 1.4; a += 0.2) for (let rr = RR - 0.4; rr <= RR + 1.6; rr += 0.2) {
+    const fx = fi(RX + Math.cos(th) * rr - Math.sin(th) * a), fz = fi(RZ + Math.sin(th) * rr + Math.cos(th) * a);
+    for (let fy = F(GY + 61); fy <= F(GY + 63); fy++) fset(fx, fy, fz, Math.abs(a) > 1.2 || rr > RR + 1.4 || fy === F(GY + 61) ? 0x56565c : 0x343438);
+  }
+}
+for (let fy = F(HS0); fy < F(SH0); fy++)                                          // vented hot-staging ring
+  disc(RX, RZ, 0, RR + 0.25, fy, fy, (fx, y, fz) => Math.floor((ang(fx, fz) + Math.PI) * 12 / Math.PI) % 2 && fy < F(SH0) - 1 ? 0x2b2a2e : 0x5a595e);
+const shipC = (fx, fy, fz) => {
+  const z = dc(fz) - RZ, th = ang(fx, fz);
+  if (z < -0.6 + (hash(fx, fy, 27) - 0.5) * 0.8 || (Math.abs(Math.cos(th)) < 0.2 && z < 0.8)) return hash(fx, fy, fz) < 0.04 ? 0x55525a : pick(P.tile);   // heat shield on the back half
+  if (fy % (4 * S) === 0) return 0x8f8b92;
+  return P.ssteel[Math.floor(hash(fx >> 1, fy, fz) * 3)];
+};
+for (let fy = F(SH0); fy < F(NOSE0); fy++) disc(RX, RZ, RR - 0.9, RR, fy, fy, shipC);
+{                                                                                 // ogive nose, tiles wrap round the tip
+  let prev = RR;
+  for (let fy = F(NOSE0); fy <= F(NOSE1); fy++) {
+    const t = (dc(fy) - NOSE0) / (NOSE1 - NOSE0), rr = RR * Math.pow(Math.max(0, Math.cos(t * Math.PI / 2)), 0.75);
+    const th = rr < 1.6 ? rr + 0.5 : Math.max(1.0, prev - rr + 0.9);
+    disc(RX, RZ, Math.max(0, rr - th), Math.max(0.5, rr), fy, fy, (fx, y, fz) => t > 0.75 ? pick(P.tile) : shipC(fx, y, fz));
+    prev = rr;
+  }
+}
+// flaps: plates in the x-y plane on ±x, tiles on the back face
+function flap(side, y0, y1, extBot, extTop, rIn) {
+  for (let fy = F(y0); fy < F(y1); fy++) {
+    const t = (fy - F(y0)) / Math.max(1, F(y1) - F(y0) - 1), r = rIn(dc(fy)), ext = extBot + (extTop - extBot) * t;
+    for (let fx = fi(RX + side * (r - 0.6)); side > 0 ? fx <= fi(RX + r + ext) : fx >= fi(RX - r - ext); fx += side)
+      for (const fz of [fi(RZ) - 1, fi(RZ)]) fset(fx, fy, fz, fz === fi(RZ) - 1 ? pick(P.tile) : pick(P.ssteel));
+  }
+}
+const noseR = y => y < NOSE0 ? RR : RR * Math.pow(Math.max(0, Math.cos((y - NOSE0) / (NOSE1 - NOSE0) * Math.PI / 2)), 0.75);
+for (const s of [1, -1]) { flap(s, SH0 + 0.5, SH0 + 11, 2.8, 1.4, () => RR); flap(s, NOSE0 - 1, NOSE0 + 4.5, 1.8, 0.8, noseR); }
+
+// ship QD arm (after the hull exists, so it can stop exactly at the hull)
+TAG = 3;
+{
+  const z0 = F(46.5), z1 = z0 + 2, yt = F(QDY + 2) + 1, yb = F(QDY);
+  let xe = TX1 + 1;
+  while (xe < F(RX) && ![z0, z0 + 1, z1].some(z => fhas(xe + 1, yb + 2, z))) xe++;
+  trussX(TX1 + 1, xe, z0, z1, yt, yb, yb, P.steelHi);
+  fbox(xe - 3, yb - 2, z0 - 1, xe, yt + 1, z1 + 1, 0x5a5d66);                     // QD hood against the ship
+  limb((TX1 + 1) / S, QDY - 7, z0 / S, (xe - 6) / S, yb / S, z0 / S, P.steel, 2);   // raking brace
+}
+
+// ---------- orbital launch mount ----------
+for (let k = 0; k < 6; k++) {
+  const a = Math.PI / 6 + k * Math.PI / 3, lx = fi(RX + Math.cos(a) * 7.6), lz = fi(RZ + Math.sin(a) * 7.6);
+  fbox(lx - S, TOP, lz - S, lx + S - 1, F(RB - 3) - 1, lz + S - 1, P.olm);
+  fbox(lx - S - 1, TOP, lz - S - 1, lx + S, TOP + 1, lz + S, P.concrete);       // leg footing
+}
+disc(RX, RZ, 3.4, 9, F(RB - 3), F(RB) - 1, (fx, fy, fz) => fy === F(RB) - 1 && hash(fx, fz, 28) < 0.15 ? 0x7e5a3e : pick(P.olm));   // ring, rust spots
+for (let k = 0; k < 10; k++) {                                                   // hold-down clamps
+  const a = k * Math.PI / 5 + 0.2, cx = fi(RX + Math.cos(a) * 5.4), cz = fi(RZ + Math.sin(a) * 5.4);
+  fbox(cx - 1, F(RB), cz - 1, cx, F(RB) + 2, cz, 0x4e5058);
+}
+disc(RX, RZ, 0, 6, TOP, TOP, 0x55575c);                                          // flame deflector
+TAG = 0;
+
+// ---------- tank farm (left), pipe rack to the mount ----------
+TAG = 3;
+for (const [z, x0, x1] of [[60, 6, 21], [63.6, 7, 22], [67.2, 6, 20]]) {
+  hcyl(x0, x1, GY + 2.3, z, 1.6, P.tank);
+  for (const x of [x0 + 2, (x0 + x1) / 2, x1 - 2]) fbox(F(x), TOP, F(z) - 2, F(x) + 1, F(GY + 1), F(z) + 1, 0x6a6c72);   // saddles
+}
+vtank(10, 46, 2.4, 15, P.tank); vtank(16, 44, 2.2, 13, P.tank); vtank(13, 52, 2, 11, [0xb8b4b0, 0xc4c0bc]);
+lattice(F(19), F(25) - 1, F(46), F(52) - 1, TOP, F(GY + 16), 4 * S, P.steelHi, P.steel, 1);   // shrouded tank frame
+vtank(22, 49, 2.2, 15, P.tank);
+for (let x = 22; x <= 52; x += 4) fbox(F(x), TOP, F(58), F(x), F(GY + 2.5), F(58), P.steel);   // pipe rack posts
+fbox(F(18), F(GY + 3), F(58) - 1, F(53.5), F(GY + 3) + 1, F(58), 0xb0aca6);       // propellant line
+fbox(F(18), F(GY + 3) + 1, F(58) + 1, F(53.5), F(GY + 3) + 1, F(58) + 1, 0x8c7a5a);   // smaller line
+fbox(F(53.5), F(GY + 1), F(57), F(55), F(GY + 3) + 1, F(58), 0x6a6c72);            // line drops into the mount leg
+TAG = 0;
+
+// ---------- detailed props: authored in fine cells at S = 3 (one cell ≈ 0.37 m, real size ×1.0–1.2), scaled with S ----------
+const q = n => Math.round(n * S / 3);
+// sprite: local x = width, y = up, z = length (front = +z); rot turns it in 90° steps about y
+function sprite(ox, oy, oz, rot = 0) {
+  const tr = (a, d) => rot === 0 ? [a, d] : rot === 1 ? [d, -a] : rot === 2 ? [-a, -d] : [-d, a];
+  const put = (x, y, z, c, e = false) => {
+    const cc = col(c, x + ox, y, z + oz);
+    for (let a = q(x); a < Math.max(q(x) + 1, q(x + 1)); a++) for (let b = q(y); b < Math.max(q(y) + 1, q(y + 1)); b++)
+      for (let d = q(z); d < Math.max(q(z) + 1, q(z + 1)); d++) { const [X, Z] = tr(a, d); fset(ox + X, oy + b, oz + Z, cc, e); }
+  };
+  put.box = (x0, y0, z0, x1, y1, z1, c, e) => { for (let x = x0; x <= x1; x++) for (let y = y0; y <= y1; y++) for (let z = z0; z <= z1; z++) put(x, y, z, c, e); };
+  put.w = (x, y, z) => { const [X, Z] = tr(q(x), q(z)); return [(ox + X) / S, (oy + q(y)) / S, (oz + Z) / S]; };   // local -> design, for limb()
+  return put;
+}
+const TYRE = 0x1c1c1e, HUB = 0xa4a4a8, CHROME = 0xb8babe, DARK = 0x2a2a2e, HEAD = 0xfff4d8, TAIL = 0xff3a2a;
+function wheel(s, x, z) {                                         // truck wheel, 4 long × 3 tall (≈1.1 m)
+  for (const [y, z0, z1] of [[0, z, z + 1], [1, z - 1, z + 2], [2, z, z + 1]]) for (let k = z0; k <= z1; k++) s(x, y, k, TYRE);
+  s(x, 1, z, HUB); s(x, 1, z + 1, HUB);
+}
+function carWheel(s, x, z) {                                      // car wheel, 3 long × 2 tall (≈0.75 m)
+  for (let k = z; k <= z + 2; k++) s(x, 0, k, TYRE);
+  s(x, 1, z, TYRE); s(x, 1, z + 1, HUB); s(x, 1, z + 2, TYRE);
+}
+// pickup / SUV, 6 × 18 × 6 cells (2.2 × 6.7 × 2.2 m): glass cab with seats, pillars, mirrors, grille, lights, bed
+function pickup(s, body, o = {}) {
+  const mud = (x, y, z) => y === 1 && hash(x, z, 7) < 0.4 ? 0x6a5a44 : body;
+  const z0 = o.suv ? 1 : 7, z1 = 11, zm = Math.round((z0 + z1) / 2);
+  s.box(1, 0, 1, 4, 0, 14, DARK);                                 // underbody
+  s.box(0, 1, 0, 5, 2, 15, mud);                                  // lower body
+  s.box(1, 3, z0 + 1, 4, 4, z1 - 1, 0x34302c);                    // seats and dash behind the glass
+  for (let z = z0; z <= z1; z++) for (const x of [0, 5]) for (const y of [3, 4]) {
+    const pillar = z === z0 || z === z1 || z === zm;
+    s(x, y, z, pillar ? body : GLASS, pillar ? false : 'glass');
+  }
+  for (let x = 1; x <= 4; x++) for (const y of [3, 4]) { s(x, y, z1, GLASS, 'glass'); s(x, y, z0, GLASS, 'glass'); }
+  s.box(0, 5, z0, 5, 5, z1, body);                                // roof
+  if (o.suv) for (let z = z0 + 1; z < z1; z++) { s(0, 6, z, DARK); s(5, 6, z, DARK); }   // roof rails
+  else {
+    for (let z = 0; z < z0; z++) { s(0, 3, z, body); s(5, 3, z, body); }               // bed walls
+    s.box(1, 3, 0, 4, 3, 0, body);                                                      // tailgate
+    s.box(1, 2, 1, 4, 2, z0 - 1, 0x303032);                                             // bed liner
+    if (o.cargo) o.cargo(s);
+  }
+  s.box(1, 2, 16, 4, 2, 16, x => x === 1 || x === 4 ? CHROME : DARK);                  // grille
+  s(0, 2, 16, HEAD, true); s(5, 2, 16, HEAD, true);
+  s.box(0, 1, 16, 5, 1, 16, CHROME); s.box(0, 1, -1, 5, 1, -1, CHROME);                 // bumpers
+  s(0, 2, -1, TAIL, true); s(5, 2, -1, TAIL, true);
+  s(-1, 3, z1 - 1, DARK); s(6, 3, z1 - 1, DARK);                                        // mirrors
+  s(0, 2, z1 - 2, DARK); s(5, 2, z1 - 2, DARK);                                         // door handles
+  for (const z of [2, 12]) { carWheel(s, 0, z); carWheel(s, 5, z); }
+  if (o.bar) for (let x = 1; x <= 4; x++) s(x, 6, z1 - 1, x % 2 ? 0xffa020 : 0xff7a10, true);   // amber light bar
+  if (o.whip) for (let y = 6; y <= 9; y++) s(5, y, z0, DARK);
+}
+// fuel tanker, 6 × 49 cells (2.2 × 18 m): tractor with sleeper, stacks and side tanks; polished barrel trailer with
+// catwalk, rails, rear ladder, hose tube and placard
+function tanker(s, cab) {
+  const T = 8;                                                    // tractor sits further forward on the longer trailer
+  s.box(1, 1, 0, 4, 1, 37 + T, DARK);
+  s.box(1, 2, 22 + T, 4, 2, 26 + T, 0x3a3a3c);                    // fifth wheel
+  s.box(0, 2, 27 + T, 5, 9, 29 + T, cab);                         // sleeper
+  s.box(0, 2, 30 + T, 5, 5, 35 + T, cab);
+  s.box(1, 6, 31 + T, 4, 7, 34 + T, 0x34302c);
+  for (let z = 30; z <= 35; z++) for (const x of [0, 5]) for (const y of [6, 7]) s(x, y, z + T, z === 30 || z === 35 ? cab : GLASS, z === 30 || z === 35 ? false : 'glass');
+  for (let x = 1; x <= 4; x++) for (const y of [6, 7]) s(x, y, 35 + T, GLASS, 'glass');
+  s.box(0, 8, 30 + T, 5, 8, 35 + T, cab); s.box(1, 9, 27 + T, 4, 9, 33 + T, cab);   // roof and fairing
+  s.box(0, 2, 36 + T, 5, 4, 38 + T, cab);                         // hood
+  s.box(1, 2, 39 + T, 4, 4, 39 + T, (x, y) => y % 2 ? CHROME : DARK);
+  s(0, 3, 39 + T, HEAD, true); s(5, 3, 39 + T, HEAD, true); s.box(0, 1, 39 + T, 5, 1, 39 + T, CHROME);
+  for (const x of [-1, 6]) { s.box(x, 2, 31 + T, x, 3, 33 + T, CHROME); s.box(x, 5, 29 + T, x, 11, 29 + T, CHROME); s(x, 5, 35 + T, DARK); }
+  for (const z of [23, 27, 35]) { wheel(s, 0, z + T); wheel(s, 5, z + T); }
+  const steel = [0xc8cacc, 0xbcbec1, 0xd4d6d8], L = 30;
+  for (let z = 0; z <= L; z++) for (let x = -1; x <= 6; x++) for (let y = 2; y <= 9; y++) {
+    const d = Math.hypot(x - 2.5, y - 5.5);
+    if (d > 3.6 || (d < 2.4 && z > 0 && z < L)) continue;
+    s(x, y, z, z === 0 || z === L ? CHROME : z % 6 === 3 ? 0x8f9194 : pick(steel));
+  }
+  for (let z = 3; z <= L - 3; z++) s.box(1, 10, z, 4, 10, z, z % 2 ? 0x55565a : 0x3e3f42);    // catwalk grating
+  for (let z = 3; z <= L - 3; z += 4) { s(1, 11, z, CHROME); s(4, 11, z, CHROME); }
+  for (let z = 3; z <= L - 3; z++) { s(1, 12, z, CHROME); s(4, 12, z, CHROME); }
+  for (let y = 2; y <= 9; y++) { s(1, y, -1, CHROME); s(4, y, -1, CHROME); if (y % 2) s.box(2, y, -1, 3, y, -1, CHROME); }
+  s.box(-1, 3, 5, -1, 3, L - 4, DARK);                            // hose tube
+  s(-2, 6, 3, 0xe8541c); s(-2, 6, 4, 0xe8541c); s(-2, 5, 3, 0xf2f0ea); s(-2, 5, 4, 0xe8541c);
+  for (const z of [3, 7]) { wheel(s, 0, z); wheel(s, 5, z); }
+  for (const x of [1, 4]) s.box(x, 0, L - 4, x, 1, L - 4, CHROME);  // landing gear
+  s.box(1, 0, L - 4, 4, 0, L - 4, DARK);
+}
+// 20 ft shipping container, 7 × 7 × 17 cells (2.6 × 2.6 × 6.3 m): corrugated sides, corner castings, two doors with
+// lock bars, rust and a stencil
+function container(s, c1, c2) {
+  const W = 6, H = 6, L = 16;
+  for (let x = 0; x <= W; x++) for (let y = 0; y <= H; y++) for (let z = 0; z <= L; z++) {
+    if (x > 0 && x < W && y > 0 && y < H && z > 0 && z < L) continue;
+    const corner = (x === 0 || x === W) + (y === 0 || y === H) + (z === 0 || z === L) >= 2;
+    let c = (x === 0 || x === W) ? (z % 2 ? c1 : c2) : y === H ? c2 : z === 0 ? (y % 2 ? c1 : c2) : c1;
+    if (z === L && x === W / 2 && y < H) c = DARK;
+    if (corner) c = 0x3a3a3c;
+    else if (hash(x * 13 + z, y, c1 & 255) < 0.06) c = 0x7a4a30;
+    if (x === 0 && y >= 3 && y <= 4 && z >= 4 && z <= 11 && hash(z, y, 3) > 0.35) c = 0xe6e4de;
+    s(x, y, z, c);
+  }
+  for (const x of [1, 2, 4, 5]) s.box(x, 1, L + 1, x, H - 1, L + 1, 0xa8a8aa);
+  for (const x of [2, 4]) s(x, 3, L + 1, 0x8a1e1e);               // handles
+}
+function dish(cx, cy, cz, R, n) {                                 // tilted paraboloid dish, design units, n = unit axis
+  const f = R * 0.9;
+  for (let fx = fi(cx - R - 1); fx <= fi(cx + R + 1); fx++) for (let fy = fi(cy - R - 1); fy <= fi(cy + R + 1); fy++) for (let fz = fi(cz - R - 1); fz <= fi(cz + R + 1); fz++) {
+    const p = [dc(fx) - cx, dc(fy) - cy, dc(fz) - cz], h = p[0] * n[0] + p[1] * n[1] + p[2] * n[2], r2 = p[0] ** 2 + p[1] ** 2 + p[2] ** 2 - h * h;
+    if (r2 <= R * R && Math.abs(h - r2 / (4 * f)) < 0.55 / S + 0.2) fset(fx, fy, fz, r2 > (R - 0.5) ** 2 ? 0xc8c6c2 : 0xe6e4e0);
+  }
+  limb(cx, cy, cz, cx + n[0] * f * 0.8, cy + n[1] * f * 0.8, cz + n[2] * f * 0.8, DARK, 1);   // feed arm
+}
+function latticeBoom(p0, p1, w, c, cl) {                          // 4 chords with zigzag lacing, tapered at both ends
+  const d = p1.map((v, i) => v - p0[i]), L = Math.hypot(...d), u = d.map(v => v / L);
+  const n1 = [0, 0, 1], n2 = [-u[1], u[0], 0];
+  const half = t => w / 2 * Math.min(1, 0.45 + Math.min(t, 1 - t) * 4);
+  const pt = (t, a, b) => { const h = half(t); return [0, 1, 2].map(i => p0[i] + d[i] * t + (a * n1[i] + b * n2[i]) * h); };
+  const C = [[-1, -1], [1, -1], [1, 1], [-1, 1]], N = Math.max(4, Math.round(L / (w * 1.6)));
+  for (let k = 0; k < N; k++) for (let j = 0; j < 4; j++) {
+    const [a, b] = C[j], [a2, b2] = C[(j + 1) % 4];
+    limb(...pt(k / N, a, b), ...pt((k + 1) / N, a, b), c, 1);
+    if (k % 2) limb(...pt(k / N, a2, b2), ...pt((k + 1) / N, a, b), cl, 1); else limb(...pt(k / N, a, b), ...pt((k + 1) / N, a2, b2), cl, 1);
+  }
+}
+
+// ---------- imagined back and sides ----------
+// launch control bunker (back left): parapet, AC units, vents, dish, door canopy, step, sign, bollards
+shell(16, GY, 20, 30, GY + 3, 30, P.concrete);                  // 4.4 m tall, earth-sheltered look
+box(15, GY + 4, 19, 31, GY + 4, 31, [0x8a857e, 0x827d77]);
+{
+  const X0 = F(15), X1 = F(32) - 1, Z0 = F(19), Z1 = F(32) - 1, Y = F(GY + 5);
+  for (let x = X0; x <= X1; x++) for (let z = Z0; z <= Z1; z++) if (x === X0 || x === X1 || z === Z0 || z === Z1) fset(x, Y, z, 0x8e8983);
+  for (const ax of [F(17), F(20)]) {                              // AC units with fan grilles (1.8 × 1.1 × 1.8 m)
+    fbox(ax, Y, F(21), ax + q(5), Y + q(3), F(21) + q(5), [0xb4b2ae, 0xaaa8a4]);
+    for (let a = 1; a <= q(4); a++) for (let b = 1; b <= q(4); b++) fset(ax + a, Y + q(3), F(21) + b, Math.hypot(a - q(2.5), b - q(2.5)) < q(1.6) ? (a === Math.round(q(2.5)) || b === Math.round(q(2.5)) ? 0x8a8a8a : 0x2c2c2e) : 0xb4b2ae);
+    for (let y = Y; y <= Y + q(3); y++) for (let z = F(21) + 1; z < F(21) + q(5); z += 2) fset(ax, y, z, 0x6a6a6a);
+  }
+  for (const [x, z] of [[F(26), F(27)], [F(26) + 2, F(27)], [F(28), F(25)]]) { fbox(x, Y, z, x, Y + q(4) + (x & 1), z, 0x5a5a5e); fset(x, Y + q(5) + (x & 1), z, 0x3a3a3c); }
+  fbox(F(28), Y, F(21), F(28), Y + q(8), F(21), P.steel);         // dish mast
+  dish(28.8, (Y + q(8)) / S + 0.5, 21.7, 1.3, [0.55, 0.65, 0.52].map(c => c / Math.hypot(0.55, 0.65, 0.52)));
+  limb(F(28) / S, (Y + q(8)) / S, F(21) / S, 28.8, (Y + q(8)) / S + 0.5, 21.7, P.steel, 1);   // dish arm
+  const FR = 30 * S + S - 1;                                      // front wall plane
+  fbox(F(22.5), F(GY + 2) + 1, FR + 1, F(25) - 1, F(GY + 2) + 1, FR + q(4), 0x55565a);   // door canopy
+  fbox(F(22.5), TOP, FR + 1, F(25) - 1, TOP, FR + q(3), [0xa29d96, 0x9a958f]);           // step
+  fbox(F(23), TOP + 1, FR + 1, F(24.5), TOP + 1, FR + q(2), 0x5a4a3a);                   // mat
+  fbox(F(25.5), F(GY + 1), FR + 1, F(26.2), F(GY + 1.6), FR + 1, (x, y) => y === F(GY + 1) ? 0xc8322a : 0xeeece6);   // sign
+  for (const x of [20, 23.7, 27.5]) { fbox(F(x), TOP, FR + q(7), F(x), TOP + q(2), FR + q(7), 0xe8b820); fset(F(x), TOP + q(3), FR + q(7), DARK); }   // bollards
+  for (let x = F(16); x <= F(30); x++) fset(x, F(GY + 3), FR + 1, (x & 3) ? 0x6a6a6e : 0x4a4a4e);   // cable tray
+}
+win('x', 30 * S + S - 1, 1, 23, 24, GY, GY + 1, { door: true });                 // 2.2 × 2.2 m door
+win('x', 30 * S + S - 1, 1, 19, 20, GY + 1, GY + 2, { lit: true });
+win('x', 30 * S + S - 1, 1, 27, 28, GY + 1, GY + 2, { lit: false });
+lantern('x', 30 * S + S - 1, 1, F(25) + 1, F(GY + 1) + 1);
+// vehicles: pickups by the bunker (one crew truck with a light bar), an SUV on the road, a fuel tanker on the back road
+pickup(sprite(F(33), TOP, F(19), 0), 0xe8e6e2, { bar: true, whip: true, cargo: s => { s.box(1, 3, 5, 4, 3, 6, 0x8a1e1e); s(2, 3, 2, 0x2e5a8a); s(3, 4, 6, 0x8a1e1e); } });
+pickup(sprite(F(36) + 1, TOP, F(20), 0), 0x3a4652, { cargo: s => { s.box(1, 3, 1, 2, 4, 2, 0xc8a050); s(3, 3, 3, 0x2a2a2a); } });
+pickup(sprite(F(36), TOP, F(34), 1), 0x9a2a26, { suv: true });
+tanker(sprite(F(45.8), TOP, F(11), 0), 0xd84a1c);
+// generator on a trailer next to the bunker (2.2 × 4.8 × 2.2 m), cable snaking to the wall
+{
+  const s = sprite(F(10), TOP, F(22), 0);
+  s.box(0, 2, 0, 5, 4, 8, [0x5a6a4a, 0x52623f]);
+  for (let z = 1; z <= 7; z += 2) { s(0, 3, z, DARK); s(5, 3, z, DARK); }
+  s.box(1, 5, 1, 4, 5, 7, 0x4a5a3a); s(4, 6, 2, DARK); s(4, 7, 2, DARK);   // roof and exhaust
+  s.box(1, 1, 0, 4, 1, 8, DARK); s.box(2, 1, 9, 3, 1, 12, DARK); s(2, 0, 12, DARK);
+  carWheel(s, -1, 3); carWheel(s, 6, 3);
+  for (let x = 7; x <= 15; x++) s(x, 0, 4 + ((x >> 1) & 1), 0x1e1e1e);
+  for (let x = 7; x <= 15; x += 2) s(x, 0, 5, 0x1e1e1e);
+}
+// crawler crane (back right) on timber mats: tracks with rollers, slewing upper with engine grilles, counterweight
+// with hazard stripes, glazed cab, gantry, lattice boom with pendants, hoist rope, hook block lifting a steel beam
+{
+  const s = sprite(F(65), TOP, F(24) + 8, 1);
+  const Y = [0xe2ac2e, 0xd8a228], G = 0x55565c;
+  for (let z = -2; z <= 23; z++) s.box(-2, 0, z, 18, 0, z, z % 4 === 3 ? 0x4a3a28 : [0x8a6a44, 0x7a5c3a, 0x93734a][(z >> 2) % 3]);
+  for (const x0 of [0, 13]) for (let x = x0; x <= x0 + 3; x++) for (let y = 1; y <= 4; y++) for (let z = 0; z <= 21; z++) {
+    if ((z === 0 || z === 21) && (y === 1 || y === 4)) continue;
+    const outer = y === 1 || y === 4 || z === 0 || z === 21;
+    s(x, y, z, outer ? (z % 2 ? DARK : 0x3c3c3e) : (y === 2 || y === 3) && z % 4 === 2 && (x === x0 || x === x0 + 3) ? 0x5a5a5e : 0x333336);
+  }
+  s.box(4, 2, 6, 12, 4, 15, G);
+  s.box(5, 5, 7, 11, 5, 14, 0x6e6e72);                            // slewing ring
+  s.box(2, 6, 4, 14, 10, 17, Y);
+  for (const x of [2, 14]) for (let y = 7; y <= 9; y++) for (let z = 6; z <= 11; z++) if (z % 2 === 0) s(x, y, z, DARK);   // engine grilles
+  s.box(2, 6, 0, 14, 11, 3, (x, y, z) => z === 0 ? (((x + y) % 4 + 4) % 4 < 2 ? 0xe2ac2e : DARK) : y % 2 ? G : 0x4a4b50);
+  for (let z = 5; z <= 15; z++) { s(2, 12, z, CHROME); s(14, 12, z, CHROME); if (z % 3 === 2) { s(2, 11, z, CHROME); s(14, 11, z, CHROME); } }   // handrails
+  for (let x = 15; x <= 18; x++) for (let y = 6; y <= 11; y++) for (let z = 12; z <= 18; z++) {
+    if (x > 15 && x < 18 && y > 6 && y < 11 && z > 12 && z < 18) continue;
+    const glass = y >= 8 && y <= 10 && ((z === 18 && x >= 16 && x <= 17) || (x === 18 && z >= 13 && z <= 17));
+    s(x, y, z, glass ? GLASS : y === 11 ? 0xd8d4cc : Y, glass ? 'glass' : false);
+  }
+  s.box(16, 7, 14, 17, 8, 16, 0x34302c);                          // operator seat
+  for (let y = 3; y <= 5; y++) s(19, y, 14, CHROME);               // step
+  limb(...s.w(4, 11, 7), ...s.w(6, 18, 10), Y, 1); limb(...s.w(12, 11, 7), ...s.w(10, 18, 10), Y, 1);   // gantry
+  limb(...s.w(6, 18, 10), ...s.w(10, 18, 10), Y, 1);
+  s.box(6, 10, 16, 10, 11, 19, G);                                // boom foot
+  const foot = s.w(8, 11.5, 18), a = 1.08, L = 34;
+  const tip = [foot[0] + Math.cos(a) * L, foot[1] + Math.sin(a) * L, foot[2]];
+  latticeBoom(foot, tip, 1.4, Y, [0xd09a26, 0xc89428]);
+  fbox(fi(tip[0]) - 1, fi(tip[1]) - 1, fi(tip[2]) - 1, fi(tip[0]) + 1, fi(tip[1]) + 1, fi(tip[2]) + 1, G);   // sheave head
+  for (const dz of [-0.4, 0.4]) limb(...s.w(8, 18, 10).map((v, i) => i === 2 ? v + dz : v), tip[0] - 0.4, tip[1], tip[2] + dz, P.black, 1);   // pendants
+  const hx = fi(tip[0] + 0.6), hz = fi(tip[2]), hy = F(GY + 17);
+  for (let y = hy + 1; y < fi(tip[1]); y++) fset(hx, y, hz, P.black);                // hoist rope
+  fbox(hx - 1, hy - 3, hz - 1, hx + 1, hy, hz + 1, (x, y) => y % 2 ? 0xe2ac2e : DARK);  // hook block
+  fset(hx, hy - 4, hz, DARK); fset(hx, hy - 5, hz, DARK); fset(hx + 1, hy - 5, hz, DARK); fset(hx + 1, hy - 4, hz, DARK);
+  const by = F(GY + 9);                                            // slings to a steel beam
+  for (const dz of [-3.2, 3.2]) limb(hx / S, (hy - 5) / S, hz / S, hx / S, by / S, (hz + dz * S) / S, 0x2a2a2a, 1);
+  for (let z = hz - F(3.6); z <= hz + F(3.6); z++) { fset(hx, by, z, 0x7a6e66); fset(hx, by - 2, z, 0x7a6e66); fset(hx, by - 1, z, 0x6a5e56); fset(hx - 1, by, z, 0x7a6e66); fset(hx + 1, by, z, 0x7a6e66); fset(hx - 1, by - 2, z, 0x7a6e66); fset(hx + 1, by - 2, z, 0x7a6e66); }
+  for (let y = by - 3; y >= TOP; y--) fset(hx, y, hz + F(3.6), 0xd8c070);                 // tag line to the ground
+}
+
+function tankLadder(cx, cz, r, h) {                               // caged-free ladder up the +x side, handrail ring on top
+  const z = fi(cz), yTop = F(GY + h) + 4;
+  let X = fi(cx);
+  while (fhas(X + 1, TOP + 2, z)) X++;
+  X += 1;
+  for (let y = TOP; y <= yTop + 2; y++) { fset(X + 1, y, z - 1, CHROME); fset(X + 1, y, z + 1, CHROME); if (y % 2 === 0) fset(X + 1, y, z, CHROME); if (y % 6 === 0) { fset(X, y, z - 1, CHROME); fset(X, y, z + 1, CHROME); } }
+  for (let k = 0; k < 8; k++) { const a = k * Math.PI / 4; const px = fi(cx + Math.cos(a) * (r - 0.3)), pz = fi(cz + Math.sin(a) * (r - 0.3)); fbox(px, F(GY + h) + 1, pz, px, F(GY + h) + 3, pz, CHROME); }
+  disc(cx, cz, r - 0.5, r, F(GY + h) + 3, F(GY + h) + 3, CHROME);
+  fbox(fi(cx + r) - 1, TOP, z + 2, fi(cx + r) + 2, TOP + 1, z + 3, 0x8a8c90);   // outlet pipe stub
+}
+// deluge water tanks (back right), lightning masts, floodlights
+vtank(84, 36, 2.2, 11, P.tank); vtank(89, 40, 2.2, 11, P.tank); vtank(85.5, 42, 1.8, 9, [0xb8b4b0]);
+tankLadder(84, 36, 2.2, 11); tankLadder(89, 40, 2.2, 11);
+for (const [x, z, h] of [[28, 30, 40], [88, 30, 44]]) {
+  TAG = 3;
+  fbox(F(x), TOP, F(z), F(x) + 1, F(GY + h), F(z) + 1, P.steelHi);
+  fbox(F(x), F(GY + h) + 1, F(z), F(x), F(GY + h + 4), F(z), P.steelHi);
+  fset(F(x), F(GY + h + 4) + 1, F(z), RED, true);
+  box(x - 1, GY, z - 1, x + 1, GY, z + 1, P.concrete);
+  TAG = 0;
+}
+const flood = [[44, 30], [70, 32], [92, 52]];
+for (const [x, z] of flood) {
+  TAG = 3;
+  fbox(F(x), TOP, F(z), F(x), F(GY + 14), F(z), P.steel);
+  fbox(F(x) - 1, F(GY + 14) + 1, F(z) - 1, F(x) + 1, F(GY + 14) + 2, F(z) + 1, P.black);
+  TAG = 0;
+  fbox(F(x) - 1, F(GY + 14) + 3, F(z) - 1, F(x) + 1, F(GY + 14) + 3, F(z) + 1, 0xfff4d8, true);
+}
+// clutter: shipping containers, jersey barriers, cones, a cable drum, sandbags, debris on the apron
+container(sprite(F(54), TOP, F(23) + 4, 1), 0x3f5f7a, 0x36546c);
+container(sprite(F(54) + 1, TOP + q(7), F(23) + 4, 1), 0x8a4a32, 0x7a4029);               // stacked slightly off
+container(sprite(F(54), TOP, F(23) + 4 + q(10), 1), 0x4a6a3a, 0x405e32);
+for (let z = 8; z < 34; z += 4) for (const x of [44.2, 49.6]) if (hash(x, z, 5) > 0.2) fbox(F(x), TOP, F(z), F(x) + q(1), TOP + q(1), F(z) + q(9), P.concrete);   // 0.7 × 0.7 × 3.7 m barriers
+for (const [x, z] of [[46, 37], [49.5, 37.4], [62, 34], [33, 61]]) { fset(F(x), TOP, F(z), 0xf06a1c); fset(F(x), TOP + 1, F(z), 0xf2f0ea); }
+disc(66, 30, 0, 1.4, TOP, TOP + 2, (x, y, z) => y === TOP + 1 ? 0x2a2a2a : 0x8a6a40);
+for (let i = 0; i < 7; i++) blob(78 + i * 0.9, GY + 0.3, 31 + (i % 2) * 0.4, 0.6, [0xb4a07a, 0xa89470], 0.6, 0.1);
+for (let i = 0; i < 40; i++) {
+  const a = rnd() * 6.283, d = 10 + rnd() * 14, x = RX + Math.cos(a) * d, z = RZ + Math.sin(a) * d * 0.6;
+  if (apron(x, z) && !fhas(fi(x), TOP, fi(z))) fset(fi(x), TOP, fi(z), pick([0x8a857f, 0x6e6964, 0x9a948c]));
+}
+// vegetation: scrub everywhere off the pad, palms on the right and back, kept off the sight lines to the rocket
+for (let i = 0; i < 140; i++) {
+  const x = 2 + rnd() * 96, z = 2 + rnd() * 96;
+  const fx = fi(x), fz = fi(z);
+  if (topAt(fx, fz) === -OUT || edgeE(x, z) < 2 || apron(x, z) || road(x, z) || isPond(x, z) || fhas(fx, topAt(fx, fz) + 1, fz)) continue;
+  if (x > 4 && x < 32 && z > 38 && z < 72) continue;                               // tank farm
+  if (x > 13 && x < 40 && z > 17 && z < 38) continue;                               // bunker yard
+  shrub(x, z, 0.7 + rnd() * 1.2);
+}
+for (const [x, z, h] of [[90, 62, 11], [94, 70, 9], [86, 74, 12.5], [62, 14, 10], [8, 34, 8.5], [96, 46, 10]])
+  if (topAt(fi(x), fi(z)) !== -OUT && edgeE(x, z) > 2) palm(x, z, h);
+// reeds and rocks along the lagoon
+for (let i = 0; i < 60; i++) {
+  const x = 18 + rnd() * 48, z = 76 + rnd() * 16, fx = fi(x), fz = fi(z);
+  if (isPond(x, z) || topAt(fx, fz) === -OUT || ![[3, 0], [-3, 0], [0, 3], [0, -3]].some(([a, b]) => isPond(x + a / S, z + b / S))) continue;
+  const t = topAt(fx, fz);
+  if (hash(fx, fz, 44) < 0.7) for (let k = 1; k <= 2 + (hash(fx, fz, 45) * 3 | 0); k++) fset(fx, t + k, fz, pick(P.weed));
+  else fbox(fx, t + 1, fz, fx + 1, t + 1, fz + 1, pick([0x7c776c, 0x6d685e]));
+}
+
+// ---------- fire and smoke ----------
+// flame column through the mount, then flames spilling out under the clouds (right) and up the steam column (left)
+TAG = 5;
+for (let fy = TOP; fy < F(RB); fy++) disc(RX, RZ, 0, 3.4, fy, fy, (fx, y, fz) => FLAME[Math.min(5, Math.floor(Math.hypot(dc(fx) - RX, dc(fz) - RZ) / 3.4 * 3 + hash(fx, y, fz) * 1.5))], true);
+TAG = 0;
+for (let k = 0; k < 6; k++) { const a = k * Math.PI / 3; fire(RX + Math.cos(a) * 5, GY + 1.8, RZ + Math.sin(a) * 5, 3, 0.55, 0); }
+{                                                                                 // right jet: one continuous ragged tongue
+  const pts = [[58, 2.5, 6, 3.8], [62, 3, 9.5, 3.8], [66.5, 4.5, 12, 3.6], [71, 5.5, 13.5, 3.3], [75.5, 6.5, 14.5, 3], [80, 7, 15, 2.5], [84, 7.5, 15, 2], [88, 7.5, 14.5, 1.4]];
+  for (let i = 0; i + 1 < pts.length; i++) for (let s = 0; s < 1; s += 0.34) {
+    const [a, b] = [pts[i], pts[i + 1]], m = k => a[k] + (b[k] - a[k]) * s;
+    fire(m(0), GY + m(1), RZ + m(2), m(3), 0.7, (i + s) / pts.length);
+  }
+  fire(70, GY + 10, RZ + 11, 2.6, 0.8, 0.5); fire(57, GY + 9, RZ + 6.5, 2.6, 0.8, 0);
+}
+{                                                                                 // left: flames run out under the tower and climb the steam column
+  const pts = [[49, 2, 56, 2.8], [44, 2.5, 59, 2.8], [38.5, 3.5, 61, 2.8], [34.5, 6, 61.5, 2.8], [33.5, 11, 61, 2.7], [32.8, 16, 60.6, 2.5], [32, 21, 60.4, 2.3], [31.3, 26, 60.2, 2.1], [30.6, 31, 60, 1.8], [30, 35.5, 59.8, 1.4], [29.5, 39, 59.6, 1]];
+  for (let i = 0; i + 1 < pts.length; i++) for (let s = 0; s < 1; s += 0.34) {
+    const [a, b] = [pts[i], pts[i + 1]], m = k => a[k] + (b[k] - a[k]) * s;
+    fire(m(0), GY + m(1), m(2), m(3), 0.9, 0.15 + (i + s) / pts.length * 0.9);
+  }
+}
+// clouds: low wide bank to the right, a front skirt hiding the mount base, a bank and a tall steam column on the left
+const PUFFS = [
+  [64, GY + 4, 47, 8, 0.75], [72, GY + 5.5, 50, 8.5, 0.75], [80, GY + 5, 47, 7.5, 0.75], [88, GY + 4.5, 50, 6.5, 0.75], [94, GY + 3.5, 49, 4.5, 0.8],
+  [70, GY + 11, 50, 6, 0.8], [81, GY + 10, 49, 5.5, 0.8], [62, GY + 3.5, 60, 6, 0.7], [76, GY + 3.5, 61, 6, 0.7], [86, GY + 3.5, 59, 5.5, 0.7],
+  [66, GY + 4, 38, 6, 0.7], [79, GY + 3.5, 39, 5.5, 0.7], [61, GY + 11, 45, 4.5, 0.9],
+  [54, GY + 4.5, 61, 6.5, 0.75], [46, GY + 3.5, 63, 5.5, 0.75], [57, GY + 8, 57, 4.5, 0.9], [50, GY + 5, 42, 5.5, 0.8], [58, GY + 3.5, 40, 5, 0.8],
+  [39, GY + 4.5, 61, 5.5, 0.8], [30, GY + 5, 57, 6.5, 0.8], [23, GY + 4.5, 55, 5.5, 0.8], [28, GY + 4.5, 45, 5.5, 0.8], [33, GY + 6, 51, 5, 0.85],
+];
+for (let i = 0; i < 8; i++) PUFFS.push([29 - i * 0.6, GY + 11 + i * 6, 55 + i * 0.2, 5.8 - i * 0.2, 0.9]);
+PUFFS.push([24.5, GY + 57, 57, 3.8, 0.8], [27, GY + 52, 59, 3.2, 0.8]);
+for (const [x, y, z, r, sy] of PUFFS) puff(x, y, z, r, sy);
+// smoke interiors are never seen: keep a 2-voxel skin
+{
+  const D = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]], cut = [];
+  for (const v of V.values()) if (v.g === 1 && D.every(([a, b, c]) => fhas(v.x + a, v.y + b, v.z + c) && fhas(v.x + 2 * a, v.y + 2 * b, v.z + 2 * c))) cut.push(v);
+  for (const v of cut) fdel(v.x, v.y, v.z);
+  console.info(`smoke: culled ${cut.length} interior voxels`);
+}
+
+const norm = v => { const l = Math.hypot(...v); return v.map(c => c / l); };
+// Baked lamps (design units). The fire lamps ignore shadows: they glow through the steam they sit in.
+const bakedLights = [
+  { x: RX, y: GY + 3, z: RZ, color: 0xffa850, power: 4, r: 46, shadow: false },
+  { x: 73, y: GY + 7, z: RZ + 13, color: 0xffa04a, power: 3.2, r: 30, shadow: false },
+  { x: 32, y: GY + 20, z: 61, color: 0xffb060, power: 3, r: 28, shadow: false },
+  { x: RX + 3, y: GY + 12, z: RZ + 12, color: 0xffc888, power: 3.6, r: 60, shadow: false },   // flame light up the booster
+  ...[24, 36, 48, 60].map(y => ({ x: RX + 2, y: GY + y, z: RZ + 10, color: 0xffd9a0, power: 2.4 - y / 40, r: 24, shadow: false })),   // flame light up the booster
+  ...flood.map(([x, z]) => ({ x, y: GY + 15.5, z, color: 0xfff0d0, power: 1.3, r: 22, dir: norm([RX - x, -9, RZ - z]), cone: 0.5 })),
+  { x: 25, y: GY + 3.5, z: 31.5, color: 0xffc070, power: 1.1, r: 8 },
+];
+
+// =====================================================================================================
+// ENGINE: connectivity, meshes, lighting, animation (keep; tune lights/camera to the scene)
+// =====================================================================================================
+// scruff: weeds at the foot of anything standing in the lawn, leaf litter under trees. Strengths 0 = off.
+const SCRUFF = { weeds: 0.2, litter: 0.4 };
+{
+  const add = [];
+  for (let fx = LO; fx < LO + WD; fx++) for (let fz = LO; fz < LO + WD; fz++) {
+    const t = topAt(fx, fz);
+    if (t === -OUT || fhas(fx, t + 1, fz)) continue;
+    const foot = [[1, 0], [-1, 0], [0, 1], [0, -1]].some(([a, c]) => fhas(fx + a, t + 1, fz + c) && fhas(fx + a, t + 2, fz + c));
+    if (foot && hash(fx, fz, 81) < SCRUFF.weeds) {
+      const n = hash(fx, fz, 82) < 0.4 ? 2 : 1;
+      for (let k = 1; k <= n; k++) add.push([fx, t + k, fz, pick(P.weed)]);
+      if (hash(fx, fz, 83) < 0.12) add.push([fx, t + n + 1, fz, pick([0xf2d64a, 0xffffff, 0xc89ad8])]);
+    }
+  }
+  for (const [cx, cz, r] of CANOPY)
+    for (let fx = Math.floor((cx - r) * S); fx <= Math.ceil((cx + r) * S); fx++) for (let fz = Math.floor((cz - r) * S); fz <= Math.ceil((cz + r) * S); fz++) {
+      const d = Math.hypot(dc(fx) - cx, dc(fz) - cz) / r, v = V.get(key(fx, topAt(fx, fz), fz));
+      if (v && d < 1.1 && hash(fx, fz, 84) < SCRUFF.litter * (1.1 - d)) v.c = pick(P.litter);
+    }
+  for (const [x, y, z, c] of add) fset(x, y, z, c);
+}
+
+// keep only what is connected (face to face) to one seed on the ground surface
+{
+  const seen = new Set(), stack = [];
+  const k0 = key(Math.round(CX * S), topAt(Math.round(CX * S), Math.round((CZ + 12) * S)), Math.round((CZ + 12) * S));
+  seen.add(k0); stack.push(V.get(k0));
+  const D = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+  while (stack.length) {
+    const v = stack.pop();
+    for (const [dx, dy, dz] of D) {
+      const k = key(v.x + dx, v.y + dy, v.z + dz);
+      if (!seen.has(k) && V.has(k)) { seen.add(k); stack.push(V.get(k)); }
+    }
+  }
+  let removed = 0;
+  const lost = {};
+  for (const k of [...V.keys()]) if (!seen.has(k)) { const v = V.get(k), b = `${v.x / S >> 2 << 2},${v.y / S >> 2 << 2},${v.z / S >> 2 << 2}`; lost[b] = (lost[b] || 0) + 1; V.delete(k); removed++; }
+  window.__lost = lost;
+  console.info(`connectivity: removed ${removed} floating voxels`);
+}
+
+const vox = [...V.values()];
+const LAYER = 0.1 / S;            // seconds per fine layer
+const DUR = 0.55;                  // drop duration per voxel
+const minY = vox.reduce((m, v) => Math.min(m, v.y), 0);
+for (const v of vox) {
+  const radial = Math.hypot(v.x - CX * S, v.z - CZ * S) / (2 * CX * S * 0.75);
+  v.t0 = (v.y - minY) * LAYER + (hash(v.x, v.z, v.y) * 0.6 + radial * 0.4) * 0.28 * 2.2;
+}
+vox.sort((a, b) => a.t0 - b.t0);
+const COUNT = vox.length;
+const BUILD_END = vox[COUNT - 1].t0 + DUR;
+document.getElementById('info').textContent = `${COUNT.toLocaleString()} voxels · F skip · H hides UI · drag to orbit · ?res=1-4`;
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.25;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+{ // dusk sky sampled from the photo, as a texture (bloom drops canvas transparency)
+  const sc = document.createElement('canvas'); sc.width = 2; sc.height = 256;
+  const sg = sc.getContext('2d'), gr = sg.createLinearGradient(0, 0, 0, 256);
+  gr.addColorStop(0, '#9e9194'); gr.addColorStop(0.45, '#978f97'); gr.addColorStop(0.8, '#8f9099'); gr.addColorStop(1, '#a39a98');
+  sg.fillStyle = gr; sg.fillRect(0, 0, 2, 256);
+  scene.background = new THREE.CanvasTexture(sc);
+  scene.background.colorSpace = THREE.SRGBColorSpace;
+}
+const VIEW = 84;                   // half-height of the ortho view in world units
+const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 2000);
+const TY = 46;                     // look-at height (world units)
+const controls = new OrbitControls(cam, renderer.domElement);
+controls.target.set(0, TY, 0);
+controls.enableDamping = true;
+let userMoved = false;
+controls.addEventListener('start', () => { userMoved = true; });
+const orbitBox = document.getElementById('orbit');
+const ORBIT_R = 320, ORBIT_EL = 0.16;
+function placeCamera(az) {
+  cam.position.set(Math.sin(az) * Math.cos(ORBIT_EL) * ORBIT_R, TY + Math.sin(ORBIT_EL) * ORBIT_R, Math.cos(az) * Math.cos(ORBIT_EL) * ORBIT_R);
+}
+let camAz = 0.3;                   // 0 = looking at the +z (front) side
+placeCamera(camAz);
+function resize() {
+  const a = innerWidth / innerHeight;
+  const v = a < 1 ? VIEW / a : VIEW;
+  cam.left = -v * a; cam.right = v * a; cam.top = v; cam.bottom = -v;
+  cam.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  if (window.composer) composer.setSize(innerWidth, innerHeight);
+}
+addEventListener('resize', resize); resize();
+
+scene.add(new THREE.HemisphereLight(0xc4b8be, 0x8a7c66, 1.5));   // flat mauve dusk sky
+const sun = new THREE.DirectionalLight(0xffc8a0, 1.1);            // low warm sun from the right
+sun.position.set(150, 80, 110);
+sun.castShadow = true;
+sun.shadow.mapSize.set(4096, 4096);
+Object.assign(sun.shadow.camera, { left: -125, right: 125, top: 125, bottom: -125, near: 1, far: 600 }); // cover the island
+sun.shadow.bias = -0.0006;
+sun.shadow.normalBias = 0.02;
+scene.add(sun);
+const W = (x, y, z) => new THREE.Vector3(x - CX + 0.5, y - GY + 0.5, z - CZ + 0.5);   // design -> world
+const warmLights = [[RX, GY + 5, RZ + 7, 900]].map(([x, y, z, p]) => {
+  const l = new THREE.PointLight(0xffa850, p, 70, 1.5); l.position.copy(W(x, y, z)); l.userData.base = p; scene.add(l); return l;
+});
+
+// soft voxel outlines
+const cv = document.createElement('canvas'); cv.width = cv.height = 32;
+const g = cv.getContext('2d');
+g.fillStyle = '#dadada'; g.fillRect(0, 0, 32, 32);
+g.fillStyle = '#ffffff'; g.fillRect(3, 3, 26, 26);
+const tex = new THREE.CanvasTexture(cv);
+tex.colorSpace = THREE.SRGBColorSpace;
+
+// three materials: lit, glowing, glass (clearly visible: blue tint, ~0.55 opacity, environment reflections)
+const pmrem = new THREE.PMREMGenerator(renderer);
+const envTex = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+const glowMat = new THREE.MeshBasicMaterial({ map: tex });
+const glassMat = new THREE.MeshPhysicalMaterial({
+  transparent: true, opacity: 0.55, roughness: 0.03, metalness: 0, envMap: envTex, envMapIntensity: 0.9,
+  specularIntensity: 1, clearcoat: 1, clearcoatRoughness: 0.05, depthWrite: false,
+});
+const geo = new THREE.BoxGeometry(1, 1, 1);
+const counts = [0, 0, 0];
+for (const v of vox) { v.m = v.e === 'glass' ? 2 : v.e ? 1 : 0; v.i = counts[v.m]++; }
+const meshes = [new THREE.MeshStandardMaterial({ map: tex, roughness: 0.9 }), glowMat, glassMat].map((mat, m) => {
+  const mesh = new THREE.InstancedMesh(geo, mat, Math.max(1, counts[m]));
+  mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  mesh.castShadow = m === 0; mesh.receiveShadow = m === 0;
+  mesh.renderOrder = m === 2 ? 1 : 0;
+  mesh.frustumCulled = false;
+  return mesh;
+});
+const c3 = new THREE.Color();
+for (const v of vox) {
+  c3.setHex(v.c);
+  if (v.m === 0) c3.offsetHSL(0, 0, (hash(v.x, v.z, v.y + 99) - 0.5) * 0.04);
+  meshes[v.m].setColorAt(v.i, c3);
+}
+
+// ---------- bake: ambient occlusion + baked lamps into the lit mesh's instance colours ----------
+// AO: from every exposed face cast 9 short rays (normal ± tangents) through an occupancy grid; near hits
+// darken. Openings, eaves, porches and corners get depth for free. Glass does not occlude.
+// Returns two colour sets: A = AO only (lamps off), B = AO + lamps; setLights() blends between them.
+const BAKE = { ao: 0.6, reach: 8 };
+// Weathering: nothing real is evenly coloured. Broad blotches, odd stones/boards off-shade, grime splashed
+// up the foot of walls, rain streaks down them, moss on what faces the sky. Strengths 0 = off.
+const WEATHER = { patch: 0.14, speckle: 0.12, grime: 0.35, grimeH: 1.8, streak: 0.14, moss: 0.35 };
+const GRIME = new THREE.Color(0x4f4a34), MOSS = new THREE.Color(0x587a2e), RUST = new THREE.Color(0x8a5232), SOOT = new THREE.Color(0x3a3634);
+function weather(v, fn, r, g, b) {
+  const side = fn.some(n => n[1] === 0), up = fn.some(n => n[1] === 1);
+  if (v.g === 1 || v.g === 2) {                                 // smoke and the rocket: gentle unevenness, plus soot low on the booster
+    const m = 1 + (vnoise(v.x + v.y * 0.7, v.z - v.y * 0.5, 5 * S, 91) - 0.5) * WEATHER.patch * (v.g === 1 ? 1.2 : 0.8);
+    const sk = v.g === 2 ? Math.max(0, 0.35 - (v.y - RB * S) / (S * 14)) * vnoise(v.x, v.z + v.y, 2, 95) : 0;
+    return [r * m * (1 - sk) + SOOT.r * sk, g * m * (1 - sk) + SOOT.g * sk, b * m * (1 - sk) + SOOT.b * sk];
+  }
+  const h = (v.y - topAt(v.x, v.z)) / S;                        // design units above the local ground
+  let m = 1 + (vnoise(v.x + v.y * 0.7, v.z - v.y * 0.5, 7 * S, 91) - 0.5) * 2 * WEATHER.patch;
+  m *= 1 + (hash(v.x, v.z, v.y + 7) - 0.5) * 2 * WEATHER.speckle * (hash(v.x, v.y, v.z + 3) < 0.2 ? 1 : 0.3);
+  if (side && h >= WEATHER.grimeH) m *= 1 - WEATHER.streak * Math.max(0, vnoise(v.x + v.z, 0, 2.5, 93) - 0.4) * 1.7;   // vertical streaks
+  let tk = 0, tint = GRIME;
+  if (side && h >= 0.5 && h < WEATHER.grimeH + 0.5) tk = WEATHER.grime * (1 - (h - 0.5) / WEATHER.grimeH) * (0.5 + vnoise(v.x + v.z, v.y, 3, 92));
+  const mo = vnoise(v.x, v.z, 4 * S, 94);
+  if (up && h > 1 && mo > 0.6) { tk = Math.min(0.6, WEATHER.moss * (mo - 0.6) / 0.4 * 2.2); tint = v.g === 3 ? RUST : MOSS; }
+  if (v.g === 3 && side && vnoise(v.x * 3, v.y * 0.3, 4, 96) > 0.8) { tk = Math.max(tk, 0.25); tint = RUST; }   // rust runs on steel
+  tk = Math.max(0, Math.min(0.6, tk));
+  return [r * m * (1 - tk) + tint.r * tk, g * m * (1 - tk) + tint.g * tk, b * m * (1 - tk) + tint.b * tk];
+}
+function bake() {
+  const t0 = performance.now();
+  let x0 = 1e9, y0 = 1e9, z0 = 1e9, x1 = -1e9, y1 = -1e9, z1 = -1e9;
+  for (const v of vox) { x0 = Math.min(x0, v.x); y0 = Math.min(y0, v.y); z0 = Math.min(z0, v.z); x1 = Math.max(x1, v.x); y1 = Math.max(y1, v.y); z1 = Math.max(z1, v.z); }
+  const NY = y1 - y0 + 1, NZ = z1 - z0 + 1, occ = new Uint8Array((x1 - x0 + 1) * NY * NZ);
+  const gi = (x, y, z) => ((x - x0) * NY + (y - y0)) * NZ + (z - z0);
+  const solid = (x, y, z) => x >= x0 && x <= x1 && y >= y0 && y <= y1 && z >= z0 && z <= z1 && occ[gi(x, y, z)] === 1;
+  for (const v of vox) if (v.m !== 2) occ[gi(v.x, v.y, v.z)] = 1;
+  const N = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+  const RAYS = N.map(n => {
+    const ax = n.findIndex(c => c !== 0), [ta, tb] = [0, 1, 2].filter(i => i !== ax), out = [];
+    for (const a of [-1, 0, 1]) for (const b of [-1, 0, 1]) { const d = n.slice(); d[ta] += a; d[tb] += b; out.push(d); }
+    return out;
+  });
+  const lights = bakedLights.map(l => ({ ...l, x: l.x * S, y: l.y * S, z: l.z * S, r: l.r * S, col: new THREE.Color(l.color) }));
+  const base = meshes[0].instanceColor.array, A = new Float32Array(base), B = new Float32Array(base);
+  const L = BAKE.reach * S / 2, hits = lights.map(() => 0);
+  for (const v of vox) {
+    if (v.m !== 0) continue;
+    const fn = [];
+    let occl = 0;
+    for (let f = 0; f < 6; f++) {
+      const n = N[f];
+      if (solid(v.x + n[0], v.y + n[1], v.z + n[2])) continue;
+      fn.push(n);
+      for (const d of RAYS[f]) for (let k = 1; k <= L; k++) if (solid(v.x + d[0] * k, v.y + d[1] * k, v.z + d[2] * k)) { occl += 1 - (k - 1) / L; break; }
+    }
+    if (!fn.length) continue;                                     // hidden voxel: leave as is
+    const ao = 1 - BAKE.ao * occl / (fn.length * 9);
+    let lr = 0, lg = 0, lb = 0;
+    for (let li = 0; li < lights.length; li++) {
+      const l = lights[li], dx = l.x - v.x, dy = l.y - v.y, dz = l.z - v.z, dist = Math.hypot(dx, dy, dz);
+      if (dist > l.r || dist < 0.5) continue;
+      let face = 0, nb = fn[0];
+      for (const n of fn) { const f = (n[0] * dx + n[1] * dy + n[2] * dz) / dist; if (f > face) { face = f; nb = n; } }
+      if (face <= 0) continue;
+      let k = l.power * (0.35 + 0.65 * face) * (1 - dist / l.r) ** 2;
+      if (l.cone !== undefined) k *= Math.min(1, Math.max(0, (-(l.dir[0] * dx + l.dir[1] * dy + l.dir[2] * dz) / dist - l.cone) / (1 - l.cone) * 2));
+      if (k <= 0) continue;
+      if (l.shadow !== false) {                                   // march from just off the lit face to the lamp
+        const px = v.x + nb[0], py = v.y + nb[1], pz = v.z + nb[2], ex = l.x - px, ey = l.y - py, ez = l.z - pz, D = Math.hypot(ex, ey, ez);
+        let hit = false;
+        for (let s = 0; s < D - 1.5; s++) if (solid(Math.round(px + ex / D * s), Math.round(py + ey / D * s), Math.round(pz + ez / D * s))) { hit = true; break; }
+        if (hit) continue;
+      }
+      lr += l.col.r * k; lg += l.col.g * k; lb += l.col.b * k;
+      if (k > 0.05) hits[li]++;
+    }
+    const o = v.i * 3;
+    const w = weather(v, fn, base[o], base[o + 1], base[o + 2]);
+    A[o] = w[0] * ao; A[o + 1] = w[1] * ao; A[o + 2] = w[2] * ao;
+    B[o] = A[o] + w[0] * lr; B[o + 1] = A[o + 1] + w[1] * lg; B[o + 2] = A[o + 2] + w[2] * lb;
+  }
+  const dark = hits.map((n, i) => n < 20 ? i : -1).filter(i => i >= 0);
+  console.info(`bake: ${Math.round(performance.now() - t0)} ms, ${lights.length} baked lamps, lit voxels per lamp ~${Math.round(hits.reduce((a, b) => a + b, 0) / Math.max(1, hits.length))}` + (dark.length ? `; lamps reaching almost nothing (inside geometry?): ${dark.join(', ')}` : ''));
+  return [A, B];
+}
+const [colA, colB] = bake();
+let bakeK = -1, bakeForce = null;
+function blendBake(k) {                                         // lamps off (A) .. on (B)
+  if (bakeForce !== null) k = bakeForce;
+  if (Math.abs(k - bakeK) < 0.002) return;
+  bakeK = k;
+  const out = meshes[0].instanceColor.array;
+  for (let i = 0; i < out.length; i++) out[i] = colA[i] + (colB[i] - colA[i]) * k;
+  meshes[0].instanceColor.needsUpdate = true;
+}
+const group = new THREE.Group();
+group.scale.setScalar(1 / S);
+group.position.set(-CX + 0.5 / S, 0.5 / S - GY, -CZ + 0.5 / S);
+meshes.forEach(m => group.add(m));
+scene.add(group);
+const composer = window.composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, cam));
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.5, 0.6, 0.78);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+composer.setSize(innerWidth, innerHeight);
+
+const MA = meshes.map(m => m.instanceMatrix.array);
+function setM(v, x, y, z, s) {
+  const M = MA[v.m], o = v.i * 16;
+  M[o] = s; M[o + 5] = s; M[o + 10] = s;
+  M[o + 12] = x; M[o + 13] = y; M[o + 14] = z;
+}
+const easeOutCubic = p => 1 - Math.pow(1 - p, 3);
+const easeOutBack = p => { const c = 1.9; return 1 + (c + 1) * Math.pow(p - 1, 3) + c * Math.pow(p - 1, 2); };
+const DROP = 6 * S;
+
+let t = 0, first = 0, paused = false, doneAt = -1;
+function reset() {
+  for (const v of vox) setM(v, 0, -9999, 0, 0);
+  meshes.forEach(m => { m.instanceMatrix.needsUpdate = true; });
+  t = 0; first = 0; doneAt = -1;
+}
+reset();
+function step() {
+  let i = first;
+  while (i < COUNT && vox[i].t0 <= t) {
+    const v = vox[i];
+    const p = (t - v.t0) / DUR;
+    if (p >= 1) {
+      setM(v, v.x, v.y, v.z, 1);
+      if (i === first) first++;
+    } else {
+      const s = Math.max(0, easeOutBack(Math.min(1, p * 1.25)));
+      setM(v, v.x, v.y + (1 - easeOutCubic(p)) * DROP, v.z, s);
+    }
+    i++;
+  }
+  meshes.forEach(m => { m.instanceMatrix.needsUpdate = true; });
+}
+function setLights(k) {            // dim while building, full once complete
+  warmLights.forEach(l => { l.intensity = l.userData.base * k; });
+  glowMat.color.setScalar(0.35 + 0.65 * k);
+  bloom.strength = 0.08 + 0.5 * k;
+  blendBake(k);
+}
+
+const bar = document.querySelector('#bar i');
+const loopBox = document.getElementById('loop');
+document.getElementById('replay').onclick = reset;
+const pauseBtn = document.getElementById('pause');
+const togglePause = () => { paused = !paused; pauseBtn.textContent = paused ? 'Play (Space)' : 'Pause (Space)'; };
+pauseBtn.onclick = togglePause;
+addEventListener('keydown', e => {
+  if (e.code === 'KeyR') reset();
+  else if (e.code === 'KeyF') t = BUILD_END;
+  else if (e.code === 'Space') { e.preventDefault(); togglePause(); }
+  else if (e.code === 'KeyH') document.getElementById('ui').classList.toggle('hidden');
+});
+window.__seeAz = az => { camAz = az; placeCamera(az); };   // frame any side when testing
+window.__zoom = (z, x = 0, y = 4, zz = 0) => { cam.zoom = z; cam.updateProjectionMatrix(); controls.target.set(x, y, zz); };   // close-ups (world units)
+window.__bake = on => { bakeForce = on === undefined ? null : on ? 1 : 0; };   // force baked lamps on/off for comparison (no arg: auto)
+
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.1);
+  if (!paused) {
+    t += dt;
+    if (first < COUNT) step();
+    else if (doneAt < 0) doneAt = t;
+    else if (loopBox.checked && t - doneAt > 30) reset();     // long hold so a full orbit shows every side
+    bar.style.width = Math.min(100, (t / BUILD_END) * 100) + '%';
+    if (!userMoved && orbitBox.checked) { camAz += dt * 0.12; placeCamera(camAz); }
+  }
+  setLights(doneAt < 0 ? 0.15 : 0.15 + 0.85 * Math.min(1, (t - doneAt) / 1.5));
+  controls.update();
+  if (innerWidth && innerHeight) composer.render();       // a hidden pane has zero size
+});
+</script>
+</body>
+</html>

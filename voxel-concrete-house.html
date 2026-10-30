@@ -1,0 +1,475 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voxel Concrete House</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; font-family: system-ui, sans-serif; }
+  body { background: linear-gradient(#0636a8 0%, #0b49c9 55%, #1a5fdc 100%); }
+  canvas { display: block; }
+  #ui { position: fixed; left: 16px; bottom: 16px; display: flex; gap: 8px; align-items: center; color: #dbe6ff; font-size: 13px; flex-wrap: wrap; }
+  #ui button { background: rgba(0,0,0,.3); color: #fff; border: 1px solid rgba(255,255,255,.25); border-radius: 6px; padding: 6px 12px; cursor: pointer; font: inherit; }
+  #ui button:hover { background: rgba(0,0,0,.45); }
+  #bar { width: 160px; height: 4px; background: rgba(0,0,0,.3); border-radius: 2px; overflow: hidden; }
+  #bar i { display: block; height: 100%; width: 0; background: #ffd28a; }
+  #ui.hidden { display: none; }
+  label { display: flex; gap: 4px; align-items: center; user-select: none; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="ui">
+  <button id="replay">Replay (R)</button>
+  <button id="pause">Pause (Space)</button>
+  <label><input type="checkbox" id="loop" checked> Loop</label>
+  <div id="bar"><i></i></div>
+  <span id="info" style="opacity:.75"></span>
+</div>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+// Voxel subdivision: each design unit is S×S×S small voxels. Override with ?res=1..4
+const S = Math.max(1, Math.min(4, parseInt(new URLSearchParams(location.search).get('res')) || 2));
+
+// ---------- helpers ----------
+function hash(x, z, s = 0) {
+  let h = Math.imul(x | 0, 374761393) ^ Math.imul(z | 0, 668265263) ^ Math.imul(s | 0, 1442695041);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  h ^= h >>> 16;
+  return (h >>> 0) / 4294967295;
+}
+function vnoise(x, z, sc, s = 0) {
+  x /= sc; z /= sc;
+  const xi = Math.floor(x), zi = Math.floor(z), xf = x - xi, zf = z - zi;
+  const u = xf * xf * (3 - 2 * xf), v = zf * zf * (3 - 2 * zf);
+  const a = hash(xi, zi, s), b = hash(xi + 1, zi, s), c = hash(xi, zi + 1, s), d = hash(xi + 1, zi + 1, s);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+let seed = 909;
+const rnd = () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+const pick = a => a[Math.floor(rnd() * a.length)];
+
+// Fine-grid voxel store; `e` marks glowing (unlit) voxels
+const V = new Map();
+const key = (x, y, z) => ((x + 256) * 1024 + (y + 256)) * 1024 + (z + 256);
+const fset = (x, y, z, c, e = false) => V.set(key(x, y, z), { x, y, z, c, e });
+const fhas = (x, y, z) => V.has(key(x, y, z));
+const dc = f => (f - (S - 1) / 2) / S;
+const col = (c, x, y, z) => typeof c === 'function' ? c(x, y, z) : Array.isArray(c) ? c[Math.floor(hash(x * 7 + y, z, 3) * c.length)] : c;
+function fbox(x0, y0, z0, x1, y1, z1, c) {
+  for (let x = x0; x <= x1; x++) for (let y = y0; y <= y1; y++) for (let z = z0; z <= z1; z++) fset(x, y, z, col(c, x, y, z));
+}
+const box = (x0, y0, z0, x1, y1, z1, c) => fbox(x0 * S, y0 * S, z0 * S, x1 * S + S - 1, y1 * S + S - 1, z1 * S + S - 1, c);
+// hollow box, one fine voxel thick (design units, inclusive)
+function shell(x0, y0, z0, x1, y1, z1, c) {
+  const X0 = x0 * S, X1 = x1 * S + S - 1, Y0 = y0 * S, Y1 = y1 * S + S - 1, Z0 = z0 * S, Z1 = z1 * S + S - 1;
+  for (let x = X0; x <= X1; x++) for (let y = Y0; y <= Y1; y++) for (let z = Z0; z <= Z1; z++)
+    if (x === X0 || x === X1 || y === Y0 || y === Y1 || z === Z0 || z === Z1) fset(x, y, z, col(c, x, y, z));
+}
+const pset = (axis, a, y, l, c, e) => axis === 'x' ? fset(a, y, l, c, e) : fset(l, y, a, c, e);
+
+// ---------- palette ----------
+const P = {
+  conc: [0xa7a8a4, 0xb1b2ae, 0xbbbcb7, 0xc4c5c0],
+  soil: [0x3b3326, 0x4a3f2e],
+  under: [0x8e9188, 0x7f8279, 0x70736b, 0x62655d],
+  rock: [0x4b514a, 0x3e443e, 0x575d55, 0x343a35],
+  lichen: [0x7f8c6c, 0x93a07f, 0x6c7a5c],
+  gravel: [0x5d5e62, 0x515257, 0x68696c, 0x47484c],
+  veg: [0x3e5232, 0x485d39, 0x34472b],
+  dry: [0xa79c6c, 0xb8ad7c, 0x948a5e],
+  pine: [0x24402b, 0x1d3523, 0x2d4d33],
+  trunk: [0x4a3524, 0x3c2b1d],
+  mullion: 0x4a3e2c,
+  rail: 0x2c2c2e,
+};
+const concC = (x, y, z) => {
+  const streak = vnoise((x + z) / S, y / S * 0.15, 2.5, 5);           // vertical rain streaks
+  const n = streak * 0.8 + hash(x, y * 7 + z, 2) * 0.35;
+  return P.conc[Math.max(0, Math.min(3, Math.floor(n * 4 - 0.2)))];
+};
+// warm interior glow seen through glass: brighter towards the ceiling, curtains near some mullions, downlights
+function glassC(a, y, Y0, Y1, A0) {
+  const t = (y - Y0) / (Y1 - Y0);
+  if (t > 0.86 && hash(a, y, 31) > 0.93) return 0xffffff;
+  const panel = Math.floor((a - A0) / (6 * S));
+  const inPanel = (a - A0) % (6 * S);
+  if (hash(panel, 1, 17) > 0.6 && inPanel < 2 * S) return t > 0.5 ? 0xf6e7cc : 0xead6b4;
+  const c = new THREE.Color(0xe58f3c).lerp(new THREE.Color(0xffd89a), Math.pow(t, 0.8));
+  return c.getHex();
+}
+// glass wall facing `dir` along a plane (axis 'x' = wall at fixed z, 'z' = wall at fixed x)
+function glass(axis, plane, dir, a0, a1, y0, y1) {
+  const A0 = a0 * S, A1 = a1 * S + S - 1, Y0 = y0 * S, Y1 = y1 * S + S - 1;
+  const l = dir > 0 ? plane * S + S - 1 : plane * S;
+  for (let a = A0; a <= A1; a++) for (let y = Y0; y <= Y1; y++) {
+    const frame = a === A0 || a === A1 || y === Y0 || y === Y1 || (a - A0) % (6 * S) === 0;
+    frame ? pset(axis, a, y, l, P.mullion) : pset(axis, a, y, l, glassC(a, y, Y0, Y1, A0), true);
+  }
+}
+// thin steel railing, offset half a voxel inside the plane
+function rail(axis, plane, a0, a1, y0) {
+  const l = plane * S + Math.floor(S / 2);
+  const top = y0 * S + Math.round(2.2 * S);
+  for (let a = a0 * S; a <= a1 * S + S - 1; a++) {
+    pset(axis, a, top, l, P.rail);
+    if (a % (3 * S) === 0 || a === a1 * S + S - 1) for (let y = y0 * S; y < top; y++) pset(axis, a, y, l, P.rail);
+  }
+}
+
+const N = 52, F = N * S;
+const GY = 3;              // first building layer (terrain top is GY-1)
+const TOP = GY * S;        // first free fine layer above the terrain
+
+// ---------- terrain: granite outcrops, gravel drive, scrub ----------
+const BX0 = 8, BX1 = 39, BM = 24; // building footprint x/z 8..39, quadrants split at 24
+const inBuilding = (x, z) => x >= BX0 - 0.5 && x <= BX1 + 0.5 && z >= BX0 - 0.5 && z <= BX1 + 0.5;
+const isDrive = (x, z) => (x + z > 62 && Math.abs(x - z) < 13 + (vnoise(x, z, 3, 9) - 0.5) * 3) || (inBuilding(x - 2, z - 2) && (x > BX1 || z > BX1));
+// ground outline: rounded square with sharp thorn-like spikes; underneath, a single iceberg-like rock mass
+const ICE_X = N / 2 + 3, ICE_Z = N / 2 - 2;
+const TC = N / 2;
+function edgeR(x, z) {
+  const th = Math.atan2(z - TC, x - TC), K = 28;
+  const u = (th / (2 * Math.PI) + 0.5) * K + (vnoise(th * 4 + 9, 3, 1, 8) - 0.5) * 0.5;
+  const k = Math.floor(u), f = u - k, tri = 1 - Math.abs(2 * f - 1);
+  const amp = 1.5 + hash(((k % K) + K) % K, 0, 61) * 6.5;
+  return 42 + (vnoise(x, z, 6, 62) - 0.5) * 2 + amp * Math.pow(tri, 3.5);
+}
+const LO = -26 * S, WD = (N + 52) * S;
+const OUT = 1 << 14;
+const bottom = new Int32Array(WD * WD).fill(OUT);
+const bot = (fx, fz) => (fx < LO || fz < LO || fx >= LO + WD || fz >= LO + WD) ? OUT : bottom[(fx - LO) * WD + (fz - LO)];
+for (let fx = LO; fx < LO + WD; fx++) for (let fz = LO; fz < LO + WD; fz++) {
+  const x = dc(fx), z = dc(fz), dx = x - TC, dz = z - TC;
+  const e = edgeR(x, z) - Math.pow(dx ** 4 + dz ** 4, 0.25);
+  if (e < 0) continue;
+  // one iceberg-like mass: depth falls from an off-centre apex to the rim, with chunky facets
+  const ra = Math.min(1, Math.hypot(x - ICE_X, z - ICE_Z) / 48);
+  const rim = Math.min(1, e / 4);                                   // keep the rim thin
+  const facet = (Math.floor(vnoise(x, z, 6, 51) * 5) / 5 - 0.4) * 5; // stepped noise = flat facets
+  const depth = 2 + rim * (34 * Math.pow(1 - ra, 1.4) + facet * (1 - ra));
+  bottom[(fx - LO) * WD + (fz - LO)] = TOP - 1 - Math.max(S, Math.round(depth * S));
+}
+for (let fx = LO; fx < LO + WD; fx++) for (let fz = LO; fz < LO + WD; fz++) {
+  const b = bot(fx, fz);
+  if (b === OUT) continue;
+  const x = dc(fx), z = dc(fz);
+  // only voxels that can be seen: bottom tip, the soil band and anything exposed at a column's side
+  for (let fy = b; fy < TOP - 1; fy++) {
+    const soilBand = fy >= TOP - 1 - S;
+    if (fy !== b && !soilBand && bot(fx + 1, fz) < fy && bot(fx - 1, fz) < fy && bot(fx, fz + 1) < fy && bot(fx, fz - 1) < fy) continue; // one layer of overlap keeps the shell face-connected
+    fset(fx, fy, fz, soilBand ? P.soil[fy % 2] : P.under[Math.min(3, Math.floor((TOP - fy) / (6 * S)))]);
+  }
+  if (inBuilding(x, z)) { fset(fx, TOP - 1, fz, pick(P.gravel)); continue; }
+  if (isDrive(x, z)) { fset(fx, TOP - 1, fz, pick(P.gravel)); continue; }
+  // rock outcrops rise towards the front corners and the left
+  const bias = Math.max(0, (Math.hypot(x - TC, z - TC) - 30) / 14) * 0.5 + Math.max(0, 1 - Math.hypot(x - 52, z - 30) / 22) + Math.max(0, 1 - Math.hypot(x - 28, z - 53) / 20) + Math.max(0, 1 - Math.hypot(x - 2, z - 36) / 14);
+  const h = Math.max(0, (vnoise(x, z, 5, 4) * 0.7 + vnoise(x, z, 2, 6) * 0.3 + bias * 0.55 - 0.72) * 10);
+  const top = TOP - 1 + Math.round(h * S);
+  if (h > 0.15) {
+    for (let fy = TOP - 1; fy <= top; fy++) {
+      const lich = fy === top && vnoise(x * 1.7, z * 1.7 + fy, 1.5, 12) > 0.6;
+      fset(fx, fy, fz, lich ? pick(P.lichen) : pick(P.rock));
+    }
+    continue;
+  }
+  fset(fx, TOP - 1, fz, pick(P.veg));
+  const r = hash(fx, fz, 41);
+  if (r < 0.06) { const tall = 1 + Math.floor(hash(fx, fz, 42) * 3); for (let i = 0; i < tall; i++) fset(fx, TOP + i, fz, pick(P.dry)); }
+  else if (r < 0.065) fset(fx, TOP, fz, 0x8a7ad0);
+}
+
+// ---------- the house: three stacked floors, each with a different corner carved away ----------
+const L0 = BX0, L1 = BM - 1, H0 = BM, H1 = BX1; // low/high quadrant ranges
+const Y1a = GY, Y1b = 12, Y2a = 13, Y2b = 22, Y3a = 23, Y3b = 32;
+// ground floor: three quadrants closed, the front corner is a glowing garage under the middle block
+shell(L0, Y1a, H0, L1, Y1b, H1, concC);   // left
+shell(H0, Y1a, L0, H1, Y1b, L1, concC);   // right
+shell(L0, Y1a, L0, L1, Y1b, L1, concC);   // back
+glass('z', L1, 1, H0 + 1, H1 - 4, Y1a, Y1b - 1);      // garage glazing (left side)
+glass('x', L1, 1, H0 + 1, H1 - 9, Y1a, Y1b - 1);      // garage glazing (back)
+// middle floor: solid concrete block on the front corner, glazed rooms + terraces left and right
+shell(H0, Y2a, H0, H1, Y2b, H1, concC);
+shell(L0, Y2a, L0, L1, Y2b, L1, concC);
+shell(L0, Y2a, H0, L1, Y2b, 31, concC);
+glass('x', 31, 1, L0 + 1, L1, Y2a, Y2b - 1);
+shell(H0, Y2a, L0, 31, Y2b, L1, concC);
+glass('z', 31, 1, L0 + 1, L1, Y2a, Y2b - 1);
+rail('x', H1, L0, L1, Y2a);
+rail('z', L0, 32, H1, Y2a);
+rail('z', H1, L0, L1, Y2a);
+rail('x', L0, 32, H1, Y2a);
+// top floor: two concrete wings + back, the front corner is an open glazed V
+shell(L0, Y3a, H0, L1, Y3b, H1, concC);   // left wing
+shell(H0, Y3a, L0, H1, Y3b, L1, concC);   // right wing
+shell(L0, Y3a, L0, L1, Y3b, L1, concC);   // back
+glass('z', L1, 1, H0, H1 - 1, Y3a, Y3b - 1);
+glass('x', L1, 1, H0, H1 - 1, Y3a, Y3b - 1);
+rail('z', L1 + 1, H0, H1, Y3a);
+rail('x', L1 + 1, H0 + 1, H1, Y3a);
+
+// car in the garage
+{
+  const cx0 = 30 * S, cz0 = 27 * S, len = 9 * S, wid = 4 * S, body = 0x163526;
+  for (let i = 0; i < wid; i++) for (let j = 0; j < len; j++) {
+    const fx = cx0 + i, fz = cz0 + j;
+    for (let fy = TOP; fy < TOP + Math.round(1.6 * S); fy++) fset(fx, fy + 1, fz, body);
+    const cab = j > len * 0.25 && j < len * 0.8;
+    if (cab) fset(fx, TOP + Math.round(1.6 * S) + 1, fz, i === 0 || i === wid - 1 || j === Math.ceil(len * 0.25) + 1 ? 0x0e1a14 : body);
+    if (j === len - 1) { if (i === 0 || i === wid - 1) fset(fx, TOP + 2, fz, 0xffffff, true); else fset(fx, TOP + 1, fz, 0xe8e8e0); }
+  }
+  for (const i of [0, wid - 1]) for (const j of [Math.round(len * 0.18), Math.round(len * 0.8)]) {
+    fset(cx0 + i, TOP, cz0 + j, 0x111111); fset(cx0 + i, TOP, cz0 + j + 1, 0x111111);
+  }
+}
+
+// retaining wall with railing running off to the left, and a low annex on the right
+box(3, GY, 38, BX0 - 1, Y1b, 39, concC);
+rail('x', 39, 3, BX0 - 1, Y1b + 1);
+shell(42, GY, 14, 49, 8, 22, concC);
+box(44, GY, 22, 48, 7, 22, (x, y) => (y % (2 * S) === 0 ? 0xc9c9c2 : 0xdcdcd5));
+// a few pines behind on the right
+function pine(cx, cz, h, r0) {
+  box(cx, GY, cz, cx, GY + 3, cz, P.trunk);
+  for (let fy = (GY + 3) * S; fy < (GY + h) * S; fy++) {
+    const y = dc(fy) - GY - 3, t = y / (h - 3), tier = ((y % 3) + 3) % 3 / 3;
+    const r = Math.max(0.5, r0 * (1 - t) * (1 - tier * 0.35) + 0.4);
+    for (let fx = Math.floor((cx - r - 1) * S); fx <= Math.ceil((cx + r + 1) * S); fx++)
+      for (let fz = Math.floor((cz - r - 1) * S); fz <= Math.ceil((cz + r + 1) * S); fz++)
+        if (Math.hypot(dc(fx) - cx, dc(fz) - cz) <= r + (rnd() - 0.5) * 0.8) fset(fx, fy, fz, pick(P.pine));
+  }
+}
+pine(44, 6, 24, 5);
+pine(48, 12, 18, 4);
+pine(39, 3, 20, 4);
+pine(1, 9, 19, 4);
+pine(12, -2, 16, 3.5);
+pine(-3, 24, 14, 3);
+// a loose ring of pines on the outer land, leaving the drive (front corner) open
+for (let i = 0; i < 22; i++) {
+  const a = i / 22 * Math.PI * 2 + hash(i, 1, 71) * 0.2;
+  if (Math.abs(((a - Math.PI / 4 + Math.PI) % (2 * Math.PI)) - Math.PI) < 1.1) continue;
+  const r = 32 + hash(i, 2, 71) * 6;
+  pine(Math.round(TC + Math.cos(a) * r), Math.round(TC + Math.sin(a) * r), 12 + Math.round(hash(i, 3, 71) * 12), 3 + hash(i, 4, 71) * 2);
+}
+// climbing plant by the garage
+for (let fz = 22 * S; fz < 24 * S; fz++) for (let fy = TOP; fy < TOP + 9 * S; fy++)
+  if (hash(fz, fy, 3) > 0.45 && fy < TOP + (5 + hash(fz, 0, 1) * 4) * S) fset(BX1 * S + S, fy, fz, pick([0x5b8a3a, 0x6f9e48, 0x4a7a30]));
+
+// ---------- keep only what is connected to the ground ----------
+// flood fill from the centre of the slab through face neighbours; anything not reached (floating bits,
+// or rock pillars at spike tips that only touch the slab diagonally) is dropped
+{
+  const seen = new Set(), stack = [];
+  const k0 = key(Math.round(TC * S), TOP - 1, Math.round(TC * S));
+  seen.add(k0); stack.push(V.get(k0));
+  const D = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+  while (stack.length) {
+    const v = stack.pop();
+    for (const [dx, dy, dz] of D) {
+      const k = key(v.x + dx, v.y + dy, v.z + dz);
+      if (!seen.has(k) && V.has(k)) { seen.add(k); stack.push(V.get(k)); }
+    }
+  }
+  let removed = 0;
+  for (const k of [...V.keys()]) if (!seen.has(k)) { V.delete(k); removed++; }
+  console.info(`connectivity: removed ${removed} floating voxels`);
+}
+
+// ---------- instanced meshes (lit concrete + unlit glow) ----------
+const vox = [...V.values()];
+const LAYER = 0.3 / S;
+const minY = vox.reduce((m, v) => Math.min(m, v.y), 0);
+const DUR = 0.55;
+for (const v of vox) {
+  const radial = Math.hypot(v.x - F / 2, v.z - F / 2) / (F * 0.75);
+  v.t0 = (v.y - minY) * LAYER + (hash(v.x, v.z, v.y) * 0.6 + radial * 0.4) * 0.3 * 2.2;
+}
+vox.sort((a, b) => a.t0 - b.t0);
+const COUNT = vox.length;
+const BUILD_END = vox[COUNT - 1].t0 + DUR;
+document.getElementById('info').textContent = `${COUNT.toLocaleString()} voxels · F skip · H hides UI · drag to orbit · ?res=1-4`;
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.1;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+{ // blue-hour sky as a gradient texture (post-processing drops canvas transparency)
+  const sc = document.createElement('canvas'); sc.width = 2; sc.height = 256;
+  const sg = sc.getContext('2d'), gr = sg.createLinearGradient(0, 0, 0, 256);
+  gr.addColorStop(0, '#05309c'); gr.addColorStop(0.6, '#0a46c4'); gr.addColorStop(1, '#1a5cd8');
+  sg.fillStyle = gr; sg.fillRect(0, 0, 2, 256);
+  scene.background = new THREE.CanvasTexture(sc);
+  scene.background.colorSpace = THREE.SRGBColorSpace;
+}
+const VIEW = 64;
+const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 1000);
+const controls = new OrbitControls(cam, renderer.domElement);
+controls.target.set(0, 4, 0);
+controls.enableDamping = true;
+controls.maxPolarAngle = Math.PI * 0.49;
+let userMoved = false;
+controls.addEventListener('start', () => { userMoved = true; });
+const ORBIT_R = 120, ORBIT_EL = 0.26;
+function swayCamera(time) {
+  const az = Math.PI / 4 + Math.sin(time * 0.13) * 0.25; // looking straight at the carved corner, swaying
+  cam.position.set(Math.sin(az) * Math.cos(ORBIT_EL) * ORBIT_R, 4 + Math.sin(ORBIT_EL) * ORBIT_R, Math.cos(az) * Math.cos(ORBIT_EL) * ORBIT_R);
+}
+swayCamera(0);
+
+// blue-hour lighting: cool sky fill + moon, warm interior lights that switch on when the build completes
+scene.add(new THREE.HemisphereLight(0xb8c8ff, 0x7a8696, 1.35));
+const moon = new THREE.DirectionalLight(0xb9caff, 1.1);
+moon.position.set(-50, 60, 70);
+moon.castShadow = true;
+moon.shadow.mapSize.set(4096, 4096);
+Object.assign(moon.shadow.camera, { left: -85, right: 85, top: 85, bottom: -85, near: 1, far: 250 });
+moon.shadow.bias = -0.0006;
+moon.shadow.normalBias = 0.02;
+scene.add(moon);
+const W = (x, y, z) => new THREE.Vector3(x - N / 2 + 0.5, y + 0.5, z - N / 2 + 0.5);
+const warm = [
+  [W(32, 10, 32), 280], // garage
+  [W(16, 20, 33), 240], // left terrace
+  [W(33, 20, 16), 240], // right terrace
+  [W(28, 29, 28), 160], // top V
+].map(([p, power]) => { const l = new THREE.PointLight(0xffb560, 0, 26, 1.6); l.position.copy(p); l.userData.power = power; scene.add(l); return l; });
+
+// soft voxel edge texture
+const cv = document.createElement('canvas'); cv.width = cv.height = 32;
+const g = cv.getContext('2d');
+g.fillStyle = '#d6d6d6'; g.fillRect(0, 0, 32, 32);
+g.fillStyle = '#ffffff'; g.fillRect(3, 3, 26, 26);
+const tex = new THREE.CanvasTexture(cv);
+tex.colorSpace = THREE.SRGBColorSpace;
+
+const geo = new THREE.BoxGeometry(1, 1, 1);
+const litMat = new THREE.MeshStandardMaterial({ map: tex, roughness: 0.9 });
+const glowMat = new THREE.MeshBasicMaterial({ map: tex });
+const counts = [0, 0];
+for (const v of vox) { v.m = v.e ? 1 : 0; v.i = counts[v.m]++; }
+const meshes = [litMat, glowMat].map((mat, m) => {
+  const mesh = new THREE.InstancedMesh(geo, mat, Math.max(1, counts[m]));
+  mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  mesh.castShadow = true; mesh.receiveShadow = m === 0;
+  mesh.frustumCulled = false;
+  return mesh;
+});
+const c3 = new THREE.Color();
+for (const v of vox) {
+  c3.setHex(v.c);
+  if (!v.e) c3.offsetHSL(0, 0, (hash(v.x, v.z, v.y + 99) - 0.5) * 0.04);
+  meshes[v.m].setColorAt(v.i, c3);
+}
+const group = new THREE.Group();
+group.scale.setScalar(1 / S);
+group.position.set(-N / 2 + 0.5 / S, 0.5 / S, -N / 2 + 0.5 / S);
+meshes.forEach(m => group.add(m));
+scene.add(group);
+
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, cam));
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.4, 0.5, 0.9);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+
+function resize() {
+  const a = innerWidth / innerHeight;
+  const v = a < 1 ? VIEW / a : VIEW;
+  cam.left = -v * a; cam.right = v * a; cam.top = v; cam.bottom = -v;
+  cam.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
+}
+addEventListener('resize', resize); resize();
+
+// ---------- animation ----------
+const MA = meshes.map(m => m.instanceMatrix.array);
+function setM(v, x, y, z, s) {
+  const M = MA[v.m], o = v.i * 16;
+  M[o] = s; M[o + 5] = s; M[o + 10] = s;
+  M[o + 12] = x; M[o + 13] = y; M[o + 14] = z;
+}
+const easeOutCubic = p => 1 - Math.pow(1 - p, 3);
+const easeOutBack = p => { const c = 1.9; return 1 + (c + 1) * Math.pow(p - 1, 3) + c * Math.pow(p - 1, 2); };
+const DROP = 6 * S;
+
+let t = 0, first = 0, paused = false, doneAt = -1, camT = 0;
+function reset() {
+  for (const v of vox) setM(v, 0, -9999, 0, 0);
+  meshes.forEach(m => { m.instanceMatrix.needsUpdate = true; });
+  t = 0; first = 0; doneAt = -1;
+}
+reset();
+
+function step() {
+  let i = first;
+  while (i < COUNT && vox[i].t0 <= t) {
+    const v = vox[i];
+    const p = (t - v.t0) / DUR;
+    if (p >= 1) {
+      setM(v, v.x, v.y, v.z, 1);
+      if (i === first) first++;
+    } else {
+      const s = Math.max(0, easeOutBack(Math.min(1, p * 1.25)));
+      setM(v, v.x, v.y + (1 - easeOutCubic(p)) * DROP, v.z, s);
+    }
+    i++;
+  }
+  meshes.forEach(m => { m.instanceMatrix.needsUpdate = true; });
+}
+// interior lights: dim while building, warm up once the house is complete
+function setLights(k) {
+  glowMat.color.setScalar(0.25 + 0.75 * k);
+  for (const l of warm) l.intensity = l.userData.power * k;
+  bloom.strength = 0.1 + 0.3 * k;
+}
+
+const bar = document.querySelector('#bar i');
+const loopBox = document.getElementById('loop');
+document.getElementById('replay').onclick = reset;
+const pauseBtn = document.getElementById('pause');
+const togglePause = () => { paused = !paused; pauseBtn.textContent = paused ? 'Play (Space)' : 'Pause (Space)'; };
+pauseBtn.onclick = togglePause;
+addEventListener('keydown', e => {
+  if (e.code === 'KeyR') reset();
+  else if (e.code === 'KeyF') t = BUILD_END;
+  else if (e.code === 'Space') { e.preventDefault(); togglePause(); }
+  else if (e.code === 'KeyH') document.getElementById('ui').classList.toggle('hidden');
+});
+
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.1);
+  if (!paused) {
+    t += dt; camT += dt;
+    if (first < COUNT) step();
+    else if (doneAt < 0) doneAt = t;
+    else if (loopBox.checked && t - doneAt > 7) reset();
+    bar.style.width = Math.min(100, (t / BUILD_END) * 100) + '%';
+    if (!userMoved) swayCamera(camT);
+  }
+  setLights(doneAt < 0 ? 0 : Math.min(1, (t - doneAt) / 1.5));
+  controls.update();
+  composer.render();
+});
+</script>
+</body>
+</html>
