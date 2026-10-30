@@ -293,7 +293,7 @@ const X0 = F(20), X1 = F(40) - 1, Z0 = F(16), Z1 = F(40) - 1;               // o
 const X0R = F(18.5), X1R = F(41.5) - 1, Z0R = F(15), Z1R = F(41) - 1;       // roof incl. overhang
 const DM = Math.floor((X1R - X0R) / 2);
 const LF = F(GY + 6.5);                                                     // loggia floor: first free layer
-const LX0 = F(21), LX1 = F(28) - 1, LZ0 = F(36);
+const LX0 = F(21), LX1 = F(30) - 1, LZ0 = F(36);                         // loggia = left half of the gable, up to the ridge line (photo 1)
 const inLoggia = (fx, fz) => fx >= LX0 && fx <= LX1 && fz >= LZ0 && fz <= Z1;
 const footAt = (fx, fy, fz) => inFoot(ec(fx), ec(fz)) && !(fy >= LF && inLoggia(fx, fz));
 const EBF = EF - Math.floor((ec(X0R - 1) - 16) * S * 0.5);                 // bay skirt eave, meets the main eave
@@ -396,19 +396,19 @@ function opening(axis, l, dir, a0, a1, y0, y1, o = {}) {
   }
 }
 // globe wall lamp: bracket touching the wall, milky globe
-function globe(ax) {
-  const a = F(ax), y = F(GY + 5.5), l = Z1;
-  fset(a, y, l + 1, P.black); fset(a, y + 1, l + 1, P.black); fset(a, y - 1, l + 1, 0x4a524c);
-  fbox(a, y + 1, l + 2, a + 1, y + 2, l + 3, GLOW, true);
-  lamp([a, y + 1, l + 2], a + 0.5, y + 1.5, l + 2.5, { color: 0xffe0b0 });
+function globe(cx) {                                                         // ~25 cm milky ball on a short arm, just under the loggia slab
+  const g = Math.max(1, Math.round(0.6 * S)), a = Math.round(cx * S - g / 2), y = F(GY + 5.6), l = Z1;
+  fset(a, y - 1, l + 1, 0x4a524c); fset(a, y, l + 1, P.black); fset(a, y, l + 2, P.black);
+  fbox(a, y + 1, l + 2, a + g - 1, y + g, l + 1 + g, GLOW, true);
+  lamp([a, y + 1, l + 2], a + g / 2, y + 1 + g / 2, l + 1.5 + g / 2, { color: 0xffe0b0 });
 }
 
 // front gable (faces +z)
-opening('x', Z1, 1, 22.2, 23.6, GY + 1.8, GY + 4.8, { curtain: 'R', plant: true });
+opening('x', Z1, 1, 22.2, 23.6, GY + 2.5, GY + 5.4, { curtain: 'R', plant: true });          // head level with the door head (photo 1)
 opening('x', Z1, 1, 25.4, 27.5, GY + 0.5, GY + 5.5, { door: true });
 opening('x', Z1, 1, 32.0, 34.2, GY + 0.5, GY + 5.5, { door: true, hinge: 'R' });
-opening('x', Z1, 1, 31.6, 33.2, GY + 8.6, GY + 11.4, { curtain: 'LR', lit: true });
-[24.1, 28.0, 31.0, 35.0].forEach(globe);
+opening('x', Z1, 1, 32.35, 33.85, GY + 9.2, GY + 11.7, { curtain: 'LR', lit: true });   // small 0.6 × 1 m window, centred over the right door
+[24.6, 28.3, 31.2, 35.0].forEach(globe);                                       // on the outer corners of each door surround
 fbox(F(28.6), F(GY + 3.2), Z1 + 1, F(28.6), F(GY + 3.2) + 1, Z1 + 1, 0x222222);     // intercom by the left door
 // loggia: tiled slab with a lip, black railing, back wall with balcony door and barred window, side opening
 fbox(LX0, LF - 1, LZ0, LX1, LF - 1, Z1, (x, y, z) => (x + z) % 4 === 0 ? 0x8a847c : 0xa09a90);
@@ -418,7 +418,7 @@ for (let fx = LX0; fx <= LX1; fx++) {
   if (fx % 2 === 0) for (let y = LF; y < LF + 5; y++) fset(fx, y, Z1, P.black);
 }
 opening('x', LZ0 - 1, 1, 21.7, 23.3, GY + 7.3, GY + 9.6, { B: 0, bars: true, curtain: 'L' });
-opening('x', LZ0 - 1, 1, 25.4, 27.4, GY + 6.6, GY + 11, { B: 0, room: 0x4a4038 });
+opening('x', LZ0 - 1, 1, 27.8, 29.6, GY + 6.6, GY + 11, { B: 0, room: 0x4a4038 });   // balcony door at the loggia's right end
 for (let fz = F(36.3); fz < F(39.2); fz++) for (let fy = LF; fy < LF + 4; fy++) {
   fdel(X0, fy, fz); fdel(X0 + 1, fy, fz);
   if (fz % 2 === 0) fset(X0, fy, fz, P.black);
@@ -431,13 +431,13 @@ disc(24.4, 38.6, 0, 0.4, LF, LF, 0x3a6aa0); blob(24.4, GY + 7.2, 38.6, 0.6, P.le
 fbox(F(26.2), LF, F(38.2), F(27.4), LF + 1, F(39.2), [0xb8aa96, 0x9a8a7a]);           // cushions on a low stool
 
 // right side (+x, photo 2): two windows
-opening('z', X1, 1, 27.6, 29.4, GY + 2, GY + 5, { curtain: 'L', plant: true, lit: true });
-opening('z', X1, 1, 21.3, 24.2, GY + 2.2, GY + 5, { shutter: true, curtain: 'R' });
+opening('z', X1, 1, 27.6, 29.4, GY + 2.3, GY + 5.6, { curtain: 'L', plant: true, lit: true });
+opening('z', X1, 1, 21.3, 24.2, GY + 2.5, GY + 5.6, { shutter: true, curtain: 'R' });
 // back gable (faces -z, photo 3)
-opening('x', Z0, -1, 32.2, 35.5, GY + 1.8, GY + 5, { curtain: 'L' });
-opening('x', Z0, -1, 24.2, 27.1, GY + 1.8, GY + 5, { shutter: true, room: 0x2a2620 });
-opening('x', Z0, -1, 27.4, 29.4, GY + 8.4, GY + 11.4, { curtain: 'L', lit: true });
-opening('x', Z0, -1, 29.9, 31.9, GY + 8.4, GY + 11.4, { curtain: 'R', curtainC: 0xe4ded2 });
+opening('x', Z0, -1, 32.2, 35.6, GY + 2.4, GY + 5.8, { curtain: 'L' });
+opening('x', Z0, -1, 23.7, 27.1, GY + 2.4, GY + 5.8, { shutter: true, room: 0x2a2620 });
+opening('x', Z0, -1, 28.0, 29.5, GY + 9.4, GY + 12.2, { curtain: 'L', lit: true });       // twin attic windows, sills at eave level (photo 3)
+opening('x', Z0, -1, 30.1, 31.6, GY + 9.4, GY + 12.2, { curtain: 'R', curtainC: 0xe4ded2 });
 fbox(F(30), TOP, Z0 - 2, F(30) + 1, TOP + 2, Z0 - 1, 0xa0a4a6);                     // gas meter box
 // bay (left side, photo 4): French window on the front face, tall narrow windows on the canted sides
 opening('z', F(17), -1, 23.6, 27.4, GY + 0.4, GY + 5.6, { leaves: 2, shutter: 'R', noRoom: true });
@@ -463,9 +463,9 @@ for (let fx = F(17); fx < X0 + 3; fx++) for (let fz = F(19); fz < F(32); fz++)
 fbox(X0, TOP, F(23.5), X0 + 2, TOP + 1, F(27.5) - 1, 0x7a7f86);
 fbox(X0 + 2, TOP + 2, F(23.5), X0 + 2, TOP + 3, F(27.5) - 1, 0x6f747a);
 fbox(F(18), TOP - 1, F(23), F(19.5), TOP - 1, F(28), 0xa0503a);                         // rug
-for (let y = TOP; y < TOP + 7; y++) fset(F(18.2), y, F(29.6), P.black);
-fbox(F(18.2) - 1, TOP + 7, F(29.6) - 1, F(18.2) + 1, TOP + 8, F(29.6) + 1, 0xf2e2b8, true);
-lamp([F(18.2), TOP + 7, F(29.6)], F(18.2), TOP + 7.5, F(29.6), { color: 0xffc888, power: 1.2, r: 6 });
+for (let y = TOP; y < TOP + 7; y++) fset(F(19), y, F(28.4), P.black);          // floor lamp, inside the bay's canted corner
+fbox(F(19) - 1, TOP + 7, F(28.4) - 1, F(19) + 1, TOP + 8, F(28.4) + 1, 0xf2e2b8, true);
+lamp([F(19), TOP + 7, F(28.4)], F(19), TOP + 7.5, F(28.4), { color: 0xffc888, power: 1.2, r: 6 });
 
 STAGE = 3;
 // ---------- roof furniture: skylights, chimney, ladder, antenna, downpipes ----------
@@ -479,11 +479,11 @@ function skylight(x0, x1, z0, z1) {
     fset(fx, h + 1, fz, border ? 0x3b3f42 : GLASS, border ? false : 'glass');
   }
 }
-skylight(33.2, 35.6, 27, 29);          // right slope (photo 2)
+skylight(35.2, 37.6, 26.6, 28.6);      // right slope (photo 2): mid-slope, just clear of the roof ladder at z 29.2
 skylight(24, 26.4, 22, 24);            // left slope (photo 4)
 skylight(25.6, 28, 28, 30);
 { // metal-clad flue just right of the ridge, with a rain cap
-  const x0 = F(31), z0 = F(31.3), n = Math.max(2, Math.round(1.4 * S)), x1 = x0 + n, z1 = z0 + n;
+  const x0 = F(31), z0 = F(31.3), n = Math.max(1, Math.round(0.5 * S)), x1 = x0 + n, z1 = z0 + n;
   let low = 1e9;
   for (let fx = x0; fx <= x1; fx++) for (let fz = z0; fz <= z1; fz++) low = Math.min(low, rh(fx, fz));
   const topY = rh(F(30), z0) + Math.round(2.8 * S);
@@ -505,8 +505,8 @@ skylight(25.6, 28, 28, 30);
 { // TV antenna on the ridge
   const fx = X0R + DM, fz = F(26.5), y0 = rh(fx, fz) + 2, yT = y0 + Math.round(3.5 * S);
   for (let y = y0; y <= yT; y++) fset(fx, y, fz, P.metal);
-  for (let a = -4; a <= 4; a++) fset(fx + a, yT, fz, P.metal);
-  for (let a = -4; a <= 4; a += 2) { fset(fx + a, yT, fz - 1, P.metal); fset(fx + a, yT, fz + 1, P.metal); }
+  for (let a = -3; a <= 3; a++) fset(fx + a, yT, fz, P.metal);
+  for (let a = -3; a <= 3; a += 2) { fset(fx + a, yT, fz - 1, P.metal); fset(fx + a, yT, fz + 1, P.metal); }
 }
 function downpipe(gx, gz, gyF, wx, wz) {      // from below the gutter cell, jog to the wall, down to the ground
   let x = gx, z = gz, y = gyF - 1;
@@ -571,23 +571,53 @@ disc(29.9, 41.1, 0, 0.6, TOP, TOP + 1, P.terracotta);
 cone(29.9, 41.1, 4.2, 0.85, P.thuja, GY + 1);
 hedge(20.2, 24.6, 40.3, 41.4, 1.3);
 hedge(44.6, 46.2, 29, 36.5, 1.5);
-{ // red hatchback, nose to the house
-  const x0 = F(13.5), z0 = F(43.5), L = 14, Wd = 6, body = 0xa3232b, T = TOP;
-  for (const [i, j] of [[2, 0], [3, 0], [10, 0], [11, 0], [2, Wd - 1], [3, Wd - 1], [10, Wd - 1], [11, Wd - 1]]) { fset(x0 + j, T, z0 + i, 0x141414); fset(x0 + j, T + 1, z0 + i, 0x141414); }
-  for (let i = 0; i < L; i++) for (let j = 0; j < Wd; j++) {
-    fset(x0 + j, T + 2, z0 + i, i === 0 || i === L - 1 ? 0x2a2a2a : body);
-    if (i > 0 && i < L - 1) fset(x0 + j, T + 3, z0 + i, body);
-    if (i >= 3 && i <= 11) {
-      const side = j === 0 || j === Wd - 1, glassRow = i === 3 || i === 11 || (side && i > 3 && i < 11);
-      fset(x0 + j, T + 4, z0 + i, glassRow ? GLASS : 0x3a2a22, glassRow ? 'glass' : false);
-      fset(x0 + j, T + 5, z0 + i, i === 11 ? 0x1e1e1e : body);
+{ // red hatchback at real size (1.8 × 4.2 × 1.6 m), nose to the house. Authored in 20 cm cells (i along z from the
+  // front bumper, j across, y up); q() rescales for ?res. Short hood, raked screen, roof running to a near-vertical
+  // tailgate with a spoiler: no boot step, or it reads as a sedan.
+  const q = n => Math.round(n * S / 2), x0 = F(14.2), z0 = F(42.2), T = TOP, body = 0xa3232b, trim = 0x2a2a2a, cab = 0x2a2420;
+  const put = (j, y, i, c, e = false) => {
+    for (let x = x0 + q(j); x < x0 + q(j + 1); x++) for (let fy = T + q(y); fy < T + q(y + 1); fy++) for (let z = z0 + q(i); z < z0 + q(i + 1); z++) fset(x, fy, z, c, e);
+  };
+  const glass = (j, y, i) => put(j, y, i, GLASS, 'glass');
+  const W = 9, L = 21, wheel = i => (i >= 3 && i <= 5) || (i >= 15 && i <= 17);    // 2.5 m wheelbase, 0.8 m overhangs
+  for (let i = 0; i < L; i++) for (let j = 0; j < W; j++) {
+    const side = j === 0 || j === W - 1, end = i === 0 || i === L - 1;
+    if (side && wheel(i)) for (let y = 0; y < 3; y++) put(j, y, i, y === 1 && (i === 4 || i === 16) ? 0x9a9a9a : 0x141414);   // tyres + hubs
+    for (let y = 1; y <= 4; y++) {
+      if (side && (y === 1 || (wheel(i) && y <= 2))) continue;                // inset sills, wheel arches
+      put(j, y, i, end && y <= 2 ? trim : body);                              // dark bumpers
     }
   }
-  for (const j of [1, Wd - 2]) { fset(x0 + j, T + 3, z0, 0xf2f0e0, true); fset(x0 + j, T + 3, z0 + L - 1, 0xd03020, true); }
-  fset(x0 + 3, T + 6, z0 + 9, 0x1e1e1e);                                       // roof fin antenna
+  for (const j of [1, 2, 6, 7]) put(j, 3, 0, 0xf2f0e0, true);                  // headlights
+  for (const j of [3, 4, 5]) { put(j, 3, 0, 0x1e1e1e); put(j, 2, 0, 0xe8e8e8); put(j, 2, L - 1, 0xe8e8e8); }   // grille, plates
+  for (const [j, i] of [[0, L - 1], [1, L - 1], [7, L - 1], [8, L - 1], [0, L - 2], [8, L - 2]]) for (const y of [3, 4]) put(j, y, i, 0xd03020, true);   // wrap-round tail lights
+  for (const j of [0, W - 1]) {
+    for (let y = 2; y <= 4; y++) put(j, y, 12, 0x7a1a20);                     // door seam at the B pillar
+    put(j, 4, 10, 0x8a8a8a); put(j, 4, 15, 0x8a8a8a); put(j, 5, 6, trim);     // handles, mirrors
+  }
+  // greenhouse, j 1..7 (one cell in from the body sides)
+  for (let j = 1; j <= 7; j++) {
+    const edge = j === 1 || j === 7;
+    edge ? put(j, 5, 5, body) : glass(j, 5, 5);                              // raked windscreen, A pillars
+    edge ? put(j, 6, 6, body) : glass(j, 6, 6);
+    for (let i = 6; i <= 20; i++) {
+      if (i === 20) { edge ? (put(j, 5, i, body), put(j, 6, i, body)) : (glass(j, 5, i), glass(j, 6, i)); continue; }   // tailgate glass
+      if (edge) {
+        const pillar = i === 12 || i >= 17, quarter = i === 17;               // B pillar, wide C pillar with a small quarter light
+        pillar ? put(j, 5, i, body) : glass(j, 5, i);
+        if (i >= 7) (pillar && !quarter) ? put(j, 6, i, body) : glass(j, 6, i);
+      } else {
+        put(j, 5, i, i >= 17 ? 0x222222 : (i === 8 || i === 9 || i === 13 || i === 14) ? 0x3a2a22 : cab);   // dash, seats, parcel shelf
+        if ((i === 9 || i === 14) && j !== 4) put(j, 6, i, 0x2a2020);         // headrests
+      }
+    }
+    for (let i = 7; i <= 20; i++) put(j, 7, i, body);                         // roof to the tailgate
+    put(j, 7, 20, trim);                                                      // spoiler lip
+  }
+  put(4, 8, 17, 0x1e1e1e);                                                     // shark-fin antenna
 }
-{ // lamp post at the far corner of the parking
-  const fx = F(22.5), fz = F(48.5);
+{ // lamp post at the right corner of the parking, out of the facade's sight line
+  const fx = F(46), fz = F(39.5);
   fbox(fx - 1, TOP, fz - 1, fx + 1, TOP, fz + 1, 0x3a3e3c);
   for (let y = TOP + 1; y < TOP + F(7); y++) fset(fx, y, fz, P.black);
   const hy = TOP + F(7);
@@ -595,9 +625,11 @@ hedge(44.6, 46.2, 29, 36.5, 1.5);
   fbox(fx - 1, hy + 2, fz - 1, fx + 1, hy + 2, fz + 1, P.black); fset(fx, hy + 3, fz, P.black);
   lamp([fx, hy, fz], fx, hy + 0.5, fz, { power: 1.4, r: 14 });
 }
-for (const [x, lid] of [[42.2, 0x2e6b3a], [43.4, 0x3a3e40]]) {                 // wheelie bins
-  fbox(F(x), TOP, F(38.4), F(x) + 1, TOP + 3, F(38.4) + 1, 0x3a3e40);
-  fbox(F(x), TOP + 4, F(38.4), F(x) + 1, TOP + 4, F(38.4) + 1, lid);
+for (const [x, lid] of [[41.4, 0x2e6b3a], [43.1, 0x3a3e40]]) {                 // wheelie bins, 240 l (0.6 × 0.8 × 1.05 m)
+  const q = n => Math.round(n * S / 2), fx = F(x), fz = F(38.2);
+  fbox(fx, TOP, fz, fx + q(3) - 1, TOP + q(5) - 1, fz + q(4) - 1, 0x3a3e40);
+  fbox(fx, TOP + q(5), fz - 1, fx + q(3) - 1, TOP + q(5), fz + q(4) - 1, lid);            // lid overhangs at the handle side
+  fset(fx, TOP, fz + q(4), 0x141414); fset(fx + q(3) - 1, TOP, fz + q(4), 0x141414);       // wheels
 }
 cone(12.6, 36.6, 5.5, 1.1);
 cone(10.4, 33, 6.5, 1.3);
@@ -621,20 +653,20 @@ shrub(43.4, 13.8, 2.1, P.bigleaf, 0.9);
 { // twisted black garden finial
   const fx = F(43.2), fz = F(25.6);
   fbox(fx, TOP, fz, fx + 1, TOP, fz + 1, 0x2a2e2c);
-  for (let y = TOP + 1; y < TOP + 5; y++) { fset(fx + (y % 2), y, fz, P.black); fset(fx + 1 - (y % 2), y, fz + 1, P.black); fset(fx, y, fz + (y % 2), P.black); }
-  fset(fx, TOP + 5, fz, P.black);
+  for (let y = TOP + 1; y < TOP + 3; y++) { fset(fx + (y % 2), y, fz, P.black); fset(fx + 1 - (y % 2), y, fz + 1, P.black); fset(fx, y, fz + (y % 2), P.black); }
+  fset(fx, TOP + 3, fz, P.black);
 }
 for (let fz = F(17); fz < F(19.5); fz++) for (let fy = TOP; fy < TOP + 4; fy++) for (let fx = X1 + 1; fx <= X1 + 2; fx++)   // log stack under the eave
   fset(fx, fy, fz, hash(fx, fz, fy) < 0.25 ? 0x5a4430 : pick([0xb08a5a, 0x9a7448, 0xa47e50]));
 
 // ---------- back (photo 3): roses on black obelisks, lilies; raised terrace, birch, veg beds, shed ----------
-for (const x of [23.2, 27.4, 32.4, 36.6]) {
-  const cx = F(x), cz = F(14), r = hash(cx, cz, 96);
-  blob(x, GY + 0.6 + r * 0.6, 14, 0.7 + r * 0.4, P.rose, 1.1, 1.1);              // rose growing up inside the cage
-  for (const [a, b] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) for (let y = TOP; y < TOP + 8; y++) fset(cx + a, y, cz + b, P.black);
-  for (const yy of [TOP + 4, TOP + 7]) for (const [a, b] of [[0, -1], [0, 1], [-1, 0], [1, 0]]) fset(cx + a, yy, cz + b, P.black);
-  for (const [a, b] of [[0, 0], [0, -1], [0, 1], [-1, 0], [1, 0]]) fset(cx + a, TOP + 8, cz + b, P.black);
-  fset(cx, TOP + 9, cz, P.black); fset(cx, TOP + 10, cz, 0x3a3e3c);
+for (const x of [24.5, 28.7, 33.4, 36.0]) {                                   // photo 3 positions; ~1.2 m, top near sill height
+  const cx = F(x), cz = F(14), r = hash(cx, cz, 96), H = F(2.4);
+  blob(x, GY + 0.5 + r * 0.4, 14, 0.6 + r * 0.3, P.rose, 1.1, 1.1);              // rose growing up inside the cage
+  for (const [a, b] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) for (let y = TOP; y < TOP + H; y++) fset(cx + a, y, cz + b, P.black);
+  for (const yy of [TOP + (H >> 1), TOP + H - 1]) for (const [a, b] of [[0, -1], [0, 1], [-1, 0], [1, 0]]) fset(cx + a, yy, cz + b, P.black);
+  for (const [a, b] of [[0, 0], [0, -1], [0, 1], [-1, 0], [1, 0]]) fset(cx + a, TOP + H, cz + b, P.black);
+  fset(cx, TOP + H + 1, cz, P.black); fset(cx, TOP + H + 2, cz, 0x3a3e3c);
 }
 shrub(20.6, 14.2, 1.1, P.rose);
 shrub(39.2, 13.6, 1.3, P.rose);
@@ -656,7 +688,7 @@ tree(17.5, 5.5, 7, 2.6, P.apple);
 {
   const x0 = F(26), z0 = F(6.5);
   fbox(x0, TOP + 2, z0, x0 + 6, TOP + 2, z0 + 2, P.wood);
-  fbox(x0, TOP + 3, z0, x0 + 6, TOP + 5, z0, P.wood);
+  fbox(x0, TOP + 3, z0, x0 + 6, TOP + 4, z0, P.wood);
   for (const a of [0, 6]) for (const b of [0, 2]) for (let y = TOP; y < TOP + 2; y++) fset(x0 + a, y, z0 + b, 0x2a2a2a);
 }
 for (const [x0, z0] of [[34, 3.2], [34, 7.2]]) {
@@ -682,16 +714,18 @@ tree(51.5, 43, 9, 3.4, P.leafDark);
     for (let fy = TOP; fy <= roofY(fx) - 2; fy++) fset(fx, fy, fz, P.shed[Math.floor(hash(fx + fz, 0, 78) * 3)]);
   }
   for (let fx = x0 - 1; fx <= x1 + 1; fx++) for (let fz = z0 - 1; fz <= z1 + 1; fz++) { fset(fx, roofY(fx), fz, 0x8a3b32); fset(fx, roofY(fx) - 1, fz, 0x7a332c); }
-  fbox(x1, TOP, z0 + 2, x1, TOP + 7, z0 + 4, 0x5a4030);
+  fbox(x1, TOP, z0 + 1, x1, TOP + 8, z0 + 4, 0x5a4030);
   fset(x1 + 1, TOP + 4, z0 + 4, P.black);
   fbox(x0 + 2, TOP + 4, z1, x0 + 4, TOP + 5, z1, GLASS, 'glass');
 }
-{ // wheelbarrow by the shed
-  const x0 = F(11), z0 = F(16);
-  fbox(x0, TOP + 1, z0, x0 + 2, TOP + 2, z0 + 1, 0x3a7a4a);
-  fset(x0 + 3, TOP, z0, 0x1e1e1e); fset(x0 + 3, TOP + 1, z0, 0x1e1e1e);
-  fset(x0, TOP, z0, 0x555555); fset(x0, TOP, z0 + 1, 0x555555);
-  fset(x0 - 1, TOP + 2, z0, 0x8a6a48); fset(x0 - 1, TOP + 2, z0 + 1, 0x8a6a48);
+{ // wheelbarrow by the shed (1.4 m long, 0.6 m wide tub)
+  const q = n => Math.round(n * S / 2), x0 = F(11.5), z0 = F(16);
+  fbox(x0, TOP + q(1), z0, x0 + q(4) - 1, TOP + q(3) - 1, z0 + q(3) - 1, 0x3a7a4a);                    // tub
+  fbox(x0 + q(4), TOP, z0 + q(1), x0 + q(4), TOP + q(2) - 1, z0 + q(2) - 1, 0x1e1e1e);                 // wheel
+  for (const z of [z0, z0 + q(3) - 1]) {
+    fbox(x0, TOP, z, x0, TOP + q(1) - 1, z, 0x555555);                                                // legs
+    fbox(x0 - q(3), TOP + q(2), z, x0 - 1, TOP + q(2), z, 0x8a6a48);                                  // handles
+  }
 }
 
 // ---------- left side (photo 4): rose arch, roses, potted standard tree, hose reels ----------
@@ -710,9 +744,9 @@ tree(51.5, 43, 9, 3.4, P.leafDark);
 shrub(16, 33.5, 1.0, P.rose);
 shrub(16.3, 36.6, 0.9, P.rose);
 shrub(15.8, 19.6, 1.3, P.rose);
-disc(15.4, 29.1, 0, 0.55, TOP, TOP + 2, 0xf2f2ee);
-limb(15.4, GY + 1, 29.1, 15.4, GY + 3.2, 29.1, P.bark);
-blob(15.4, GY + 3.8, 29.1, 1.0, P.leaf, 1, 0.5);
+disc(15.4, 29.1, 0, 0.55, TOP, TOP + 1, 0xf2f2ee);
+limb(15.4, GY + 0.8, 29.1, 15.4, GY + 1.9, 29.1, P.bark);
+blob(15.4, GY + 2.5, 29.1, 0.75, P.leaf, 1, 0.4);
 for (const [z, rim, hose] of [[34.6, 0xf2c21a, 0x2a7ac0], [37.6, 0xe86a1a, 0xe86a1a]]) {
   const fx = F(18.4), fz = F(z);
   fset(fx, TOP, fz, 0x333333); fset(fx, TOP, fz + 2, 0x333333);
@@ -732,6 +766,7 @@ const SCRUFF = { weeds: 0.45, litter: 0.4 };
   for (let fx = LO; fx < LO + WD; fx++) for (let fz = LO; fz < LO + WD; fz++) {
     const t = topAt(fx, fz);
     if (t === -OUT || fhas(fx, t + 1, fz)) continue;
+    if (isPave(ec(fx), ec(fz))) continue;                       // no weeds sprouting from the paving (around the car wheels, bins, steps)
     const foot = [[1, 0], [-1, 0], [0, 1], [0, -1]].some(([a, c]) => fhas(fx + a, t + 1, fz + c) && fhas(fx + a, t + 2, fz + c));
     if (foot && hash(fx, fz, 81) < SCRUFF.weeds) {
       const n = hash(fx, fz, 82) < 0.4 ? 2 : 1;

@@ -75,7 +75,13 @@ Proportions are the first thing that makes a scene look like a toy. Check every 
 - **Every prop must be 1.0–1.2× its real size.** The user rejected vehicles at 1.5–1.7× ("make everything max
   1.1–1.2x original size"). Check each against real dimensions: pickup 2.0 × 5.9 × 1.9 m, semi tanker 2.5 × 18 m,
   20 ft container 2.44 × 2.59 × 6.06 m, crawler-crane track ≈ 9 m, door 2.1 m, jersey barrier 0.6 × 0.8 × 3.7 m,
-  traffic cone 0.7 m, bollard 1 m. The island may grow to make room.
+  traffic cone 0.7 m, bollard 1 m, hatchback 1.8 × 4.1 × 1.5 m, wheelie bin 0.6 × 0.75 × 1.05 m, wheelbarrow
+  1.4 m long, garden bench seat 0.45 / back 0.85 m, globe wall lamp 0.25 m, slim metal flue 0.35 m. The island
+  may grow to make room. This applies to houses too: the green house's car had been modelled at 0.7× and its
+  globe lamps as 40 cm cubes (a 2×2 fine block is already 40 cm at `S = 2`; small fixtures get 1 cell).
+- Measure openings from the photo with a scale bar on the same wall (eave height or a door), including sill and
+  head heights, not just widths: windows had been placed ~0.6–1 unit too low and attic windows 30% too wide.
+  Perspective makes the near side of a photo larger; compare items with a reference at the same depth.
 - If real-size props come out too coarse ("details on cars, crane etc. are very low"), make the grid finer
   (`S = 3`, 0.37 m cells at 1.1 m/unit) instead of enlarging the props. ~620k voxels at `S = 3` ran ≈ 47 fps with
   a 0.8 s bake — acceptable.
@@ -86,6 +92,12 @@ Proportions are the first thing that makes a scene look like a toy. Check every 
   seats behind it, pillars, mirrors, grille + glowing head/tail lights, bumpers, cargo; container corrugation,
   corner castings, door seam, lock bars, rust, stencil; crane lattice boom with zigzag lacing, pendants, hoist
   rope, striped hook block, a hung load, hazard-striped counterweight, glazed cab, tracks with rollers on mats.
+- **Cars: match the body type's side profile**, not just the size. Read it from the photo (hatchback, sedan,
+  estate, SUV): a hatchback has a short hood (~0.8 m), a raked screen, and a roof running to a near-vertical
+  tailgate with a spoiler; a separate low deck behind the cabin makes it read as a sedan (the user flagged it).
+  Keep 0.8 m overhangs and a ~2.5 m wheelbase. `voxel-green-house.html` has a hatchback sprite in 20 cm cells
+  (`q(n) = round(n·S/2)`): wheel arches with hubs, inset sills, wrap-round tail lights, A/B/wide-C pillars with
+  a quarter light, seats and headrests, mirrors, door seam and handles, plates, shark fin.
 - Lattice structures: `lattice()` (corner columns, ring beams, X braces on all faces) and `trussX()` (chords,
   verticals, diagonals). Keep a crane boom's width ~1/3 of the crane body or it looks like a solid plank.
 
@@ -237,6 +249,21 @@ Buildings
   (`max` of each rectangle's height inside its own footprint) gives correct valleys; separate overlapping
   roofs poke through each other.
 
+Alignment (check it logically before screenshots; the user asked for this pass explicitly)
+- **Stack openings on shared centre lines.** An upper window over a door or window below shares its centre line
+  unless the photo clearly breaks it; 0.5–0.7 units off reads as a mistake. Same for paired windows under a gable
+  apex.
+- **Fixtures sit relative to the opening they serve:** wall lamps symmetric about a door, on the outer corners
+  of its surround (as photographed), never overlapping a slab or sill above; steps and mats as wide as the door.
+- **Architectural edges line up with each other:** a recessed loggia or balcony that is "half the gable" ends
+  exactly on the ridge line; a downpipe sits on a corner, not just past it.
+- **Check every interior prop is inside the footprint:** canted bays have diagonal limits (`x - z >= …`), and a
+  floor lamp at a plausible-looking coordinate stood outside the house in the garden.
+- **Things on a roof plane mustn't overlap:** a skylight's flashing and a roof ladder's rail landed on the same
+  cell. Keep ≥ 1 fine cell between roof furniture.
+- **Keep added fixtures off the main sight lines:** a lamp post placed in the parking stood right in front of a
+  door in the hero view. Put it at a corner of the hard surface.
+
 Glass (the user must clearly *see* it)
 - Material: `MeshPhysicalMaterial({ transparent, opacity ≈ 0.55, roughness ≈ 0.03, clearcoat: 1,
   envMap: RoomEnvironment PMREM, envMapIntensity ≈ 0.9, depthWrite: false })`, `renderOrder = 1`, no shadows.
@@ -261,7 +288,8 @@ Automatic (template; strengths in `WEATHER` and `SCRUFF`, 0 = off):
 - **Weathering** in the bake: broad colour blotches, odd off-shade voxels, grime splashed up the foot of every
   wall (~1.8 units), vertical rain streaks above that, moss on upward faces above ground (roofs, caps, sills).
 - **Scruff** before connectivity: weeds and the odd flower at the foot of anything standing in the lawn; leaf
-  litter on the ground under every `tree()` crown.
+  litter on the ground under every `tree()` crown. Define `hardAt(fx, fz)` for paving/gravel/decks so no weeds
+  grow there: weed cubes around car wheels, bins and steps on paving read as debris.
 - **Lawn**: low hummocks (`heightAt`) and worn, sun-scorched patches (`P.lawnDry`).
 - **Roofs** (`hip()`): replaced tiles in another shade, a few lifted/slipped tiles.
 - **Trees** (`tree()`): leaning trunk with a kink, 3–5 uneven crown clumps with gaps, root flare, ~5% yellowed

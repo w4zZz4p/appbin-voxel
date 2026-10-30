@@ -181,6 +181,9 @@ const topAt = (fx, fz) => inGrid(fx, fz) ? top[idx(fx, fz)] : -OUT;
 // terrain height above the base in design units (hills: see voxel-cabin.html). Low hummocks keep the lawn from
 // being a billiard table; keep them away from footprints if a building must sit flush.
 const heightAt = (x, z) => vnoise(x, z, 6, 71) > 0.7 ? 0.5 : 0;
+// hard surfaces (paving, gravel, decks; fine cells): scruff grows no weeds there, or they read as debris around car
+// wheels, bins and steps. Return true for every paved cell in the scene.
+const hardAt = (fx, fz) => false;
 for (let fx = LO; fx < LO + WD; fx++) for (let fz = LO; fz < LO + WD; fz++) {
   const x = dc(fx), z = dc(fz), dx = x - CX, dz = z - CZ;
   const e = edgeR(x, z) - Math.pow(dx ** 4 + dz ** 4, 0.25);
@@ -346,7 +349,7 @@ const SCRUFF = { weeds: 0.45, litter: 0.4 };
   const add = [];
   for (let fx = LO; fx < LO + WD; fx++) for (let fz = LO; fz < LO + WD; fz++) {
     const t = topAt(fx, fz);
-    if (t === -OUT || fhas(fx, t + 1, fz)) continue;
+    if (t === -OUT || fhas(fx, t + 1, fz) || hardAt(fx, fz)) continue;
     const foot = [[1, 0], [-1, 0], [0, 1], [0, -1]].some(([a, c]) => fhas(fx + a, t + 1, fz + c) && fhas(fx + a, t + 2, fz + c));
     if (foot && hash(fx, fz, 81) < SCRUFF.weeds) {
       const n = hash(fx, fz, 82) < 0.4 ? 2 : 1;
