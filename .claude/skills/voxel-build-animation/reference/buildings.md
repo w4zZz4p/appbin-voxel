@@ -4,6 +4,12 @@
 
 - One-voxel `shell()`s with a material function: fieldstone (offset courses + mortar), boards (per-board hash
   colour), concrete (vertical streak noise). Add a plinth course and a string course between floors.
+- **Overlapping masses (wings, cross blocks) as one union shell:** `inV(fx, fz, g)` tests every footprint grown by
+  `g` cells; a wall cell is an in-cell with an out-neighbour (`outDir`), so no inner walls stay hidden in the
+  hollow house. A jettied timber storey is the same union at `g = S` above a band ring (in at `S`, not inside the brick).
+- **Half-timbering** (`timberC`): posts every 6 fine cells, rails at the sill plate, sill rail, head and top plate,
+  a St Andrew's cross under the windows and a brace in about half the panels; windows fill one panel (`6k+1..6k+5`)
+  so frames land between posts. Dark tar `l ≈ 0.14`, cream infill `l ≈ 0.82`.
 - Material irregularity: stones a voxel proud here and there, a darker repaired patch, moss in retaining-wall
   joints, ivy on one corner, a sagging gutter end.
 - Wall colours come from the sampler and stay muted (concrete/render s ≤ 0.1, brick s ≤ 0.4; see
@@ -56,6 +62,9 @@
   `hip()` adds replaced tiles in another shade and a few lifted ones.
 - **Combined footprints** (L-shapes, bays) get one roof: the upper envelope (`max`) of per-rectangle hipped
   roofs gives correct valleys; separate overlapping roofs poke through each other (`roofU()`).
+- **Gables and cross gables:** `roofG()` takes a ridge axis and per-end hips per rect (a wing running into another
+  roof gets a hip there, no hidden gable wall); `gable()` fills the end wall to the roof's underside. Steep villa roofs
+  ≈ slope 1.1–1.25; dormers (`o.above`) and chimneys stand on `roofTop()`.
 - **Sloped surfaces are two voxels thick** so adjacent steps share a face (`ceil(slope) + 1` when steeper than
   one cell per cell).
 - **Steep roofs lift off their walls:** with a 1-unit overhang at slope ≥ 1 the roof is 2+ cells above the eave

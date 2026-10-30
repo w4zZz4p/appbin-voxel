@@ -5,7 +5,8 @@
 - Recreate what is in the photo (trees by type, shrubs, topiary cones, flower beds, chairs, tents, cars, rocks).
 - Imagine the unseen sides: back terrace with balustrade and furniture, formal garden/fountain, pergola,
   conservatory, side door and drive, woodland ring. Keep tall trees off the main sight lines and out of the band
-  just behind an imagined courtyard, or the back view shows only treetops.
+  just behind an imagined courtyard, or the back view shows only treetops: a woodland ring keeps spruces ≥ r + 5
+  units off the walls, a ~16-unit clearing behind the back wall and the hero view's near side open.
 - **Keep busy, same-coloured props out from behind the hero's silhouette** in the hero view: a prop of the
   subject's colour directly behind its head or edge swallows that edge. Check what lies behind the subject along
   the view, too.
@@ -25,8 +26,15 @@
   height, 5–7 clumps, crown radius ≈ 0.4·h); the default gives a ball on a long bare trunk ("lollipop").
 - **Spruce/fir** (`spruce()`): per-layer `disc()`s, radius `r·(1−t)` minus a 0.8-unit whorl
   sawtooth every 5 layers, trunk to 75% of the height. Step each layer in by under a cell (widest at the whorl's
-  foot): whorls stepping in by 30% leave every tier floating after hollowing (40k voxels lost). Draw the trunk
-  **after** the leaves — leaves overwriting it get hollowed away and the crown comes loose.
+  foot): whorls stepping in by 30% leave every tier floating after hollowing (40k voxels lost). Each whorl's foot
+  grows out over the tier below by ≤ 0.8 fine cells per layer and steps in by ≤ 1.5 (`spruce()` clamps both, whorls
+  every ~1 m): a wider step hollows away the joining cells and the crown comes loose. Trunk **after** leaves.
+  Identical cones read as a plantation: each spruce draws its own taper exponent, whorl spacing/depth, jutting tiers,
+  drift off plumb and tint from `hash` (not `rnd`, so the layout doesn't shift). Keep the skirt low (3–15% of h): at
+  up to a third the spruces read as lollipops. A drifting trunk must stay face-joined where it steps sideways, or the
+  whole crown comes loose (~7k voxels per tree).
+- `blob()` edges wobble by smooth design-unit noise plus under a cell of speckle: per-cell noise of ±`rough` units
+  punched holes deeper than the 2-cell skin at S = 3 and lost ~56k crown voxels.
 - **Weeping willow:** low dome plus 4–5 clumps on top (one big blob reads as a flat-topped cylinder), and hanging
   shoots every ~4.5 cells round two rings with lengths spread by `hash²`; at every 2.2 cells the curtains form
   a solid green wall.

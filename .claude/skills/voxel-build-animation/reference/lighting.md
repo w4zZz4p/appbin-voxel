@@ -29,14 +29,16 @@ light into the voxels in a single pass after connectivity.
   where `src` is a glowing voxel of its fixture; a light at a bare coordinate drifts from its fixture and gives a
   pool of light at a random spot. Lamps whose `src` isn't glow after connectivity are dropped with a warning naming
   the prop that now owns the cell (e.g. a tree crown over a lit window, or `A0 + 3` outside a 3-cell window — use
-  the pane centre). The fixture helpers call it for you: `lantern(axis, l, dir, a, y, opts)`,
+  the pane centre). Lamps whose light point is covered (no path of ≤ 4 empty cells to glass or glow: a roof or
+  crown over a lit pane) are dropped too, since their light would have no visible fixture. The fixture helpers call it for you: `lantern(axis, l, dir, a, y, opts)`,
   `uplight(axis, l, dir, a, opts)` (by a wall), `uplightAt(fx, fz, opts)` (free-standing), `wallLamp(axis, l, dir,
   a, y, opts)` (one cell), `lampPost(x, z, opts)`, `win()` / `rWin()` for lit rooms and doors. For a custom fixture,
   build the glow voxels, then `lamp()` at them. `window.__lamps` lists what was baked.
 - Lamp fields: `{ color, power, r (design units), dir?, cone?, shadow?, wrap?, hero? }`. Contribution =
-  `power × (wrap + (1 − wrap)·facing) × (1 − d/r)²` (wrap 0.35) with a shadow ray to the lamp; glow voxels don't
-  block it, and the ray stops 2.5 cells short so a lantern's own caps don't cast a stripe. `dir` + `cone`
-  (cosine of the half angle) make a spot.
+  `power × (wrap + (1 − wrap)·facing) × (1 − d/r)²` (wrap 0.35) with a shadow ray all the way to the lamp; opaque
+  and glass cells block it, glow doesn't, and cells within one cell of `src` (caps, bracket) are skipped. Baked light
+  is per voxel, not per face: light reaching the inside of a one-cell wall or roof (a ray stopping short, or entering
+  through a pane) glows on its outside as a patch with no fixture. `dir` + `cone` (cosine of the half angle) make a spot.
 - **Baked light is emission, not albedo**: it goes into the `lamp` instance attribute and the lit material adds
   `diffuseColor × lamp × lampK` (`onBeforeCompile`), so it reads the same on every side, day or night (as albedo
   it vanishes on walls facing away from the sun). `BAKE.gain` scales it; `setLights(k)` fades it in with the glow
@@ -45,15 +47,15 @@ light into the voxels in a single pass after connectivity.
 | Fixture | power | r | notes |
 |---|---|---|---|
 | Lantern | 1.6 | 3.5 | a tight pool; at r 6 two door lanterns light the whole facade evenly |
-| Lamp post | 1.2 | 8–10 | |
-| Lit window | 1 | 9 | weak spot out through the glass |
+| Lamp post (2.6 m) | 1.5 | 12 | at r 9 the falloff leaves ~10% on the ground |
+| Lit window | 1 | 9 | `paneLamp`: spot out and 27° down, cone 0.35; a hemisphere lit the eave above brighter than the dim pane |
 | Rooms, tents | 1–1.5 | | |
 | Uplight, dusk/night | ~5 | ≈ 1.5× wall height | `dir: [0,1,0], cone: 0.15` so the wash reaches the eaves |
 | Uplight, day | ~2.4 | ≈ wall height | `cone: 0.72` — the night setting floods sunny walls orange (it's emission) |
 | LED panel, billboard | 1.2–1.6 | ≈ 1.1 × width | no `dir`/`cone`, `wrap` 0.35: the halo lands on the sign's own wall. A cone facing out from a wall high on a tower lights nothing (`lamps reaching almost nothing`) |
 | Blade sign (perpendicular to the wall) | 1.6 | 11 | lamp in the one-cell gap between wall and blade, not inside the blade: at r 7 inside it no halo reached the wall |
 | Fixture lens colour | | | glow cells take the lamp's colour (`o.color ?? GLOW`): amber lenses casting cyan (uplights, park posts) read wrong |
-| Street lamp (7 m, head under the arm) | 2.2 | 13 | `dir: [0,-1,0], cone: 0.15`: a pool on the road; 1.5 / 11 left the street black |
+| Street lamp (7 m, head under the arm) | 2.2 | 13 | `dir: [0,-1,0], cone: 0.15`: a pool on the road; 1.5 / 11 leaves the street black |
 
 Dozens of lamps are fine; the bake logs its time and flags lamps that reach almost nothing.
 
@@ -74,10 +76,12 @@ moving parts) and check with `__hero(false)` that it spreads no light where ther
 - `setLights(k, settled, dt)` fades the bake in over ~1 s once every voxel has landed, then sets `sun.castShadow =
   false` (no shadow pass per frame, no aliasing); any motion (replay, demolish, pile) brings the map back within a
   frame so flying voxels keep casting. `__shadow('map' | 'bake')` forces a source, `__shadow()` reports and resets.
+- `renderer.shadowMap.autoUpdate` is off: the shadow pass runs only on frames with `moved` set, since the sun never
+  moves; the last map stays valid while the scene is still. A new moving caster must set `moved`.
 - **The shadow map is fitted, not fixed:** `fitShadowCamera()` (called by `bake()`) projects the voxel bounds (+8
   design units up, for dropping voxels) into light space and wraps them with a 2-unit margin. `bias -0.00005` of the
   fitted depth range plus `normalBias 0.03` keep the offset under 0.02 world units, so contact shadows meet their
-  casters; `-0.0006` over a 300-unit range detaches every shadow by a third of a voxel. `?shadow=hi` uses an 8192 map.
+  casters; `-0.0006` over a 300-unit range detaches every shadow by a third of a voxel. `?shadow=lo|hi` uses a 1024 / 4096 map (default 2048).
 - The map's edges on a wall the sun grazes alias into a sawtooth with a period of about one voxel, and a texel
   covers ~0.02 world units even when fitted; the bake follows the grid exactly, which is why the map is for
   motion only.
@@ -96,8 +100,8 @@ moving parts) and check with `__hero(false)` that it spreads no light where ther
   `FOV` 28°, elevation `ORBIT_EL` 0.36 rad (~21°, keep 15–25°), distance `VIEW / tan(FOV/2)` so it frames the
   same height at the target. Use it for the hero screenshot and the photo comparison; the ortho view stays for
   side checks and inspection (`__props` centres are world points and work in both).
-- Start near the photo's angle; with imagined sides, orbit 360° slowly (`camAz += dt * 0.12`) and hold the
-  finished scene ~30 s before looping.
+- Start near the photo's angle; with imagined sides, orbit 360° slowly (`camAz += dt * 0.12`); the
+  finished scene holds until Replay.
 - **Voxel outlines:** a 32×32 canvas texture with a near-invisible border (`#f4f4f4`) as `map`, so cubes read as
   surfaces; `?grid=1` draws the full grid (`#dadada`) for checking geometry.
 
@@ -111,9 +115,9 @@ moving parts) and check with `__hero(false)` that it spreads no light where ther
   framebuffer warnings.
 - With the composer the lit material writes linear colour and `OutputPass` converts to sRGB, so the depth-haze
   colours must be linear (`raw = h => new THREE.Color(h)`), not raw sRGB components, or the haze band shifts lighter.
-- Keep the glow gain at 1.0 and the threshold ≈ 0.6: at gain 1.25 cyan neon bloomed to white; pale tints (0xbafdfc,
-  0xfbdaeb) on a panel bloom white too — mix a saturated pair (0x62d5dc + 0x14f1f4, 0xe032ad + 0xf07ad0) instead. Night city that matched
-  the photo's `__compare`: `LIGHT { hemi 1.5, sun 0.55, sky 0x5a7a8e, ground 0x3a4048, sunColor 0x9fb8d8 }`, bloom
+- Keep the glow gain at 1.0 and the threshold ≈ 0.6: at gain 1.25 cyan neon blooms to white; pale tints (0xbafdfc,
+  0xfbdaeb) on a panel bloom white too — mix a saturated pair (0x62d5dc + 0x14f1f4, 0xe032ad + 0xf07ad0) instead. Night city
+  starting point: `LIGHT { hemi 1.5, sun 0.55, sky 0x5a7a8e, ground 0x3a4048, sunColor 0x9fb8d8 }`, bloom
   (0.6, 0.4, 0.6) ramped with the lamps, `HAZE.strength 0.48`, sky stops lifted to the photo's upper-third means.
 - Sampled night materials fall under the palette lint (l < 0.12): lift base walls to l 0.12–0.16 (navy 0x172330,
   steel 0x1c2b38) and put neon / lit-room keys in `ACCENT`; the darkness comes from the low hemisphere, not the albedo.

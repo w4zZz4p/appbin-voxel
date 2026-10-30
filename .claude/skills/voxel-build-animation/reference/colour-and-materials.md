@@ -31,6 +31,8 @@ materials; photographic ones from muted, slightly varied colours with the light 
 - Glass tint `0x6b96b4` (s ≈ 0.33): visibly blue against walls, not a toy's cyan.
 - Overcast photos push every material toward the sky's grey-blue: let the sampled values carry that; don't
   "correct" them back to catalogue colours.
+- Vivid photos (sunny, saturated brick or tile at s 0.5–0.75): keep the sampled hue, clamp s to 0.37–0.38 (0.40
+  rounds over the lint) and lift l by ~0.05, since a clamped red reads brown once AO and weathering darken it.
 
 ## Real-world albedos (what the sampled values should land near)
 

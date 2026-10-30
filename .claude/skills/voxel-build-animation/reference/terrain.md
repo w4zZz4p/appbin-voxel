@@ -13,6 +13,8 @@ The floating island is the default ground; the fade-out ground (below) is the al
   like a sea urchin.
 - **Generously wider than the building:** radius ≈ building half-width + 15–20 units; a tight island reads as a
   pedestal.
+- **Props near the rim are placed by test, not by eye:** check the footprint + eaves against `edgeR() −
+  superellipse distance > 3` and take the nearest spot that fits; one placed by eye hangs over the edge, seen from below.
 
 ## Underside
 
@@ -41,7 +43,7 @@ that thickens inward hangs an inverted stair under the rim whose risers sit in s
 - Markings: dashed centre line (every 5 cells) except inside junctions, zebra stripes in the 3 units before a crossing
   band, bay lines every 5 cells in the lot. Wet night asphalt: 20% lighter blue-grey speckle plus `vnoise > 0.74`
   puddles; a plain 0x1c2128 road read as black. Rim: the outermost 1.3 units in kerb colour, 1 m bollards along it.
-- A road band runs the whole slab: anything "beyond" the cross street (a bus shelter, a pedestrian) placed by eye landed
+- A road band runs the whole slab: anything "beyond" the cross street (a bus shelter, a pedestrian) placed by eye lands
   on the avenue's continuation, half a cell above the road. Stand props on `topAt() + 1`, never on `BY`, and check
   `groundKind` at their cells.
 

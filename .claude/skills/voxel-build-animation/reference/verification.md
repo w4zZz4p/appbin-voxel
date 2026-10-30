@@ -9,20 +9,25 @@
   the hard-coded one and navigation fails. If a borrowed server goes away, start your own.
 - Both ports taken by other chats → add a third `python3 -m http.server` config (e.g. `static-py3-c`, 8797) to
   launch.json and start that; a borrowed server works for a sampler page but the hook warns the pane may not reach it.
-- Add `?v=N` to bust the cache after edits.
+- Add `?v=N` to bust the cache after edits; `http.server` lets the browser reuse an old copy of the same URL, so a
+  reload without a new `v` can show the previous build.
 
 ## Timing gotchas
 
 - Generating 100k+ voxels takes a few seconds; wait ~5 s after load.
 - While the pane is hidden, frames are throttled: a screenshot right after load can show an empty sky (check the
   `#bar i` width), and lamps stay half faded after `F` — call `__bake(true)` before judging lighting.
-- **Untick Loop (or press F again) before a long check:** after the 30 s hold the scene replays and screenshots
-  show half-built towers.
+- The pane can stop animation frames entirely (fps readout blank, `#bar i` frozen); a screenshot wakes it, so
+  interleave screenshots in a `browser_batch` while waiting on the build. The readout shows `idle` when nothing
+  redraws, which is expected for a settled scene with Orbit off.
 - `?sky=night` in a hidden pane may never reach night (frames throttled): call `__night(1)` to force it, `__night()`
   for automatic.
-- A dragged view stops the camera auto-moving (`userMoved`); reload before judging framing.
-- A screenshot straight after `__seeAz` / `__zoom` captures the previous frame (two views came back identical):
+- A drag unticks Orbit; ticking it again orbits on from the dragged view (keeps zoom and tilt). Reload or
+  `__seeAz()` before judging the default framing.
+- A screenshot straight after `__seeAz` / `__zoom` captures the previous frame, so two views look identical:
   `await new Promise(r => setTimeout(r, 500))` before each capture, in a `browser_batch` of view + screenshot pairs.
+- In a hidden pane an awaited `__compare()` can outlive the tool's 45 s limit: start it without awaiting
+  (`__compare(src, 0).then(r => window.__cmp = r)`) and read `__cmp` in a later call.
 
 ## Test hooks
 
@@ -32,7 +37,7 @@ to automatic · `__hero(false)` hide hero PointLights · `__lamps` baked lamps �
 props · `__lost` voxels removed by connectivity, bucketed by 4-unit cells · `__compare(src, opacity)` photo
 overlay and per-region colour table (below) · `__shadow('map' | 'bake')` force the sun's shadow source (shadow
 map vs baked faces), `__shadow()` back to automatic, returning `{ k, castShadow }`. URL flags: `?grid=1` full cube
-grid, `?cam=persp` perspective hero view, `?bg=css` CSS sky instead of the texture, `?shadow=hi` 8192 shadow map.
+grid, `?cam=persp` perspective hero view, `?bg=css` CSS sky instead of the texture, `?shadow=lo|hi` 1024 / 4096 shadow map (default 2048), `?dpr=N` pins the pixel ratio.
 
 ## Checks
 

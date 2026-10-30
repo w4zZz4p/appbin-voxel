@@ -9,14 +9,34 @@
   body { background: linear-gradient(#8fa2b6 0%, #b6c2cb 50%, #d6d9d6 72%, #cfc8bb 100%); } /* sky fallback (?bg=css); the sky texture (SKY) is the default */
   canvas { display: block; position: relative; z-index: 1; }
   #night { position: fixed; inset: 0; opacity: 0; pointer-events: none; background: linear-gradient(#0a1430 0%, #1c2a4e 55%, #3b3552 100%); } /* sky=night fades this in */
-  #ui { z-index: 2; position: fixed; left: 16px; bottom: 16px; display: flex; gap: 8px; align-items: center; color: #2c3336; font-size: 13px; flex-wrap: wrap; }
-  #ui button { background: rgba(255,255,255,.5); color: #222; border: 1px solid rgba(0,0,0,.15); border-radius: 6px; padding: 6px 12px; cursor: pointer; font: inherit; }
-  #ui button:hover { background: rgba(255,255,255,.75); }
-  #ui select { background: rgba(255,255,255,.5); color: #222; border: 1px solid rgba(0,0,0,.15); border-radius: 6px; padding: 5px 6px; font: inherit; cursor: pointer; }
-  #bar { width: 160px; height: 4px; background: rgba(0,0,0,.15); border-radius: 2px; overflow: hidden; }
+  /* HUD: fps top left; every control lives in a popover opened by the burger, bottom left. H hides burger + popover. */
+  #fps { z-index: 2; position: fixed; left: 16px; top: 16px; color: #2c3336; font-size: 12px; font-variant-numeric: tabular-nums; opacity: .75; pointer-events: none; }
+  #menu { z-index: 3; position: fixed; left: 16px; bottom: 16px; width: 40px; height: 40px; display: grid; place-content: center; gap: 4px; padding: 0;
+    background: rgba(255,255,255,.55); border: 1px solid rgba(0,0,0,.15); border-radius: 8px; cursor: pointer; backdrop-filter: blur(6px); }
+  #menu:hover { background: rgba(255,255,255,.8); }
+  #menu i { display: block; width: 18px; height: 2px; border-radius: 1px; background: #2c3336; transition: transform .2s, opacity .2s; }
+  #menu[aria-expanded="true"] i:nth-child(1) { transform: translateY(6px) rotate(45deg); }
+  #menu[aria-expanded="true"] i:nth-child(2) { opacity: 0; }
+  #menu[aria-expanded="true"] i:nth-child(3) { transform: translateY(-6px) rotate(-45deg); }
+  #ui { z-index: 3; position: fixed; left: 16px; bottom: 64px; width: min(280px, calc(100vw - 32px)); max-height: calc(100vh - 108px);   /* clears the fps readout above */ overflow-y: auto; box-sizing: border-box;
+    display: none; flex-direction: column; gap: 10px; padding: 14px; color: #2c3336; font-size: 13px;
+    background: rgba(255,255,255,.72); border: 1px solid rgba(0,0,0,.12); border-radius: 10px; box-shadow: 0 8px 28px rgba(0,0,0,.18); backdrop-filter: blur(10px); }
+  #ui.open { display: flex; }
+  #ui .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  #ui button { flex: 1; background: rgba(255,255,255,.6); color: #222; border: 1px solid rgba(0,0,0,.15); border-radius: 6px; padding: 6px 12px; cursor: pointer; font: inherit; }
+  #ui button:hover { background: rgba(255,255,255,.9); }
+  #ui select { width: 150px; background: rgba(255,255,255,.6); color: #222; border: 1px solid rgba(0,0,0,.15); border-radius: 6px; padding: 5px 6px; font: inherit; cursor: pointer; }
+  #ui label.pick { justify-content: space-between; }
+  #ui h3 { margin: 6px 0 -4px; font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; opacity: .6; }
+  #ui h3 span { font-weight: 400; text-transform: none; letter-spacing: 0; }
+  #bar { height: 4px; background: rgba(0,0,0,.15); border-radius: 2px; overflow: hidden; }
   #bar i { display: block; height: 100%; width: 0; background: #d98a2e; }
-  #ui.hidden { display: none; }
-  body.dark #ui { color: #dfe6f2; }
+  #info { opacity: .75; font-size: 12px; line-height: 1.4; }
+  body.hud-hidden #menu, body.hud-hidden #ui { display: none; }
+  body.dark #fps { color: #dfe6f2; }
+  body.dark #menu { background: rgba(20,30,55,.6); border-color: rgba(255,255,255,.2); }
+  body.dark #menu i { background: #e6ecf5; }
+  body.dark #ui { color: #dfe6f2; background: rgba(16,24,44,.78); border-color: rgba(255,255,255,.15); }
   body.dark #ui button, body.dark #ui select { background: rgba(20,30,55,.6); color: #e6ecf5; border-color: rgba(255,255,255,.2); }
   label { display: flex; gap: 4px; align-items: center; user-select: none; }
 </style>
@@ -29,40 +49,47 @@
 </head>
 <body>
 <div id="night"></div>
+<div id="fps"></div>
+<button id="menu" aria-label="Menu" aria-expanded="false" aria-controls="ui"><i></i><i></i><i></i></button>
 <div id="ui">
-  <button id="replay">Replay (R)</button>
-  <button id="pause">Pause (Space)</button>
-  <label><input type="checkbox" id="loop" checked> Loop</label>
-  <label><input type="checkbox" id="orbit" checked> Orbit</label>
-  <label>Intro <select id="intro"><option value="none">None</option><option value="blueprint">Blueprint</option></select></label>
-  <label>Order <select id="order"><option value="layers">Layers</option><option value="scan">3D print</option><option value="stages">Stages</option></select></label>
-  <label>Motion <select id="motion"><option value="drop">Drop</option><option value="grow">Grow</option><option value="swarm">Swarm</option><option value="tornado">Tornado</option><option value="slide">Slide</option><option value="pop">Pop</option><option value="tumble">Tumble</option><option value="squash">Squash</option><option value="flash">Flash</option></select></label>
-  <label>Detail <select id="res"><option value="1">1 · coarse</option><option value="2">2</option><option value="3">3</option><option value="4">4 · fine</option></select></label>
-  <label>Ending <select id="outro"><option value="reset">Reset</option><option value="demolish">Demolish</option><option value="pile">Pile &amp; rebuild</option></select></label>
-  <label>Sky <select id="sky"><option value="day">Day</option><option value="night">Day → night</option></select></label>
+  <div class="row"><button id="replay">Replay (R)</button><button id="pause">Pause (Space)</button></div>
   <div id="bar"><i></i></div>
-  <span id="info" style="opacity:.75"></span>
+  <h3>Animation</h3>
+  <label class="pick">Order <select id="order"><option value="layers">Layers</option><option value="stages">Stages</option></select></label>
+  <label class="pick">Motion <select id="motion"><option value="drop">Drop</option><option value="grow">Grow</option><option value="swarm">Swarm</option><option value="tornado">Tornado</option><option value="slide">Slide</option><option value="pop">Pop</option><option value="tumble">Tumble</option><option value="squash">Squash</option><option value="flash">Flash</option></select></label>
+  <label class="pick">Sky <select id="sky"><option value="day">Day</option><option value="night">Day → night</option></select></label>
+  <label><input type="checkbox" id="orbit" checked> Orbit</label>
+  <h3>Render <span>· reloads</span></h3>
+  <label class="pick">Camera <select data-q="cam"><option value="">Orthographic</option><option value="persp">Perspective</option></select></label>
+  <label class="pick">Background <select data-q="bg"><option value="">Sky texture</option><option value="css">CSS gradient</option></select></label>
+  <label class="pick">Shadow map <select data-q="shadow"><option value="lo">1024</option><option value="">2048</option><option value="hi">4096</option></select></label>
+  <label class="pick">Pixel ratio <select data-q="dpr"><option value="">Auto</option><option value="1">1</option><option value="1.5">1.5</option><option value="2">2</option></select></label>
+  <label><input type="checkbox" data-q="grid" value="1"> Cube grid</label>
+  <h3>Debug</h3>
+  <label class="pick">Force time <select id="dbgNight"><option value="">Auto</option><option value="0">Day</option><option value="1">Night</option></select></label>
+  <label class="pick">Baked lamps <select id="dbgBake"><option value="">Auto</option><option value="1">On</option><option value="0">Off</option></select></label>
+  <label class="pick">Sun shadow <select id="dbgShadow"><option value="">Auto</option><option value="map">Shadow map</option><option value="bake">Baked</option></select></label>
+  <label><input type="checkbox" id="dbgHero" checked> Hero lights</label>
+  <div id="info"></div>
 </div>
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 
-// Voxel subdivision: each design unit is S×S×S small voxels. Override with ?res=1..4
+// Voxel subdivision: each design unit is S×S×S small voxels. Scenes are built at detail 3 only (no ?res)
 const Q = new URLSearchParams(location.search);
-const S = Math.max(1, Math.min(4, parseInt(Q.get('res')) || 2));
+const S = 3;
 const GRID = Q.get('grid') === '1';                      // ?grid=1 draws the full cube grid; by default the cube border is near-invisible
 const CAM = Q.get('cam') === 'persp' ? 'persp' : 'ortho'; // ?cam=persp: perspective hero view (modest FOV, 15–25° elevation); default orthographic
-const SHADOW_HI = Q.get('shadow') === 'hi';              // ?shadow=hi: 8192 shadow map for the real-time shadows while voxels move (default 4096)
-// Animation style (see the skill's reference/animation.md). Set the scene's defaults here; ?intro= ?order= ?motion= ?outro= ?sky= override.
-//   intro:  none | blueprint (see-through outline of the finished model first, then it fills in)
-//   order:  layers (bottom up, jittered) | scan (3D printer: strict layers, sweeping head) | stages (by STAGE tag)
+const SHADOW_MAP = { lo: 1024, hi: 4096 }[Q.get('shadow')] || 2048;   // ?shadow=lo|hi: 1024 / 4096 shadow map for the real-time shadows while voxels move (default 2048)
+const DPR_PIN = parseFloat(Q.get('dpr')) || 0;           // ?dpr=N pins the pixel ratio; by default it starts at min(devicePixelRatio, 2) and steps down when frames run slow
+// Animation style (see the skill's reference/animation.md). Set the scene's defaults here; ?order= ?motion= ?sky= override.
+//   order:  layers (bottom up, jittered) | stages (by STAGE tag)
 //   motion: drop | grow | swarm | tornado | slide | pop | tumble | squash | flash (see POSE)
-//   outro:  reset (hold, then restart) | demolish (collapse in reverse build order, rebuild) | pile (heap up, rebuild from the heap)
 //   sky:    day | night (dusk falls a few seconds after the build completes)
-const ANIM = { intro: 'none', order: 'layers', motion: 'drop', outro: 'reset', sky: 'day' };
+const ANIM = { order: 'layers', motion: 'drop', sky: 'day' };
 for (const k in ANIM) ANIM[k] = Q.get(k) || ANIM[k];
-if (!Q.has('motion') && ANIM.order === 'scan') ANIM.motion = 'grow';
 
 // =====================================================================================================
 // ENGINE: helpers (keep as is)
@@ -120,13 +147,23 @@ function disc(cx, cz, r0, r1, fy0, fy1, c, e) {        // ring/disc, design cent
       if (d >= r0 && d <= r1) for (let fy = fy0; fy <= fy1; fy++) fset(fx, fy, fz, col(c, fx, fy, fz), e);
     }
 }
-function blob(cx, cy, cz, r, pal, sy = 1, rough = 0.6, e = false) {   // noisy ellipsoid (leaves, bushes, smoke)
-  const R = r + 1;
+// smooth 3D value noise on a design-unit lattice (0..1)
+function vnoise3(x, y, z, s = 0) {
+  const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z), f = v => v * v * (3 - 2 * v);
+  const u = f(x - xi), v = f(y - yi), w = f(z - zi), h = (a, b, c) => hash(xi + a, (yi + b) * 7919 + zi + c, s);
+  const L = (a, b, k) => a + (b - a) * k;
+  return L(L(L(h(0, 0, 0), h(1, 0, 0), u), L(h(0, 1, 0), h(1, 1, 0), u), v), L(L(h(0, 0, 1), h(1, 0, 1), u), L(h(0, 1, 1), h(1, 1, 1), u), v), w);
+}
+// noisy ellipsoid (leaves, bushes, smoke). The edge wobbles by smooth noise in design units plus under one cell of
+// per-cell speckle: per-cell random noise of ±rough units punches holes a few cells deep at S = 3, and the hollowed
+// 2-cell skin falls apart (spruce and tree crowns lost by the ten thousand)
+function blob(cx, cy, cz, r, pal, sy = 1, rough = 0.6, e = false) {
+  const R = r + 1, s0 = Math.floor(rnd() * 1e6);
   for (let fx = Math.floor((cx - R) * S); fx <= Math.ceil((cx + R) * S); fx++)
     for (let fy = Math.floor((cy - R * sy) * S); fy <= Math.ceil((cy + R * sy) * S); fy++)
       for (let fz = Math.floor((cz - R) * S); fz <= Math.ceil((cz + R) * S); fz++) {
         const d = Math.hypot(dc(fx) - cx, (dc(fy) - cy) / sy, dc(fz) - cz);
-        if (d <= r + (rnd() - 0.5) * rough) fset(fx, fy, fz, typeof pal === 'function' ? pal(fx, fy, fz) : pick(pal), e);   // pal: array or fn(fx, fy, fz)
+        if (d <= r + (vnoise3(dc(fx) * 1.4, dc(fy) * 1.4, dc(fz) * 1.4, s0) - 0.5) * rough * 1.6 + (hash(fx, fy * 4099 + fz, s0) - 0.5) * Math.min(rough, 0.8) / S) fset(fx, fy, fz, typeof pal === 'function' ? pal(fx, fy, fz) : pick(pal), e);   // pal: array or fn(fx, fy, fz)
       }
 }
 // face-connected line between two design points (trunks, branches, poles): steps one axis at a time
@@ -248,6 +285,9 @@ TAG = 0;
 // built are dropped with a warning, so light never comes from an empty spot. hero: also a real PointLight.
 const LAMPS = [];
 const lamp = (src, fx, fy, fz, o = {}) => LAMPS.push({ src, fx, fy, fz, color: 0xffc070, power: 1.6, r: 3.5, ...o });
+// lit pane (win, fwin, rWin): a spot out and down through the glass (outward unit vector ox, oz) so the pool lands on the
+// sill and the ground; a full hemisphere also lit the eave above, brighter than the dim pane: light with no visible fixture
+const paneLamp = (src, fx, fy, fz, ox, oz) => lamp(src, fx, fy, fz, { color: 0xffb860, power: 1, r: 9, wrap: 0, dir: [ox * 0.894, -0.447, oz * 0.894], cone: 0.35 });
 
 // ---------- building parts ----------
 // window: frame + mullions on the wall plane, glass recessed one voxel, reveal, room two voxels behind,
@@ -286,7 +326,7 @@ function win(axis, l, dir, a0, a1, y0, y1, o = {}) {
   if (lit || o.door) {
     const src = axis === 'x' ? [A0 + 1, Y0 + 1, l - 3 * dir] : [l - 3 * dir, Y0 + 1, A0 + 1];
     const at = [ac, (Y0 + Y1) / 2, l + dir], [fx, fy, fz] = axis === 'x' ? at : [at[2], at[1], at[0]];
-    lamp(src, fx, fy, fz, { color: 0xffb860, power: 1, r: 9, wrap: 0, dir: axis === 'x' ? [0, 0, dir] : [dir, 0, 0], cone: 0 });
+    paneLamp(src, fx, fy, fz, axis === 'x' ? 0 : dir, axis === 'x' ? dir : 0);
   }
 }
 // wall lantern: bracket keeps it attached; the light sits in its glowing 2×2 glass
@@ -362,19 +402,41 @@ function tree(x, z, h, r, pal = P.leaf, o = {}) {
     CANOPY.push([tx + dx, tz + dz, rr]);
   }
 }
-// spruce/fir: straight trunk, whorled tiers narrowing to a spire. Each layer steps in by under a cell so the
+// spruce/fir: trunk, whorled tiers narrowing to a spire. Each layer steps in by under a cell so the
 // hollowed skin stays face-connected; the trunk goes in after the leaves or the hollowing cuts the crown loose.
 function spruce(x, z, h, r, pal = P.spruce) {
   const px = Math.round(x * S), pz = Math.round(z * S), b = topAt(px, pz) + 1, H = Math.round(h * S), cx = dc(px), cz = dc(pz), tag = TAG;
-  const dl = (rnd() - 0.5) * 0.06, own = pal.map(c => tmp.set(c).offsetHSL((rnd() - 0.5) * 0.02, 0, dl).getHex());
+  const dl = (rnd() - 0.5) * 0.06, dh = pal.map(() => (rnd() - 0.5) * 0.02), s0 = Math.floor(rnd() * 1e6);
+  // each spruce its own build, drawn from a hash so the rnd stream (and the forest layout) stays put: taper from
+  // dome-shouldered to needle spire, skirt mostly near the ground (a spruce on a bare pole reads as a lollipop),
+  // whorl spacing and depth, a drift off plumb, odd tiers jutting or tucked, and a tint from blue-grey fir to a
+  // yellower, lighter green
+  const v = k => hash(k, px * 31 + pz, s0);
+  const taper = 0.7 + v(1) * 0.8, skirt = 0.03 + v(2) ** 2 * 0.12, notch = 0.4 + v(4) * 1.2;
+  const W = Math.max(3, Math.round((1.8 + v(3) * 1.8) * S));
+  const ox = (v(5) - 0.5) * r * 0.5, oz = (v(6) - 0.5) * r * 0.5;
+  const hue = (v(7) - 0.5) * 0.07, lit = dl + (v(8) - 0.3) * 0.09, sat = (v(9) - 0.5) * 0.15;
+  const own = pal.map((c, i) => tmp.set(c).offsetHSL(dh[i] + hue, sat, lit).getHex());
   TAG = 6;
-  for (let fy = b + Math.round(H * 0.15); fy <= b + H; fy++) {
-    const t = (fy - b) / H, tier = ((fy - b) % 5) / 4;
-    const rr = r * Math.min(1, (1 - t) * 1.15) - 0.8 * tier + 0.6 + (rnd() - 0.5) * 0.3;
-    disc(cx, cz, 0, Math.max(0.3, rr), fy, fy, own);
+  let prev = Infinity;
+  for (let fy = b + Math.round(H * skirt); fy <= b + H; fy++) {
+    const t = (fy - b) / H, tier = ((fy - b) % W) / (W - 1), jut = (hash(Math.floor((fy - b) / W), s0, 11) - 0.5) * r * 0.3;
+    // neighbouring layers differ by under a fine cell outward and 1.5 inward: a wider step hollows away the cells
+    // that join the tiers and the crown above comes loose (thousands of voxels on r >= 5 trees)
+    const want = r * Math.min(1, Math.pow(1 - t, taper) * 1.15) + jut * (1 - t) - notch * tier + 0.6 + (hash(fy, px * 31 + pz, s0) - 0.5) * 0.3;
+    const rr = Math.max(prev === Infinity ? -1 : prev - 1.5 / S, Math.min(prev + 0.8 / S, want));
+    disc(cx + ox * t, cz + oz * t, 0, Math.max(0.3, rr), fy, fy, own);
+    prev = Math.max(0.3, rr);
   }
   TAG = tag;
-  for (let fy = b; fy < b + Math.round(H * 0.75); fy++) fset(px, fy, pz, pick(P.bark));
+  // the trunk follows the drift; where it steps sideways it also keeps the cell below's column, so it stays face-joined
+  let lx = px, lz = pz;
+  for (let fy = b; fy < b + Math.round(H * 0.75); fy++) {
+    const t = (fy - b) / H, tx = px + Math.round(ox * t * S), tz = pz + Math.round(oz * t * S);
+    fset(tx, fy, tz, pick(P.bark));
+    if (tx !== lx || tz !== lz) { fset(lx, fy, lz, pick(P.bark)); fset(tx, fy, lz, pick(P.bark)); }
+    lx = tx; lz = tz;
+  }
   CANOPY.push([cx, cz, r * 0.8]);
 }
 // cypress: a narrow, slightly wavering column
@@ -396,13 +458,13 @@ function shrub(x, z, r, pal = P.leaf) {
 // ---------- more light fixtures (all register their light at a glowing voxel) ----------
 // lamp post on the terrain, ~2.6 m: iron pole, one glowing cell, cap and finial
 function lampPost(x, z, o = {}) {
-  const fx = Math.round(x * S), fz = Math.round(z * S), b = topAt(fx, fz) + 1, H = cells(2.4);
+  const fx = Math.round(x * S), fz = Math.round(z * S), b = topAt(fx, fz) + 1, H = cells(2.0);   // + base, glow, finial = 2.6 m
   fset(fx, b, fz, P.iron);
   for (let y = b + 1; y < b + H; y++) fset(fx, y, fz, P.iron);
   fset(fx, b + H, fz, GLOW, true);
   fset(fx, b + H + 1, fz, P.black);
   fset(fx, b + H + 2, fz, P.black);                                            // finial
-  lamp([fx, b + H, fz], fx, b + H, fz, { power: 1.2, r: 9, ...o });            // r must reach the ground from 2.4 m up
+  lamp([fx, b + H, fz], fx, b + H, fz, { power: 1.5, r: 12, ...o });           // at r 9 the (1 - d/r)² falloff leaves ~10% on the ground
 }
 // one-cell wall lamp (use at S >= 3, where the 2×2 lantern() is 0.7 m of glass): iron cap and foot, touching the wall
 function wallLamp(axis, l, dir, a, y, o = {}) {
@@ -459,6 +521,180 @@ function roofU(rects) {
     const th = Math.ceil(best.slope) + 1, y0 = bd <= (best.over ?? 1) * S + 3 ? Math.min(bh - th + 1, best.E - 1) : bh - th + 1;
     for (let y = y0; y <= bh; y++) fset(fx, y, fz, y < bh - th + 1 ? P.roofCap : c);
     if (!cap && bd > 1 && hash(fx, fz, 15) < 0.02) fset(fx, bh + 1, fz, c);                                          // a lifted tile
+  }
+}
+// gabled / hipped roofs as one upper envelope (roofU with a ridge axis and per-end hips): rects { x0, x1, z0, z1 (design,
+// outer edge incl. overhang), eave (design y at the edge), slope, ridge 'x'|'z', hip [lo, hi] (hipped ends; a gable end
+// gets a dark bargeboard, o.verge), over (1) }. ROOFH keeps the top per fine column so dormers, chimneys and finials stand
+// on it (roofTop); o.above draws only cells above the roof already there (dormer roofs). Returns the rects for gable().
+const ROOFH = new Map(), rk = (fx, fz) => fx * 8192 + fz;
+const roofTop = (fx, fz) => ROOFH.get(rk(fx, fz)) ?? -OUT;
+function roofG(rects, o = {}) {
+  const R = rects.map(r => {
+    const X0 = r.x0 * S, X1 = r.x1 * S + S - 1, Z0 = r.z0 * S, Z1 = r.z1 * S + S - 1, along = r.ridge === 'x';
+    return { slope: 1, over: 1, hip: [false, false], ...r, X0, X1, Z0, Z1, along, E: r.eave * S, dMax: Math.floor((along ? Z1 - Z0 : X1 - X0) / 2) };
+  });
+  const verge = o.verge ?? P.black;
+  const bx0 = Math.min(...R.map(r => r.X0)), bx1 = Math.max(...R.map(r => r.X1)), bz0 = Math.min(...R.map(r => r.Z0)), bz1 = Math.max(...R.map(r => r.Z1));
+  for (let fx = bx0; fx <= bx1; fx++) for (let fz = bz0; fz <= bz1; fz++) {
+    let b = null, bh = -1e9;
+    for (const r of R) {
+      if (fx < r.X0 || fx > r.X1 || fz < r.Z0 || fz > r.Z1) continue;
+      const ac = r.along ? Math.min(fz - r.Z0, r.Z1 - fz) : Math.min(fx - r.X0, r.X1 - fx);
+      const lo = r.along ? fx - r.X0 : fz - r.Z0, hi = r.along ? r.X1 - fx : r.Z1 - fz;
+      let d = ac; if (r.hip[0]) d = Math.min(d, lo); if (r.hip[1]) d = Math.min(d, hi);
+      const h = r.E + Math.floor(d * r.slope);
+      if (h > bh) { bh = h; b = { r, ac, lo, hi, d }; }
+    }
+    if (!b || (o.above && bh <= roofTop(fx, fz))) continue;
+    const { r, ac, lo, hi, d } = b;
+    const ridge = ac >= r.dMax - 1, hipL = (r.hip[0] && Math.abs(lo - ac) < 1) || (r.hip[1] && Math.abs(hi - ac) < 1);
+    const edge = (!r.hip[0] && lo < 1) || (!r.hip[1] && hi < 1), plain = !edge && !ridge && !hipL;
+    let c = edge ? col(verge, fx, bh, fz) : ridge || hipL ? P.roofCap : P.roof[Math.floor(d / 2) % 3];
+    if (plain && hash(fx >> 1, fz, 16) < 0.07) c = P.roof[(Math.floor(d / 2) + 1 + (hash(fx, fz, 17) * 2 | 0)) % 3];   // replaced tiles
+    if (plain && hash(fx, fz >> 2, 18) < 0.02) c = 0x7d6e52;                                                            // lichen
+    const th = Math.ceil(r.slope) + 1, y0 = d <= r.over * S + 3 ? Math.min(bh - th + 1, r.E - 1) : bh - th + 1;
+    for (let y = y0; y <= bh; y++) fset(fx, y, fz, y < bh - th + 1 ? P.roofCap : c);
+    if (plain && d > 1 && hash(fx, fz, 15) < 0.02) fset(fx, bh + 1, fz, c);                                            // a lifted tile
+    ROOFH.set(rk(fx, fz), Math.max(roofTop(fx, fz), bh));
+  }
+  return R;
+}
+// gable wall under a roofG rect's gable end: plane l (fine; axis/dir as win()), along a0..a1, from fine row y0 up to the
+// roof's underside. cf(a, y) colours it (timberC for half-timbering).
+function gable(r, axis, l, dir, a0, a1, y0, cf = (a, y) => col(P.wall, a, y, l)) {
+  const th = Math.ceil(r.slope) + 1;
+  for (let a = a0; a <= a1; a++) {
+    const ac = axis === 'x' ? Math.min(a - r.X0, r.X1 - a) : Math.min(a - r.Z0, r.Z1 - a);
+    for (let y = y0; y <= r.E + Math.floor(ac * r.slope) - th + 1; y++) pset(axis, a, y, l, cf(a, y));
+  }
+}
+
+// ---------- half-timbering, arches, recesses ----------
+// timber frame colour at fine (a along the wall, y) for a storey whose sill plate is row y0 or, with o.gable, a gable
+// above y0. The pattern lives on a 0.2 m grid (cells at S = 2: h(v) = floor(v·2/S)) so beams keep their size at S = 3:
+// a storey of 16 rows (sill rail at 4, head rail at 13, top plate at 15) or gable rails every 7 rows, posts every
+// 6, a St Andrew's cross under the window line, a brace in about half the full panels. Windows fill one panel: fine
+// c(6k + 1)..c(6k + 6) - 1 between posts (c(n) = round(n·S/2)).
+const c2 = n => Math.round(n * S / 2), h2 = v => Math.floor(v * 2 / S);
+function timberC(a, y, y0, o = {}) {
+  a = h2(a); y = y0 + h2(y - y0);
+  const beam = o.beam ?? P.black, fill = o.fill ?? P.wall, pa = ((a % 6) + 6) % 6, k = Math.floor(a / 6), r = y - y0;
+  const B = () => col(beam, a, y >> 2, 0), F = () => col(fill, a >> 1, y >> 1, 0);
+  if (o.gable) {
+    const row = Math.floor(r / 7), rr = r % 7;
+    if (pa === 0 || rr === 0) return B();
+    if ((k + row) % 2 === 0 && Math.abs((k % 2 ? 6 - pa : pa) - rr * 5 / 6) < 0.55) return B();
+    return F();
+  }
+  if (pa === 0 || r === 0 || r === 4 || r === 13 || r === 15) return B();
+  if (r < 4) return pa === r || pa === 6 - r ? B() : F();
+  if (r > 4 && r < 13 && hash(k, y0, 38) < 0.5 && Math.abs((k % 2 ? 6 - pa : pa) - ((r - 5) / 7 * 4 + 1)) < 0.55) return B();
+  return F();
+}
+// window in fine cells (axis/l/dir as win()): frame + mullion on the wall plane, glass one cell in, reveal, closed room
+// three cells behind. o: arch, frame / reveal / sill colours, ring (brick + ochre voussoirs: [c1, c2]), mull (spacing; 0 =
+// centre mullion), transom row, lit, door (warm glass), plank (wooden door, no glass), grille (iron bars on a dark hole).
+function fwin(axis, l, dir, A0, A1, Y0, Y1, o = {}) {
+  const ac = (A0 + A1) / 2, R = (A1 - A0) / 2, FR = o.frame ?? P.trim, RV = o.reveal ?? 0xb8ac94;
+  const lit = !o.grille && !o.plank && (o.lit ?? hash(A0 * 3 + l, Y0, 9) > 0.86), curtain = hash(A0, Y0 + l, 10) > 0.35;
+  const yTop = o.arch ? Y1 + Math.ceil(R) : Y1, tr = o.transom ?? (o.arch ? Y1 : Y1 - 3);
+  for (let a = A0; a <= A1; a++) for (let y = Y0; y <= yTop; y++) {
+    let frame, edge;
+    if (y > Y1) {
+      const d = Math.hypot(a - ac, y - Y1);
+      if (d > R + 0.5) continue;
+      edge = d > R - 0.7; frame = edge || (!o.plank && Math.abs(a - ac) < 0.6);
+    } else {
+      edge = a === A0 || a === A1 || y === Y0 || (!o.arch && y === Y1);
+      frame = edge || (!o.plank && (o.mull ? (a - A0) % o.mull === 0 : Math.abs(a - ac) < 0.6)) || (!o.plank && !o.door && y === tr);
+    }
+    if (o.grille) { pset(axis, a, y, l, edge || (a - A0) % 2 === 0 ? P.iron : 0x1e1a18); if (!edge) pset(axis, a, y, l - dir, 0x1e1a18); continue; }
+    if (o.plank) { pset(axis, a, y, l, edge ? FR : (a - A0) % 2 ? 0x553c2c : 0x4a3426); continue; }
+    if (frame) pset(axis, a, y, l, FR);
+    if (edge) { for (let k = 1; k <= 3; k++) pset(axis, a, y, l - k * dir, RV); continue; }
+    if (!frame) { pdel(axis, a, y, l); pset(axis, a, y, l - dir, GLASS, 'glass'); }
+    const t = (y - Y0) / Math.max(1, yTop - Y0), drape = curtain && !o.door && (a - A0) % 5 < 2;
+    const c = lit || o.door ? (drape ? 0xf5e4c4 : tmp.set(0xf0b860).lerp(new THREE.Color(0xffe2a6), t).getHex())
+                            : (drape ? 0xbfb39a : tmp.set(0x2a231e).lerp(new THREE.Color(0x4a3f34), t * 0.6).getHex());
+    pset(axis, a, y, l - 3 * dir, c, lit || !!o.door);
+  }
+  if (!o.door && !o.plank) for (let a = A0 - 1; a <= A1 + 1; a++) { pset(axis, a, Y0 - 1, l, o.sill ?? FR); pset(axis, a, Y0 - 1, l + dir, o.sill ?? FR); }
+  if (o.ring) for (let a = A0 - 3; a <= A1 + 3; a++) for (let y = Y1; y <= yTop + 3; y++) {
+    const d = Math.hypot(a - ac, y - Y1);
+    if (d > R + 0.5 && d <= R + 2.1) pset(axis, a, y, l, o.ring[Math.floor(Math.atan2(y - Y1, a - ac) / Math.PI * (R + 2) * 1.1) % 2]);
+  }
+  if (lit || o.door) {
+    const src = axis === 'x' ? [A0 + 1, Y0 + 1, l - 3 * dir] : [l - 3 * dir, Y0 + 1, A0 + 1];
+    const at = [ac, (Y0 + Y1) / 2, l + dir], [fx, fy, fz] = axis === 'x' ? at : [at[2], at[1], at[0]];
+    paneLamp(src, fx, fy, fz, axis === 'x' ? 0 : dir, axis === 'x' ? dir : 0);
+  }
+}
+// round window with a cross (fine centre ac, yc, radius r): ring colour o.ring, frame o.frame, glass one cell in
+function oculus(axis, l, dir, ac, yc, r, o = {}) {
+  for (let a = Math.floor(ac - r - 2); a <= Math.ceil(ac + r + 2); a++) for (let y = Math.floor(yc - r - 2); y <= Math.ceil(yc + r + 2); y++) {
+    const d = Math.hypot(a - ac, y - yc);
+    if (d > r + 1.6) continue;
+    if (d > r) { pset(axis, a, y, l, col(o.ring ?? P.trim, a, y, l)); continue; }
+    if (d > r - 0.8 || Math.abs(a - ac) < 0.6 || Math.abs(y - yc) < 0.6) { pset(axis, a, y, l, o.frame ?? P.black); if (d > r - 0.8) pset(axis, a, y, l - dir, o.frame ?? P.black); continue; }
+    pdel(axis, a, y, l); pset(axis, a, y, l - dir, GLASS, 'glass'); pset(axis, a, y, l - 2 * dir, 0x2e2620);
+  }
+}
+// round arch through a thick wall (fine planes l0..l1): straight sides up to Y1, semicircular head, voussoirs alternating
+// ring[0] / ring[1] on both faces (arcades, loggias)
+function roundCut(axis, l0, l1, A0, A1, Y0, Y1, ring = [P.trim, P.trim]) {
+  const ac = (A0 + A1) / 2, R = (A1 - A0) / 2 + 0.5;
+  const inside = (a, y, m) => a >= A0 - m && a <= A1 + m && y >= Y0 && (y <= Y1 || Math.hypot(a - ac, y - Y1) <= R + m - 0.2);
+  for (let a = A0 - 3; a <= A1 + 3; a++) for (let y = Y0; y <= Y1 + R + 3; y++) for (let l = l0; l <= l1; l++) {
+    if (inside(a, y, 0)) pdel(axis, a, y, l);
+    else if ((l === l0 || l === l1) && y > Y1 && inside(a, y, 2)) pset(axis, a, y, l, ring[Math.floor(Math.atan2(y - Y1, a - ac) / Math.PI * 9) % 2]);
+  }
+}
+// loggia / balcony recess in a wall plane: opening A0..A1 × Y0..Y1 (+ round head with o.arch) cleared D cells deep, with a
+// back wall (o.back), floor (o.floor), ceiling and frame ring (o.frame), side walls and a railing of o.rail rows
+function recess(axis, l, dir, A0, A1, Y0, Y1, D, o = {}) {
+  const ac = (A0 + A1) / 2, R = (A1 - A0) / 2 + 0.5, yTop = o.arch ? Y1 + Math.ceil(R) : Y1;
+  const back = o.back ?? P.wall, frame = o.frame ?? P.black, floor = o.floor ?? P.wood;
+  const inside = (a, y, m = 0) => a >= A0 - m && a <= A1 + m && y >= Y0 - m && (y <= Y1 || (o.arch ? Math.hypot(a - ac, y - Y1) <= R + m - 0.2 : y <= Y1 + m));
+  for (let a = A0 - 1; a <= A1 + 1; a++) for (let y = Y0 - 1; y <= yTop + 1; y++) {
+    for (let k = 1; k <= D; k++) {
+      const L = l - k * dir, rim = a === A0 - 1 || a === A1 + 1 || y === Y0 - 1 || y === yTop + 1;
+      if (k === D || rim) pset(axis, a, y, L, col(y === Y0 - 1 ? floor : y === yTop + 1 ? frame : back, a, y, L));
+      else if (inside(a, y)) pdel(axis, a, y, L);
+    }
+    if (inside(a, y)) pdel(axis, a, y, l);
+    else if (inside(a, y, 1)) pset(axis, a, y, l, col(frame, a, y, l));
+  }
+  if (o.rail) for (let a = A0; a <= A1; a++) for (let y = Y0; y < Y0 + o.rail; y++)
+    if (y === Y0 + o.rail - 1 || (a - A0) % 2 === 0) pset(axis, a, y, l, col(o.railC ?? frame, a, y, l));
+}
+// iron railing along a fine line (axis 'x' runs along x at fixed z = l): handrail, balusters every 3 cells, a scroll cell
+// between some of them; h rows high from y0 (5 = 1 m at S = 2)
+function railing(axis, l, a0, a1, y0, h = 5) {
+  for (let a = a0; a <= a1; a++) {
+    pset(axis, a, y0 + h - 1, l, P.iron);
+    if ((a - a0) % 3 === 0 || a === a1) for (let y = y0; y < y0 + h - 1; y++) pset(axis, a, y, l, P.iron);
+    else if ((a - a0) % 3 === 1 && (a >> 1) % 2) pset(axis, a, y0 + 1, l, P.iron);
+  }
+}
+// straight stair from a floor whose top cell is fine row yTop down to the ground (TOP - 1): steps one cell high, two deep,
+// running along `axis` from plane l0 in direction dir, a0..a1 across; treads o.tread, cheeks o.cheek one cell higher,
+// iron posts and a sloping handrail on the cheeks (o.rail false: none)
+function stair(axis, dir, l0, a0, a1, yTop, o = {}) {
+  const n = yTop - (TOP - 1), tread = o.tread ?? P.under, cheek = o.cheek ?? P.under;
+  const f = (l, y, a) => axis === 'x' ? [l, y, a] : [a, y, l];
+  for (let k = 0; k < n; k++) for (let j = 0; j < 2; j++) {
+    const l = l0 + (2 * k + j) * dir, ty = yTop - k - 1;
+    for (let a = a0 - 1; a <= a1 + 1; a++) {
+      const ch = a === a0 - 1 || a === a1 + 1, h = ch ? ty + 1 : ty;
+      for (let y = TOP; y <= h; y++) fset(...f(l, y, a), col(ch ? cheek : tread, ...f(l, y, a)));
+    }
+  }
+  if (o.rail !== false) for (const a of [a0 - 1, a1 + 1]) {
+    const rh = cells(1), every = Math.max(2, c2(2));                              // 1 m rail, a post every ~0.8 m of run
+    for (let k = 0; k < n; k += every) { const l = l0 + 2 * k * dir, ty = yTop - k - 1; for (let y = ty + 2; y <= ty + 1 + rh; y++) fset(...f(l, y, a), P.iron); }
+    for (let y = TOP; y <= TOP + rh; y++) fset(...f(l0 + (2 * n - 2) * dir, y, a), P.iron);       // newel at the foot: the handrail ends on a post
+    fline(...f(l0, yTop + rh, a), ...f(l0 + (2 * n - 2) * dir, TOP + rh, a), P.iron);
   }
 }
 
@@ -538,7 +774,7 @@ function rWin(T, th, y0, y1, w, o = {}) {
   }
   if (src) {
     const ox = Math.cos(th), oz = Math.sin(th);
-    lamp(src, (T.c[0] + ox * (T.R + 0.5)) * S, (Y0 + Y1) / 2, (T.c[1] + oz * (T.R + 0.5)) * S, { color: 0xffb860, power: 1, r: 9, wrap: 0, dir: [ox, 0, oz], cone: 0 });
+    paneLamp(src, (T.c[0] + ox * (T.R + 0.5)) * S, (Y0 + Y1) / 2, (T.c[1] + oz * (T.R + 0.5)) * S, ox, oz);
   }
 }
 // arrow slit in a round tower: outer cells removed, the next layer dark (fine y range)
@@ -655,7 +891,7 @@ function trussX(x0, x1, z0, z1, yt, yb0, yb1, c) {
 }
 
 // ---------- sprites: detailed props authored in fine cells ----------
-// Author at SPRITE_S (cells of M_PER_UNIT / SPRITE_S metres); q() rescales to the current ?res. q(0) must be 0 —
+// Author at SPRITE_S (cells of M_PER_UNIT / SPRITE_S metres); q() rescales to S. q(0) must be 0 —
 // with Math.max(1, …) rows 0 and 1 both map to cell 1 and every sprite floats a cell up.
 // s = sprite(ox, oy, oz, rot): local x = width, y = up, z = length (front = +z); rot turns it in 90° steps about y.
 // s(x, y, z, c, e) puts a cell, s.box(…) a box, s.w(x, y, z) gives design coordinates (for limb), s.f(…) fine (for lamp).
@@ -753,31 +989,42 @@ const SCRUFF = { weeds: 0.45, litter: 0.4 };
   console.info(`connectivity: removed ${removed} floating voxels`);
 }
 // only lamps whose fixture still glows emit light
-const bakedLights = LAMPS.filter(l => V.get(key(...l.src))?.e === true);
-if (bakedLights.length < LAMPS.length) console.warn(`lamps without a glowing source voxel dropped: ${LAMPS.length - bakedLights.length} at`, LAMPS.filter(l => !bakedLights.includes(l)).map(l => `[${l.src}] ${V.get(key(...l.src))?.p ?? '-'}`).join(' '));
+const glowing = LAMPS.filter(l => V.get(key(...l.src))?.e === true);
+if (glowing.length < LAMPS.length) console.warn(`lamps without a glowing source voxel dropped: ${LAMPS.length - glowing.length} at`, LAMPS.filter(l => !glowing.includes(l)).map(l => `[${l.src}] ${V.get(key(...l.src))?.p ?? '-'}`).join(' '));
+// a lamp shines from its light point (fx, fy, fz), usually just outside its fixture (a window lamp sits in front of the
+// pane). If later geometry covers that point (a roof or dormer over a lit window, a tree crown in front of it), the
+// light would come from nowhere: keep a lamp only if a few steps through empty cells lead from its point to glass or glow
+const reachesFixture = l => {
+  const s = [Math.round(l.fx), Math.round(l.fy), Math.round(l.fz)], seen = new Set([key(...s)]);
+  let front = [s];
+  for (let step = 0; step <= 4 && front.length; step++) {
+    const next = [];
+    for (const [x, y, z] of front) {
+      const v = V.get(key(x, y, z));
+      if (v && (v.e === true || v.e === 'glass')) return true;
+      if (v) continue;                                                   // opaque: the light is walled off here
+      for (const [a, b, c] of [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]) {
+        const k = key(x + a, y + b, z + c);
+        if (!seen.has(k)) { seen.add(k); next.push([x + a, y + b, z + c]); }
+      }
+    }
+    front = next;
+  }
+  return false;
+};
+const bakedLights = glowing.filter(reachesFixture);
+if (bakedLights.length < glowing.length) console.warn(`lamps whose light point is covered (light with no visible fixture) dropped: ${glowing.length - bakedLights.length} at`, glowing.filter(l => !bakedLights.includes(l)).map(l => `[${l.src}] → [${[l.fx, l.fy, l.fz].map(Math.round)}] ${V.get(key(...[l.fx, l.fy, l.fz].map(Math.round)))?.p ?? '-'}`).join(' '));
 
 const vox = [...V.values()];
 const LAYER = 0.28 / S;            // seconds per fine layer
-const SCAN = LAYER * 1.2;          // seconds per layer when printing (no jitter, so a little slower)
 const DURS = { drop: 0.55, grow: 0.45, swarm: 1.6, tornado: 1.8, slide: 0.7, pop: 0.6, tumble: 0.9, squash: 0.75, flash: 0.9 };   // motion duration per voxel
-let minY = 1e9, maxY = -1e9, minX = 1e9, maxX = -1e9, minZ = 1e9, maxZ = -1e9;
-for (const v of vox) {
-  minY = Math.min(minY, v.y); maxY = Math.max(maxY, v.y); minX = Math.min(minX, v.x); maxX = Math.max(maxX, v.x);
-  minZ = Math.min(minZ, v.z); maxZ = Math.max(maxZ, v.z);
-}
+const minY = vox.reduce((m, v) => Math.min(m, v.y), 1e9);
 const layerT = (v, y0) => (v.y - y0) * LAYER + (hash(v.x, v.z, v.y) * 0.6 + Math.hypot(v.x - CX * S, v.z - CZ * S) / (2 * CX * S * 0.75) * 0.4) * 0.28 * 2.2;
 const COUNT = vox.length;
 let DUR, BUILD_END;
 // (re)compute start times for ANIM.order and re-sort; called again when the UI changes the order or motion
 function plan() {
-  if (ANIM.order === 'scan') {
-    // head rasters each layer in rows along z, alternating direction like a printer nozzle
-    const nx = maxX - minX + 1, nz = maxZ - minZ + 1;
-    for (const v of vox) {
-      const row = v.z - minZ, along = row % 2 ? maxX - v.x : v.x - minX;
-      v.t0 = (v.y - minY) * SCAN + (row + along / nx) / nz * SCAN * 0.9;
-    }
-  } else if (ANIM.order === 'stages') {
+  if (ANIM.order === 'stages') {
     // each stage builds bottom-up from its own lowest voxel; the next starts when this one is ~80% done
     const groups = new Map();
     for (const v of vox) (groups.get(v.st) || groups.set(v.st, []).get(v.st)).push(v);
@@ -794,13 +1041,15 @@ function plan() {
   BUILD_END = vox[COUNT - 1].t0 + DUR;
 }
 plan();
-document.getElementById('info').textContent = `${COUNT.toLocaleString()} voxels · F skip · D demolish · P pile · H hides UI · drag to orbit`;
+document.getElementById('info').textContent = `${COUNT.toLocaleString()} voxels · F skip · D demolish · P pile · H hides menu · Esc closes it · drag to orbit`;
 
 const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+let dpr = DPR_PIN || Math.min(devicePixelRatio, 2);
+renderer.setPixelRatio(dpr);
 renderer.setSize(innerWidth, innerHeight);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.shadowMap.autoUpdate = false;   // the shadow pass only runs on frames where voxels moved (see `moved`); the sun never moves
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 0.95;
 document.body.appendChild(renderer.domElement);
@@ -831,9 +1080,10 @@ const cam = CAM === 'persp' ? new THREE.PerspectiveCamera(FOV, 1, 0.1, 1000) : n
 const controls = new OrbitControls(cam, renderer.domElement);
 controls.target.set(0, 4, 0);
 controls.enableDamping = true;
-let userMoved = false;
-controls.addEventListener('start', () => { userMoved = true; });
+// Orbit checkbox = auto-orbit on/off. A drag unticks it (the user took the camera); ticking it again orbits on from
+// wherever the camera is now, keeping the user's zoom, tilt and target (see orbitStep).
 const orbitBox = document.getElementById('orbit');
+controls.addEventListener('start', () => { orbitBox.checked = false; });
 const ORBIT_EL = 0.36;             // camera elevation (~21°); a hero view wants 15–25°
 const ORBIT_R = CAM === 'persp' ? VIEW / Math.tan(FOV / 2 * Math.PI / 180) : 140;   // perspective: distance that frames VIEW at the target
 function placeCamera(az) {
@@ -841,6 +1091,12 @@ function placeCamera(az) {
 }
 let camAz = 0.3;                   // 0 = looking at the +z (front) side
 placeCamera(camAz);
+const camOff = new THREE.Vector3(), UP = new THREE.Vector3(0, 1, 0);
+function orbitStep(da) {           // turn the camera about the vertical axis through the target
+  camOff.subVectors(cam.position, controls.target).applyAxisAngle(UP, da);
+  cam.position.copy(controls.target).add(camOff);
+  camAz = Math.atan2(camOff.x, camOff.z);
+}
 function resize() {
   const a = innerWidth / innerHeight;
   if (cam.isPerspectiveCamera) { cam.aspect = a; cam.zoom = Math.min(1, a); }
@@ -860,7 +1116,7 @@ sun.position.set(-50, 70, 40);
 // The shadow map is only for voxels in motion: once the build settles, bake() has written per-face sun shadows and
 // setLights() cross-fades to them and turns the map off (no sawtooth from projective aliasing, no shadow pass per frame).
 sun.castShadow = true;
-sun.shadow.mapSize.set(SHADOW_HI ? 8192 : 4096, SHADOW_HI ? 8192 : 4096);
+sun.shadow.mapSize.set(SHADOW_MAP, SHADOW_MAP);
 scene.add(sun);
 // Fit the shadow camera to the voxel bounds (fine cells; fitShadowCamera is called by bake()): the bounds' corners go
 // into light space and the frustum wraps them with a small margin, so every texel is spent on the scene. The depth
@@ -1008,9 +1264,10 @@ function bake() {
   const NY = y1 - y0 + 1, NZ = z1 - z0 + 1, occ = new Uint8Array((x1 - x0 + 1) * NY * NZ);
   const gi = (x, y, z) => ((x - x0) * NY + (y - y0)) * NZ + (z - z0);
   const inB = (x, y, z) => x >= x0 && x <= x1 && y >= y0 && y <= y1 && z >= z0 && z <= z1;
-  const solid = (x, y, z) => inB(x, y, z) && occ[gi(x, y, z)] > 0;
-  const blocks = (x, y, z) => inB(x, y, z) && occ[gi(x, y, z)] === 1;   // glowing fixtures don't shadow their own light
-  for (const v of vox) if (v.m !== 2) occ[gi(v.x, v.y, v.z)] = v.m === 1 ? 2 : 1;
+  // occ: 1 opaque, 2 glow, 3 glass. AO and the sun see through glass; lamp light doesn't (see the lamp loop)
+  const solid = (x, y, z) => inB(x, y, z) && (occ[gi(x, y, z)] === 1 || occ[gi(x, y, z)] === 2);
+  const blocks = (x, y, z) => inB(x, y, z) && (occ[gi(x, y, z)] & 1) === 1;   // opaque and glass; glowing fixtures don't shadow their own light
+  for (const v of vox) occ[gi(v.x, v.y, v.z)] = v.m === 2 ? 3 : v.m === 1 ? 2 : 1;
   const N = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
   const RAYS = N.map(n => {
     const ax = n.findIndex(c => c !== 0), [ta, tb] = [0, 1, 2].filter(i => i !== ax), out = [];
@@ -1081,8 +1338,14 @@ function bake() {
       if (l.shadow !== false) {                                   // march from just off the lit face to the lamp
         const px = v.x + nb[0], py = v.y + nb[1], pz = v.z + nb[2], ex = l.x - px, ey = l.y - py, ez = l.z - pz, D = Math.hypot(ex, ey, ez);
         let hit = false;
-        // stop 2.5 cells short: those are the lamp's own fixture (caps, bracket), which must not shadow it
-        for (let s = 0; s < D - 2.5; s++) if (blocks(Math.round(px + ex / D * s), Math.round(py + ey / D * s), Math.round(pz + ez / D * s))) { hit = true; break; }
+        // every solid or glass cell on the way blocks, up to the lamp itself, except the fixture's own parts (caps,
+        // bracket: within one cell of its glowing src). Baked light is per voxel, not per face: light reaching the inside
+        // of a one-cell wall, roof or floor (through a skipped last stretch of the ray, or in through a pane) shows on
+        // its outside too, as a lit patch with no fixture — so rays neither stop short nor pass glass.
+        for (let s = 0; s < D; s += 0.5) {
+          const cx = Math.round(px + ex / D * s), cy = Math.round(py + ey / D * s), cz = Math.round(pz + ez / D * s);
+          if (blocks(cx, cy, cz) && Math.max(Math.abs(cx - l.src[0]), Math.abs(cy - l.src[1]), Math.abs(cz - l.src[2])) > 1) { hit = true; break; }
+        }
         if (hit) continue;
       }
       lr += l.col.r * k; lg += l.col.g * k; lb += l.col.b * k;
@@ -1126,6 +1389,24 @@ meshes.forEach(m => group.add(m));
 scene.add(group);
 
 const MA = meshes.map(m => m.instanceMatrix.array);
+// GPU uploads and draw counts. vox is in build order and v.i follows it, so the voxels started so far are a prefix of
+// each mesh: mesh.count draws only that prefix (unplaced voxels cost nothing, also in the shadow pass), and step()
+// uploads only the instances it touched. A full rewrite (reset, demolish, pile) uploads everything and must not be narrowed
+// by a range step() adds before the next render, hence `full`. `moved` asks the loop for a shadow pass and a frame.
+let moved = true;
+const full = [false, false, false];
+function uploadAll(count) {
+  meshes.forEach((m, k) => { m.instanceMatrix.clearUpdateRanges(); m.instanceMatrix.needsUpdate = true; full[k] = true; if (count !== undefined) m.count = count < 0 ? counts[k] : count; });
+  moved = true;
+}
+function uploadRange(k, lo, hi) {          // instances lo..hi of mesh k; ranges pending from frames not yet rendered are merged
+  const a = meshes[k].instanceMatrix, r = a.updateRanges[0];
+  a.needsUpdate = true; moved = true;
+  if (full[k]) return;
+  if (!r) return a.addUpdateRange(lo * 16, (hi - lo + 1) * 16);
+  const end = Math.max(r.start + r.count, (hi + 1) * 16);
+  r.start = Math.min(r.start, lo * 16); r.count = end - r.start;
+}
 function setM(v, x, y, z, s, sy = s, sz = s) {   // scale + position; clears any rotation left by setR
   const M = MA[v.m], o = v.i * 16;
   M[o] = s; M[o + 5] = sy; M[o + 10] = sz;
@@ -1224,43 +1505,16 @@ const POSE = {
 POSE.flash.done = v => tint(v, 0);  // runs when a voxel settles
 let pose = POSE[ANIM.motion] || POSE.drop;
 
-// 3D-printer head for order=scan: a glowing plate riding on the layer being printed
-const head = new THREE.Mesh(new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2),
-  new THREE.MeshBasicMaterial({ color: 0xff8a2a, transparent: true, opacity: 0.16, depthWrite: false, side: THREE.DoubleSide }));
-head.scale.set(maxX - minX + 8, 1, maxZ - minZ + 8);
-head.position.set((minX + maxX) / 2, 0, (minZ + maxZ) / 2);
-head.renderOrder = 2;
-head.visible = false;
-group.add(head);
-
-// blueprint intro: an outline of every exposed voxel above the ground, shown for BLUEPRINT s before the build.
-// Slightly smaller than a voxel, so when the real ones land they hide it.
-const BLUEPRINT = 2.5;
-const ghost = (() => {
-  const c = document.createElement('canvas'); c.width = c.height = 32;
-  const x = c.getContext('2d');
-  x.fillStyle = 'rgba(40,120,230,0.10)'; x.fillRect(0, 0, 32, 32);
-  x.strokeStyle = 'rgba(30,105,220,0.9)'; x.lineWidth = 2.5; x.strokeRect(1.25, 1.25, 29.5, 29.5);
-  const map = new THREE.CanvasTexture(c); map.colorSpace = THREE.SRGBColorSpace;
-  const cells = vox.filter(v => v.y > topAt(v.x, v.z) && [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]].some(([a, b, d]) => !V.has(key(v.x + a, v.y + b, v.z + d))));
-  // depthWrite on + drawn last: only the nearest outline shows (with it off, hundreds of faces stacked into a milky blob)
-  const mesh = new THREE.InstancedMesh(geo, new THREE.MeshBasicMaterial({ map, transparent: true, opacity: 0 }), Math.max(1, cells.length));
-  const m4 = new THREE.Matrix4();
-  cells.forEach((v, i) => mesh.setMatrixAt(i, m4.makeScale(0.96, 0.96, 0.96).setPosition(v.x, v.y, v.z)));
-  mesh.count = cells.length; mesh.frustumCulled = false; mesh.renderOrder = 3; mesh.visible = false;
-  group.add(mesh);
-  return mesh;
-})();
-
 let t = 0, first = 0, paused = false, doneAt = -1, demoAt = -1, pileAt = -1;
 function reset() {
   for (const v of vox) setM(v, 0, -9999, 0, 0);
-  meshes.forEach(m => { m.instanceMatrix.needsUpdate = true; });
-  t = ANIM.intro === 'blueprint' ? -BLUEPRINT : 0; first = 0; doneAt = -1; demoAt = -1; pileAt = -1;
+  uploadAll(0);
+  t = 0; first = 0; doneAt = -1; demoAt = -1; pileAt = -1;
 }
 reset();
 function step() {
   let i = first;
+  const lo = [-1, -1, -1], hi = [-1, -1, -1];   // instances touched per mesh
   while (i < COUNT && vox[i].t0 <= t) {
     const v = vox[i];
     const p = (t - v.t0) / DUR;
@@ -1269,12 +1523,19 @@ function step() {
       if (pose.done) pose.done(v);
       if (i === first) first++;
     } else pose(v, p);
+    if (lo[v.m] < 0) lo[v.m] = v.i;
+    hi[v.m] = v.i;
     i++;
   }
-  meshes.forEach(m => { m.instanceMatrix.needsUpdate = true; if (pose.done && m.instanceColor) m.instanceColor.needsUpdate = true; });
+  meshes.forEach((m, k) => {
+    if (hi[k] < 0) return;
+    m.count = Math.max(m.count, hi[k] + 1);
+    uploadRange(k, lo[k], hi[k]);
+    if (pose.done && m.instanceColor) m.instanceColor.needsUpdate = true;
+  });
 }
 
-// demolish outro: the scene comes apart in reverse build order, pieces thrown outward under gravity, then the build replays
+// demolish (D): the scene comes apart in reverse build order, pieces thrown outward under gravity, then the build replays
 const DEMO = { span: 4.5, fall: 1.5, g: 45 * S };
 let REL, VX, VY, VZ;
 function startDemolish() {
@@ -1287,6 +1548,7 @@ function startDemolish() {
     }
   }
   for (const v of vox) setM(v, v.x, v.y, v.z, 1);   // also when triggered mid-build
+  uploadAll(-1);
   first = COUNT; if (doneAt < 0) doneAt = t;
   demoAt = t;
 }
@@ -1301,10 +1563,10 @@ function demolish(d) {               // returns false when everything has fallen
     const s = 1 - Math.max(0, (r - DEMO.fall * 0.5) / (DEMO.fall * 0.5));
     setM(v, v.x + VX[i] * r, v.y + VY[i] * r - 0.5 * DEMO.g * r * r, v.z + VZ[i] * r, s);
   }
-  meshes.forEach(m => { m.instanceMatrix.needsUpdate = true; });
+  uploadAll();
   return live;
 }
-// pile outro: everything above the ground flies onto a heap where the building stood (last built lands first, at
+// pile (P): everything above the ground flies onto a heap where the building stood (last built lands first, at
 // the bottom), holds, then flies back in build order, so the heap unstacks from the top. The same pairing of
 // voxels to slots would morph into another scene if that scene's voxels were the targets.
 const PILE = { fall: 3, hold: 1.2, rise: 4, fly: 1 };
@@ -1327,6 +1589,7 @@ function startPile() {
     for (const [x, z] of ring) { if (n >= N) break; SX[n] = cx + x; SY[n] = topAt(cx + x, cz + z) + 1 + y; SZ[n] = cz + z; n++; }
   }
   for (const v of vox) setM(v, v.x, v.y, v.z, 1);      // also when triggered mid-build
+  uploadAll(-1);
   first = COUNT; if (doneAt < 0) doneAt = t;
   pileAt = t;
 }
@@ -1342,7 +1605,7 @@ function pile(d) {                  // returns false when the heap has rebuilt t
     const e = easeInOutCubic(a), arc = Math.sin(Math.PI * e) * (4 * S + Math.hypot(tx - fx, tz - fz) * 0.35);
     setM(v, fx + (tx - fx) * e, fy + (ty - fy) * e + arc, fz + (tz - fz) * e, 1);
   }
-  meshes.forEach(m => { m.instanceMatrix.needsUpdate = true; });
+  uploadAll();
   return true;
 }
 // sky=night: dusk falls a couple of seconds after the build; glow and hero lights are pushed past 1 to stay bright
@@ -1351,9 +1614,11 @@ let night = 0, nightForce = null;
 function setSky(dt) {
   const want = ANIM.sky === 'night' && doneAt >= 0 && demoAt < 0 && pileAt < 0 && t - doneAt > 2 ? 1 : 0;
   night += (want - night) * Math.min(1, dt * 0.45);
+  if (Math.abs(want - night) < 0.002) night = want;            // settle exactly, so a still scene can stop rendering
   if (nightForce !== null) night = nightForce;
-  nightDiv.style.opacity = night.toFixed(3);
-  document.body.classList.toggle('dark', night > 0.5);
+  const op = night.toFixed(3);
+  if (nightDiv.style.opacity !== op) nightDiv.style.opacity = op;   // DOM writes only on change: each one restyles the page
+  if (document.body.classList.contains('dark') !== night > 0.5) document.body.classList.toggle('dark', night > 0.5);
   hemi.intensity = LIGHT.hemi * (1 - 0.72 * night);
   hemi.color.copy(DAY_HEMI).lerp(NIGHT_HEMI, night);
   sun.intensity = LIGHT.sun * (1 - 0.88 * night);
@@ -1377,33 +1642,32 @@ function setLights(k, settled, dt) {   // dim while building, full when complete
 }
 
 const bar = document.querySelector('#bar i');
-const loopBox = document.getElementById('loop');
 document.getElementById('replay').onclick = reset;
 const pauseBtn = document.getElementById('pause');
 const togglePause = () => { paused = !paused; pauseBtn.textContent = paused ? 'Play (Space)' : 'Pause (Space)'; };
 pauseBtn.onclick = togglePause;
+const menuBtn = document.getElementById('menu'), uiBox = document.getElementById('ui');
+const toggleMenu = open => { open = uiBox.classList.toggle('open', open); menuBtn.setAttribute('aria-expanded', open); };
+menuBtn.onclick = () => { toggleMenu(); menuBtn.blur(); };   // blur: Space must keep pausing, not re-press the burger
 addEventListener('keydown', e => {
+  if (e.code === 'Escape') return toggleMenu(false);
+  if (e.target.tagName === 'SELECT') return;                    // arrow/letter keys pick options there
   if (e.code === 'KeyR') reset();
   else if (e.code === 'KeyF') t = BUILD_END;
   else if (e.code === 'KeyD' && demoAt < 0 && pileAt < 0) startDemolish();
   else if (e.code === 'KeyP' && demoAt < 0 && pileAt < 0) startPile();
   else if (e.code === 'Space') { e.preventDefault(); togglePause(); }
-  else if (e.code === 'KeyH') document.getElementById('ui').classList.toggle('hidden');
+  else if (e.code === 'KeyH') document.body.classList.toggle('hud-hidden');   // burger + menu; fps stays
 });
-// detail (voxel subdivision) changes the whole grid, so it reloads the page with ?res=
-const resSel = document.getElementById('res');
-resSel.value = S;
-resSel.onchange = () => { Q.set('res', resSel.value); location.search = '?' + Q; };
 // animation mode pickers: replan + replay on change, and keep the URL in sync so the combination can be shared
 for (const k in ANIM) {
   const sel = document.getElementById(k);
   sel.value = ANIM[k];
+  if (!sel.value) { sel.selectedIndex = 0; ANIM[k] = sel.value; }   // unknown value from an old link: first option
   sel.onchange = () => {
     ANIM[k] = sel.value;
-    if (k === 'order' && sel.value === 'scan') ANIM.motion = document.getElementById('motion').value = 'grow';
     sel.blur();                        // keep Space/R/F going to the page, not the select
     if (k === 'order' || k === 'motion') { plan(); pose = POSE[ANIM.motion]; REL = null; restoreColours(); reset(); }
-    else if (k === 'intro') reset();
     for (const j in ANIM) Q.set(j, ANIM[j]);
     history.replaceState(null, '', '?' + Q);
   };
@@ -1411,6 +1675,7 @@ for (const k in ANIM) {
 window.__seeAz = az => { camAz = az; placeCamera(az); };   // frame any side when testing
 window.__zoom = (z, x = 0, y = 4, zz = 0) => { cam.zoom = z; cam.updateProjectionMatrix(); controls.target.set(x, y, zz); };   // close-ups (world units)
 window.__lamps = bakedLights;                                    // the lamps that made it into the bake
+window.__lampsDropped = LAMPS.filter(l => !bakedLights.includes(l));   // dropped: no glowing src, or light point covered
 // per-prop report for the inspectors: measured size in metres vs the declared real size, lamps, glow voxels
 {
   const R = {}, cell = M_PER_UNIT / S;
@@ -1444,7 +1709,7 @@ window.__lamps = bakedLights;                                    // the lamps th
 window.__seeProp = (name, az = camAz, pad = 1.8) => {
   const r = window.__props[name];
   if (!r) return `no prop ${name}`;
-  orbitBox.checked = false; userMoved = false;
+  orbitBox.checked = false;
   __seeAz(az);
   __zoom(VIEW / (Math.max(...r.m) / M_PER_UNIT / 2 * pad + 1), ...r.centre);
   return r;
@@ -1484,32 +1749,87 @@ window.__compare = (src, opacity = 0.5) => new Promise((resolve, reject) => {
 window.__bake = on => { bakeForce = on === undefined ? null : on ? 1 : 0; };   // force baked lamps on/off for comparison (no arg: auto)
 window.__shadow = m => { shadowForce = m === 'map' ? 0 : m === 'bake' ? 1 : null; return { k: shadowK, castShadow: sun.castShadow }; };   // force the sun's shadow source: 'map', 'bake', or auto (no arg); returns the current state
 
+// menu: render settings live in the URL and apply on reload (they rebuild the scene); empty value = the default
+for (const el of document.querySelectorAll('[data-q]')) {
+  const k = el.dataset.q, cur = Q.get(k) || '';
+  if (el.type === 'checkbox') el.checked = cur === el.value;
+  else { el.value = cur; if (el.value !== cur) el.value = ''; }
+  el.onchange = () => {
+    const v = el.type === 'checkbox' ? (el.checked ? el.value : '') : el.value;
+    if (v) Q.set(k, v); else Q.delete(k);
+    location.search = '?' + Q;
+  };
+}
+// menu: debug overrides, live and not kept in the URL (same as the __night / __bake / __shadow / __hero hooks)
+const dbg = id => document.getElementById(id);
+dbg('dbgNight').onchange = e => { __night(e.target.value === '' ? undefined : +e.target.value); e.target.blur(); };
+dbg('dbgBake').onchange = e => { __bake(e.target.value === '' ? undefined : e.target.value === '1'); e.target.blur(); };
+dbg('dbgShadow').onchange = e => { __shadow(e.target.value || undefined); e.target.blur(); };
+dbg('dbgHero').onchange = e => __hero(e.target.checked);
+
+// Adaptive resolution: when rendered frames average under ~45 fps over a second, step the pixel ratio down (2 -> 1.5 -> 1).
+// It never steps back up (that would oscillate); the first 3 s (shader compiles) and 2 s after each step are not judged.
+let perfN = 0, perfT = 0, perfFrom = 3;
+function adaptDpr(dt) {
+  if (DPR_PIN || dpr <= 1 || clock.elapsedTime < perfFrom) return;
+  perfN++; perfT += dt;
+  if (perfT < 1) return;
+  if (perfT / perfN > 1 / 45) {
+    dpr = Math.max(1, dpr - 0.5); renderer.setPixelRatio(dpr); resize();
+    perfFrom = clock.elapsedTime + 2;
+    console.info(`frames slow: pixel ratio ${dpr} (?dpr=N pins it)`);
+  }
+  perfN = perfT = 0;
+}
+// Idle skip: a frame is drawn only when something visible changed: voxels moved (`moved`), the camera, or anything
+// the sky and lights fade. A settled scene with orbit off and no input costs nothing per frame.
+const SIG = new Float64Array(13);
+function changed() {
+  const s = [cam.position.x, cam.position.y, cam.position.z, cam.quaternion.x, cam.quaternion.y, cam.quaternion.z, cam.quaternion.w,
+    cam.projectionMatrix.elements[0], night, shadowK, lampK.value, glowMat.color.r, warmLights.filter(l => l.visible).length];
+  let d = false;
+  for (let k = 0; k < s.length; k++) if (SIG[k] !== s[k]) { SIG[k] = s[k]; d = true; }
+  return d;
+}
+addEventListener('resize', () => { moved = true; });
+
+// fps readout: frames actually drawn per second (idle-skipped frames don't count), refreshed twice a second
+const fpsEl = document.getElementById('fps');
+let fpsN = 0, fpsFrom = 0;
+function countFps(drawn) {
+  if (drawn) fpsN++;
+  const s = clock.elapsedTime - fpsFrom;
+  if (s < 0.5) return;
+  fpsEl.textContent = fpsN ? `${Math.round(fpsN / s)} fps · ${dpr}x` : 'idle';
+  fpsN = 0; fpsFrom = clock.elapsedTime;
+}
+
 const clock = new THREE.Clock();
+let barW = '';
 renderer.setAnimationLoop(() => {
   const dt = Math.min(clock.getDelta(), 0.1);
   if (!paused) {
     t += dt;
     if (demoAt >= 0) { if (!demolish(t - demoAt)) reset(); }
-    else if (pileAt >= 0) { if (!pile(t - pileAt)) { for (const v of vox) setM(v, v.x, v.y, v.z, 1); meshes.forEach(m => { m.instanceMatrix.needsUpdate = true; }); pileAt = -1; doneAt = t; } }
+    else if (pileAt >= 0) { if (!pile(t - pileAt)) { for (const v of vox) setM(v, v.x, v.y, v.z, 1); uploadAll(); pileAt = -1; doneAt = t; } }
     else if (first < COUNT) step();
     else if (doneAt < 0) doneAt = t;
-    else if (loopBox.checked && t - doneAt > 30) ({ demolish: startDemolish, pile: startPile }[ANIM.outro] || reset)();   // long hold so a full orbit shows every side
-    bar.style.width = Math.max(0, Math.min(100, (t / BUILD_END) * 100)) + '%';
-    if (!userMoved && orbitBox.checked) { camAz += dt * 0.12; placeCamera(camAz); }
+    const w = Math.max(0, Math.min(100, (t / BUILD_END) * 100)).toFixed(1) + '%';
+    if (w !== barW) bar.style.width = barW = w;
+    if (orbitBox.checked) orbitStep(dt * 0.12);
   }
-  head.visible = ANIM.order === 'scan' && t >= 0 && first < COUNT && demoAt < 0;
-  if (head.visible) head.position.y = minY + Math.min(maxY - minY, Math.floor(t / SCAN)) + 0.55;
-  // blueprint: fade in during the lead-in, hold through the build, fade out when complete
-  const bp = ANIM.intro !== 'blueprint' || demoAt >= 0 || pileAt >= 0 ? 0
-    : t < 0 ? Math.min(1, (t + BLUEPRINT) / 0.8) : doneAt < 0 ? 1 : Math.max(0, 1 - (t - doneAt) / 1.2);
-  ghost.visible = bp > 0; ghost.material.opacity = bp;
   setSky(dt);
   const out = demoAt >= 0 ? demoAt : pileAt;
   setLights((out >= 0 ? Math.max(0.15, 1 - (t - out) * 0.85)
     : doneAt < 0 ? 0.15 : 0.15 + 0.85 * Math.min(1, (t - doneAt) / 1.5)) * (1 + 1.2 * night), out < 0 && doneAt >= 0 && first >= COUNT, dt);
   controls.update();
   hazeU.hazeC.value = cam.position.distanceTo(controls.target);   // depth of the target along the view axis
+  if (!changed() && !moved) return countFps(false);
+  renderer.shadowMap.needsUpdate = moved;
   renderer.render(scene, cam);
+  moved = false; full.fill(false);
+  adaptDpr(dt);
+  countFps(true);
 });
 </script>
 </body>

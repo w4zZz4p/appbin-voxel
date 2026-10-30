@@ -2,7 +2,7 @@
 
 Proportions are the first thing that makes a scene look like a toy. Check every element against these numbers.
 
-## Scale table (houses: 1 design unit = 40 cm; at `S = 2` a fine voxel is 20 cm)
+## Scale table (houses: 1 design unit = 40 cm; at `S = 3` a fine voxel is ~13 cm)
 
 | Element | Design units | Notes |
 |---|---|---|
@@ -35,7 +35,7 @@ Proportions are the first thing that makes a scene look like a toy. Check every 
 ## Every prop is 1.0–1.2× its real size
 
 Vehicles at 1.5–1.7× read as toys and a car at 0.7× as a model; the island may grow to make room instead.
-Small fixtures get one cell (a 2×2 fine block is already 40 cm at `S = 2`).
+Small fixtures get one cell (a 2×2 fine block is already ~27 cm at `S = 3`).
 
 Real sizes (w × h × l, metres): pickup 2.0 × 1.9 × 5.9 · hatchback 1.8 × 1.5 × 4.1 · semi tanker 2.5 wide, 18
 long · 20 ft container 2.44 × 2.59 × 6.06 · crawler-crane track ≈ 9 long · door 2.1 high · jersey barrier
@@ -49,12 +49,12 @@ metres to fine cells for real-size parts.
 
 - Author props with the template's `sprite(ox, oy, oz, rot)`: local cells of `M_PER_UNIT / SPRITE_S` metres (0.13 m
   at the defaults), `s(x,y,z,c,e)` / `s.box(…)`, 90° rotations, `s.w()` → design coordinates for `limb()`, `s.f()` →
-  fine cells for `lamp()`. `q(n) = round(n·S/SPRITE_S)` rescales them to `?res`. Size them from that cell size —
+  fine cells for `lamp()`. `q(n) = round(n·S/SPRITE_S)` rescales them to `S`. Size them from that cell size —
   `__props` flags it if you don't.
 - **`q(0)` must be 0** — never `Math.max(1, …)`: rows 0 and 1 then both map to cell 1, every sprite floats a
   cell up (the connectivity pass deletes it) and loses a row of width.
 - Rotations 2 and 3 extend a sprite toward −x / −z from its origin: place it by the far corner, or a parked car lands
-  in the next bay (it was flagged as 3.5 m long after overlapping its neighbour). Parked cars get dark lenses and no
+  in the next bay, overlaps its neighbour and inspects as one 3.5 m prop. Parked cars get dark lenses and no
   lamp; lit headlights on a parked car read wrong.
 - Detail that reads at real size: separate wheels with hubs and arches, glass with seats behind it, pillars,
   mirrors, grille + glowing head/tail lights, bumpers, cargo; container corrugation, corner castings, door seam,
