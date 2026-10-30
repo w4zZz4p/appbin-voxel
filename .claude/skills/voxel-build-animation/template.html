@@ -6,7 +6,7 @@
 <title>Voxel Scene</title>
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden; font-family: system-ui, sans-serif; }
-  body { background: linear-gradient(#6f9cc8 0%, #b9cdd8 55%, #e9e2cf 100%); } /* sky: match the photo */
+  body { background: linear-gradient(#8fa2b6 0%, #b6c2cb 50%, #d6d9d6 72%, #cfc8bb 100%); } /* sky fallback (?bg=css); the sky texture (SKY) is the default */
   canvas { display: block; position: relative; z-index: 1; }
   #night { position: fixed; inset: 0; opacity: 0; pointer-events: none; background: linear-gradient(#0a1430 0%, #1c2a4e 55%, #3b3552 100%); } /* sky=night fades this in */
   #ui { z-index: 2; position: fixed; left: 16px; bottom: 16px; display: flex; gap: 8px; align-items: center; color: #2c3336; font-size: 13px; flex-wrap: wrap; }
@@ -51,7 +51,10 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 // Voxel subdivision: each design unit is S×S×S small voxels. Override with ?res=1..4
 const Q = new URLSearchParams(location.search);
 const S = Math.max(1, Math.min(4, parseInt(Q.get('res')) || 2));
-// Animation style (see SKILL.md, Animation modes). Set the scene's defaults here; ?intro= ?order= ?motion= ?outro= ?sky= override.
+const GRID = Q.get('grid') === '1';                      // ?grid=1 draws the full cube grid; by default the cube border is near-invisible
+const CAM = Q.get('cam') === 'persp' ? 'persp' : 'ortho'; // ?cam=persp: perspective hero view (modest FOV, 15–25° elevation); default orthographic
+const SHADOW_HI = Q.get('shadow') === 'hi';              // ?shadow=hi: 8192 shadow map for the real-time shadows while voxels move (default 4096)
+// Animation style (see the skill's reference/animation.md). Set the scene's defaults here; ?intro= ?order= ?motion= ?outro= ?sky= override.
 //   intro:  none | blueprint (see-through outline of the finished model first, then it fills in)
 //   order:  layers (bottom up, jittered) | scan (3D printer: strict layers, sweeping head) | stages (by STAGE tag)
 //   motion: drop | grow | swarm | tornado | slide | pop | tumble | squash | flash (see POSE)
@@ -83,12 +86,17 @@ const pick = a => a[Math.floor(rnd() * a.length)];
 
 // Fine-grid voxel store; e = false (lit), true (glowing), 'glass' (semi-transparent).
 // The +256 key offset matters: the island underside goes to negative y.
-// TAG marks what a voxel is so passes can treat it differently (see SKILL.md, Fire, smoke and steam).
+// TAG marks what a voxel is so passes can treat it differently (4 terrain, >= 6 hollowed, 7 animal, 9 scruff grass; see reference/lighting.md).
 const V = new Map();
 const key = (x, y, z) => ((x + 256) * 1024 + (y + 256)) * 1024 + (z + 256);
 // STAGE groups voxels for ?order=stages: lower stages build first (0 ground, 1 walls, 2 openings, 3 roof, 4 props).
 let TAG = 0, STAGE = 0;
-const fset = (x, y, z, c, e = false) => V.set(key(x, y, z), { x, y, z, c, e, g: TAG, st: STAGE });
+// PROP names what is being built so the prop inspectors can find it (window.__props, __seeProp; skill reference/inspection.md).
+// prop(name, [w, h, l] in metres) before each prop, prop() after; M_PER_UNIT = metres per design unit.
+const M_PER_UNIT = 0.4, PROPS = {};
+let PROP = null;
+const prop = (name = null, real = null) => { PROP = name; if (name) PROPS[name] = { real }; };
+const fset = (x, y, z, c, e = false) => V.set(key(x, y, z), { x, y, z, c, e, g: TAG, st: STAGE, p: PROP });
 const fdel = (x, y, z) => V.delete(key(x, y, z));
 const fhas = (x, y, z) => V.has(key(x, y, z));
 const dc = f => (f - (S - 1) / 2) / S;                 // fine cell -> design coordinate
@@ -118,7 +126,7 @@ function blob(cx, cy, cz, r, pal, sy = 1, rough = 0.6, e = false) {   // noisy e
     for (let fy = Math.floor((cy - R * sy) * S); fy <= Math.ceil((cy + R * sy) * S); fy++)
       for (let fz = Math.floor((cz - R) * S); fz <= Math.ceil((cz + R) * S); fz++) {
         const d = Math.hypot(dc(fx) - cx, (dc(fy) - cy) / sy, dc(fz) - cz);
-        if (d <= r + (rnd() - 0.5) * rough) fset(fx, fy, fz, pick(pal), e);
+        if (d <= r + (rnd() - 0.5) * rough) fset(fx, fy, fz, typeof pal === 'function' ? pal(fx, fy, fz) : pick(pal), e);   // pal: array or fn(fx, fy, fz)
       }
 }
 // face-connected line between two design points (trunks, branches, poles): steps one axis at a time
@@ -138,28 +146,45 @@ function limb(x0, y0, z0, x1, y1, z1, pal, thick = 1) {
 // =====================================================================================================
 // SCENE: palette, ground, buildings, props (replace with your scene)
 // =====================================================================================================
+// Colours are sampled from the photo (palette-sampler.html) and stay muted: sRGB saturation <= 0.4, lightness 0.12–0.85
+// (the palette lint after the bake warns otherwise). Keys named in ACCENT (glow, flowers, signage) are exempt.
 const P = {
-  lawn: [0x4f9a35, 0x58a53b, 0x478f30],
+  lawn: [0x6b7a3c, 0x72823f, 0x637236],                // olive grass, 3 shades
   topsoil: [0x4a3b2a, 0x40331f],
   under: [0x7c776c, 0x6d685e, 0x5f5a51, 0x524e46],
-  wall: [0xe9dfc9, 0xdcd0b6],
-  trim: 0xf2ece0,
+  wall: [0xd9d0bb, 0xcdc4ad],
+  trim: 0xd6d0c2,
   roof: [0x5a3a30, 0x64423a, 0x4e322a],
   roofCap: 0x3e2822,
-  leaf: [0x3f7a35, 0x4a8a3c, 0x356a2e],
-  lawnDry: [0x8a9a4a, 0x7f9142],                       // worn / sun-scorched lawn patches
-  weed: [0x4f8a32, 0x6a9a3a, 0x3d6e2a, 0x7fa848],
-  litter: [0x7a6a34, 0x8f7a3a, 0x6a5a2e, 0x5f7a30],    // fallen leaves and twigs under trees
+  leaf: [0x4a6a3a, 0x56744a, 0x3f5c33],                // desaturated foliage
+  lawnDry: [0x8c8e5a, 0x80844f],                       // worn / sun-scorched lawn patches
+  tuft: [0x86985c, 0x90a068, 0x7a9050],               // grass tufts: paler than the lawn, never darker; a touch greener than it is yellow
+  weed: [0x5f7a3a, 0x6c8244, 0x4f6a34, 0x7a8a50],
+  litter: [0x76693c, 0x857640, 0x66593a, 0x6a7542],    // fallen leaves and twigs under trees
+  flower: [0xd9c36a, 0xe8e4d8, 0xb79ac0],              // accents (exempt from the lint)
   bark: [0x4a3a2c, 0x3d3024],
-  black: 0x1c1c1c,
+  black: 0x232323,
+  iron: 0x2c2d2e,
+  spruce: [0x2c4024, 0x34482a, 0x26381f],           // spruce()
+  cypress: [0x2c3a1e, 0x34452a, 0x283520],          // cypress()
+  wood: [0x8a7866, 0x7c6c5c, 0x968472],             // deck() planks, weathered grey
+  woodDark: [0x5c3a28, 0x4e3222],                   // piles, rail posts
 };
-const GLOW = 0xffd27a;
-const GLASS = 0x5f9cc4;
+const ACCENT = new Set(['flower']);                   // P keys the palette lint skips
+const GLOW = 0xffe6c0;                                // warm white; the lamp colour does the tinting
+const GLASS = 0x6b96b4;
+// Sky: drawn as a texture behind the scene (useSkyTexture, default) with a lighter band at the horizon; `at` are stop
+// positions from the top of the screen. The depth fade (HAZE) blends distant voxels toward the horizon band (index 2).
+const SKY = {
+  day: [0x8fa2b6, 0xb6c2cb, 0xd6d9d6, 0xcfc8bb],
+  night: [0x0a1430, 0x1c2a4e, 0x2c3350, 0x3b3552],
+  at: [0, 0.5, 0.72, 1],
+};
 
 const CX = 30, CZ = 30;            // island centre (design units)
 const GY = 3, TOP = GY * S;        // ground surface is fine layer TOP-1; things stand from TOP
 
-// ---------- island: irregular lobed outline, rounded rim bumps, one iceberg rock mass underneath ----------
+// ---------- island: irregular lobed outline, rounded rim bumps, a shallow earth slab underneath ----------
 const ISLAND = 7;                  // outline seed: change it for a differently shaped island
 // lobes: a few low harmonics with random phase/strength give bays and peninsulas instead of a round blob
 const LOBES = [2, 3, 5].map((n, i) => ({ n, a: [3.2, 2.4, 1.3][i] * (0.6 + hash(n, i, ISLAND) * 0.8), p: hash(i, n, ISLAND + 1) * 6.283 }));
@@ -178,7 +203,7 @@ const idx = (fx, fz) => (fx - LO) * WD + (fz - LO);
 const inGrid = (fx, fz) => fx >= LO && fz >= LO && fx < LO + WD && fz < LO + WD;
 const botAt = (fx, fz) => inGrid(fx, fz) ? bottom[idx(fx, fz)] : OUT;
 const topAt = (fx, fz) => inGrid(fx, fz) ? top[idx(fx, fz)] : -OUT;
-// terrain height above the base in design units (hills: see voxel-cabin.html). Low hummocks keep the lawn from
+// terrain height above the base in design units (hills: a wider vnoise, scaled up). Low hummocks keep the lawn from
 // being a billiard table; keep them away from footprints if a building must sit flush.
 const heightAt = (x, z) => vnoise(x, z, 6, 71) > 0.7 ? 0.5 : 0;
 // hard surfaces (paving, gravel, decks; fine cells): scruff grows no weeds there, or they read as debris around car
@@ -189,13 +214,15 @@ for (let fx = LO; fx < LO + WD; fx++) for (let fz = LO; fz < LO + WD; fz++) {
   const e = edgeR(x, z) - Math.pow(dx ** 4 + dz ** 4, 0.25);
   if (e < 0) continue;
   top[idx(fx, fz)] = TOP - 1 + Math.round(heightAt(x, z) * S);
-  const ra = Math.min(1, Math.hypot(x - CX - 2, z - CZ + 1) / 34);           // apex slightly off-centre
-  const facet = (Math.floor(vnoise(x, z, 6, 51) * 5) / 5 - 0.4) * 5;          // stepped noise = flat facets
-  const depth = 2 + Math.min(1, e / 4) * (24 * Math.pow(1 - ra, 1.4) + facet * (1 - ra));
+  // shallow slab, 2.5–4 design units thick, cut vertically at the rim (a slab that thickens inward hangs an inverted
+  // stair under the rim whose risers sit in shadow and read as a black band). The bottom undulates in flat steps.
+  const facet = Math.floor(vnoise(x, z, 6, 51) * 4) / 4 * 1.5;                 // stepped noise = flat facets
+  const depth = 2.5 + facet;
   bottom[idx(fx, fz)] = TOP - 1 - Math.max(S, Math.round(depth * S));
 }
 const surfaceC = (x, z, fx, fz) => vnoise(x, z, 5, 72) > 0.74 && hash(fx, fz, 73) < 0.8 ? pick(P.lawnDry)   // worn patches
   : P.lawn[(Math.floor((x + z * 0.15) / 3) % 2 + 2) % 2 + (hash(fx, fz, 2) > 0.85 ? 1 : 0)];
+TAG = 4;                           // terrain
 for (let fx = LO; fx < LO + WD; fx++) for (let fz = LO; fz < LO + WD; fz++) {
   const b = botAt(fx, fz);
   if (b === OUT) continue;
@@ -206,15 +233,18 @@ for (let fx = LO; fx < LO + WD; fx++) for (let fz = LO; fz < LO + WD; fz++) {
     if (fy !== b && fy !== t && nb.every(([nbot, ntop]) => nbot < fy && ntop > fy)) continue;
     let c;
     if (fy > t - 2 * S) c = fy === t || nb.some(([n]) => n === OUT) ? surfaceC(x, z, fx, fz) : pick(P.topsoil);
-    else c = P.under[Math.min(3, Math.floor((TOP - fy) / (6 * S)))];
+    else if (fy > t - 4 * S) c = pick(P.topsoil);                              // earth band under the turf
+    else c = P.under[Math.min(3, Math.floor((TOP - fy) / (6 * S)))];           // rock at the bottom
     fset(fx, fy, fz, c);
   }
-  if (hash(fx, fz, 41) < 0.03) fset(fx, t + 1, fz, pick(P.lawn));             // grass tufts
+  // grass tufts, ~1.5% of columns, TAG 9 (scruff grass): no grime, streaks or side-face AO, or they read as dark specks
+  if (hash(fx, fz, 41) < 0.015) { TAG = 9; fset(fx, t + 1, fz, pick(P.tuft)); TAG = 4; }
 }
+TAG = 0;
 
 // ---------- light sources ----------
-// Only fixtures emit light. lamp() registers a baked light (see SKILL.md, Baked lighting) tied to the glowing
-// voxel `src` of its fixture; positions are fine cells. Lamps whose src is not a glow voxel once the scene is
+// Only fixtures emit light. lamp() registers a baked light (see the skill's reference/lighting.md) tied to the glowing
+// voxel `src` of its fixture; positions are fine cells. Lamps whose src is not a glow voxel after the scene is
 // built are dropped with a warning, so light never comes from an empty spot. hero: also a real PointLight.
 const LAMPS = [];
 const lamp = (src, fx, fy, fz, o = {}) => LAMPS.push({ src, fx, fy, fz, color: 0xffc070, power: 1.6, r: 3.5, ...o });
@@ -291,31 +321,357 @@ function hip(x0, x1, z0, z1, eave, slope = 0.5) {
     if (d <= 1) fset(fx, E - 1, fz, P.trim);
   }
 }
-// trees are never plumb or symmetric: leaning trunk with a kink, 3-5 uneven crown clumps with gaps,
-// root flare, the odd yellowed leaf. Crown footprints go to CANOPY for leaf litter.
+// metres -> fine cells (at least one): real-size props and fixtures
+const cells = m => Math.max(1, Math.round(m / M_PER_UNIT * S));
+// face-connected line between two fine points (stays, ropes, cables): steps one axis at a time
+function fline(x0, y0, z0, x1, y1, z1, c) {
+  const n = Math.max(Math.abs(x1 - x0), Math.abs(y1 - y0), Math.abs(z1 - z0)) * 2;
+  let px = x0, py = y0, pz = z0;
+  fset(px, py, pz, col(c, px, py, pz));
+  for (let i = 1; i <= n; i++) {
+    const t = i / n, fx = Math.round(x0 + (x1 - x0) * t), fy = Math.round(y0 + (y1 - y0) * t), fz = Math.round(z0 + (z1 - z0) * t);
+    while (px !== fx) { px += Math.sign(fx - px); fset(px, py, pz, col(c, px, py, pz)); }
+    while (pz !== fz) { pz += Math.sign(fz - pz); fset(px, py, pz, col(c, px, py, pz)); }
+    while (py !== fy) { py += Math.sign(fy - py); fset(px, py, pz, col(c, px, py, pz)); }
+  }
+}
+
+// ---------- trees and plants (stand on the terrain: topAt, not GY) ----------
+// trees are never plumb or symmetric: leaning trunk with a kink, 3-5 uneven crown clumps with gaps, root flare,
+// the odd yellowed leaf, a slight tint of its own. Leaves are TAG 6 (hollowed to a skin). Crown footprints go to
+// CANOPY for leaf litter. o: lean (0.22), sy (crown squash, 0.75), spread (clump spread, 1.6), low (holm-oak dome
+// whose skirt hangs to ~1/3 of the height instead of a ball on a bare pole), trunk (fine cells thick, 2; 1 at 1 m units).
 const CANOPY = [];
-function tree(x, z, h, r, pal = P.leaf) {
-  const lx = (rnd() - 0.5) * h * 0.22, lz = (rnd() - 0.5) * h * 0.22, kx = x + lx * 0.35, kz = z + lz * 0.35, tx = x + lx, tz = z + lz;
-  limb(x, GY, z, kx, GY + h * 0.5, kz, P.bark, 2);
-  limb(kx, GY + h * 0.5, kz, tx, GY + h, tz, P.bark, 2);
-  const px = Math.round(x * S), pz = Math.round(z * S);
-  for (const [a, b] of [[-1, 0], [2, 0], [0, -1], [0, 2], [-1, 1], [2, 1]]) if (rnd() < 0.55) fset(px + a, TOP, pz + b, pick(P.bark));   // root flare
-  const leaves = [...pal, ...pal, ...pal, ...pal, ...pal, ...pal, 0x8f8f3a];      // ~5% yellowed
-  const n = 3 + Math.floor(rnd() * 3);
+function tree(x, z, h, r, pal = P.leaf, o = {}) {
+  const px = Math.round(x * S), pz = Math.round(z * S), gy = (topAt(px, pz) + 1) / S, tag = TAG;
+  const lean = o.lean ?? 0.22, sy = o.sy ?? 0.75, spread = o.spread ?? 1.6;
+  const lx = (rnd() - 0.5) * h * lean, lz = (rnd() - 0.5) * h * lean, kx = x + lx * 0.35, kz = z + lz * 0.35, tx = x + lx, tz = z + lz;
+  limb(x, gy, z, kx, gy + h * 0.5, kz, P.bark, o.trunk ?? 2);
+  limb(kx, gy + h * 0.5, kz, tx, gy + h, tz, P.bark, o.trunk ?? 2);
+  for (const [a, b] of [[-1, 0], [2, 0], [0, -1], [0, 2], [-1, 1], [2, 1]]) if (rnd() < 0.55) fset(px + a, topAt(px + a, pz + b) + 1, pz + b, pick(P.bark));   // root flare
+  const dh = (rnd() - 0.5) * 0.03, dl = (rnd() - 0.5) * 0.08;
+  const own = pal.map(c => tmp.set(c).offsetHSL(dh, 0, dl).getHex());
+  const leaves = [...own, ...own, ...own, ...own, ...own, ...own, 0x8a8848];      // ~5% yellowed
+  const n = o.low ? 5 + Math.floor(rnd() * 3) : 3 + Math.floor(rnd() * 3);
   for (let i = 0; i < n; i++) {
     const main = i === 0, rr = main ? r : r * (0.5 + rnd() * 0.4);
-    const dx = main ? 0 : (rnd() - 0.5) * r * 1.6, dz = main ? 0 : (rnd() - 0.5) * r * 1.6, dy = main ? 0 : (rnd() - 0.65) * r;
-    limb(kx, GY + h * 0.5, kz, tx + dx, GY + h + dy - rr * 0.5, tz + dz, P.bark, 1);   // branch into each clump
-    blob(tx + dx, GY + h + dy, tz + dz, rr, leaves, 0.75 + rnd() * 0.15, 1.5);
+    const dx = main ? 0 : (rnd() - 0.5) * r * spread, dz = main ? 0 : (rnd() - 0.5) * r * spread;
+    const dy = main ? (o.low ? -rr * sy * 0.35 : 0) : o.low ? (rnd() - 0.85) * r * sy * 1.2 : (rnd() - 0.65) * r * sy;
+    limb(kx, gy + h * 0.5, kz, tx + dx, gy + h + dy - rr * 0.5 * sy, tz + dz, P.bark, 1);   // branch into each clump
+    TAG = 6; blob(tx + dx, gy + h + dy, tz + dz, rr, leaves, sy + rnd() * 0.15, 1.5); TAG = tag;
     CANOPY.push([tx + dx, tz + dz, rr]);
   }
 }
-function lampPost(x, z) {
-  const fx = Math.round(x * S), fz = Math.round(z * S);
-  for (let y = TOP; y < TOP + 9; y++) fset(fx, y, fz, P.black);
-  fbox(fx, TOP + 9, fz, fx + 1, TOP + 10, fz + 1, GLOW, true);
-  fbox(fx, TOP + 11, fz, fx + 1, TOP + 11, fz + 1, P.black);
-  lamp([fx, TOP + 9, fz], fx + 0.5, TOP + 9.5, fz + 0.5, { power: 1.2 });
+// spruce/fir: straight trunk, whorled tiers narrowing to a spire. Each layer steps in by under a cell so the
+// hollowed skin stays face-connected; the trunk goes in after the leaves or the hollowing cuts the crown loose.
+function spruce(x, z, h, r, pal = P.spruce) {
+  const px = Math.round(x * S), pz = Math.round(z * S), b = topAt(px, pz) + 1, H = Math.round(h * S), cx = dc(px), cz = dc(pz), tag = TAG;
+  const dl = (rnd() - 0.5) * 0.06, own = pal.map(c => tmp.set(c).offsetHSL((rnd() - 0.5) * 0.02, 0, dl).getHex());
+  TAG = 6;
+  for (let fy = b + Math.round(H * 0.15); fy <= b + H; fy++) {
+    const t = (fy - b) / H, tier = ((fy - b) % 5) / 4;
+    const rr = r * Math.min(1, (1 - t) * 1.15) - 0.8 * tier + 0.6 + (rnd() - 0.5) * 0.3;
+    disc(cx, cz, 0, Math.max(0.3, rr), fy, fy, own);
+  }
+  TAG = tag;
+  for (let fy = b; fy < b + Math.round(H * 0.75); fy++) fset(px, fy, pz, pick(P.bark));
+  CANOPY.push([cx, cz, r * 0.8]);
+}
+// cypress: a narrow, slightly wavering column
+function cypress(x, z, h, r, pal = P.cypress) {
+  const px = Math.round(x * S), pz = Math.round(z * S), b = topAt(px, pz) + 1, tag = TAG;
+  for (let fy = b; fy < b + cells(1); fy++) fset(px, fy, pz, pick(P.bark));
+  TAG = 6;
+  for (let fy = b + cells(0.6); fy <= b + h * S; fy++) {
+    const t = (fy - b) / (h * S), rr = r * Math.min(1, Math.sin(Math.PI * Math.pow(t, 0.75)) * 1.15) + (rnd() - 0.5) * 0.4;
+    disc(x + Math.sin(fy * 0.3) * 0.15, z, 0, Math.max(0.5, rr), fy, fy, pal);
+  }
+  TAG = tag;
+}
+function shrub(x, z, r, pal = P.leaf) {
+  const gy = (topAt(Math.round(x * S), Math.round(z * S)) + 1) / S, tag = TAG;
+  TAG = 6; blob(x, gy + r * 0.3, z, r, pal, 0.65, 1.0); TAG = tag;
+}
+
+// ---------- more light fixtures (all register their light at a glowing voxel) ----------
+// lamp post on the terrain, ~2.6 m: iron pole, one glowing cell, cap and finial
+function lampPost(x, z, o = {}) {
+  const fx = Math.round(x * S), fz = Math.round(z * S), b = topAt(fx, fz) + 1, H = cells(2.4);
+  fset(fx, b, fz, P.iron);
+  for (let y = b + 1; y < b + H; y++) fset(fx, y, fz, P.iron);
+  fset(fx, b + H, fz, GLOW, true);
+  fset(fx, b + H + 1, fz, P.black);
+  fset(fx, b + H + 2, fz, P.black);                                            // finial
+  lamp([fx, b + H, fz], fx, b + H, fz, { power: 1.2, r: 9, ...o });            // r must reach the ground from 2.4 m up
+}
+// one-cell wall lamp (use at S >= 3, where the 2×2 lantern() is 0.7 m of glass): iron cap and foot, touching the wall
+function wallLamp(axis, l, dir, a, y, o = {}) {
+  pset(axis, a, y + 1, l + dir, P.iron);
+  pset(axis, a, y, l + dir, GLOW, true);
+  pset(axis, a, y - 1, l + dir, P.iron);
+  lamp(axis === 'x' ? [a, y, l + dir] : [l + dir, y, a], ...(axis === 'x' ? [a, y, l + 2 * dir] : [l + 2 * dir, y, a]), o);
+}
+// free-standing ground uplight at fine (fx, fz). Defaults are the daytime setting (narrow cone); at dusk/night
+// pass { power: 5, cone: 0.15 }. Baked light is emission and shows in daylight too.
+function uplightAt(fx, fz, o = {}) {
+  const t = topAt(fx, fz) + 1;
+  fset(fx, t, fz, P.black); fset(fx, t + 1, fz, GLOW, true);
+  lamp([fx, t + 1, fz], fx, t + 1.5, fz, { color: 0xffa850, power: 2.4, r: 20, dir: [0, 1, 0], cone: 0.72, ...o });
+}
+// firelight: a shadowless lamp tied to the nearest flame voxel (TAG 5, glowing) within R fine cells of a design
+// point. Use for flames and for light bounced off steam; warns if no flame is near.
+function nearFlame(fx, fy, fz, R = 3 * S) {
+  let best = null, bd = Infinity;
+  for (let x = fx - R; x <= fx + R; x++) for (let y = fy - R; y <= fy + R; y++) for (let z = fz - R; z <= fz + R; z++) {
+    const v = V.get(key(x, y, z)), d = (x - fx) ** 2 + (y - fy) ** 2 + (z - fz) ** 2;
+    if (v && v.e === true && v.g === 5 && d < bd) { bd = d; best = [x, y, z]; }
+  }
+  return best;
+}
+function fireLamp(x, y, z, o = {}) {
+  const f = [Math.round(x * S), Math.round(y * S), Math.round(z * S)], src = nearFlame(...f, o.reach ?? 3 * S);
+  if (!src) { console.warn(`fireLamp at ${x}, ${y}, ${z}: no flame voxel within reach`); return; }
+  lamp(src, ...f, { shadow: false, ...o });
+}
+
+// ---------- roofs ----------
+// one roof over several rectangles: the upper envelope of per-rectangle hips gives clean valleys where wings meet.
+// rects: { x0, x1, z0, z1 (design), eave (design y), slope (fine rise per fine run), over (eave overhang, design; 1) }.
+// Over the eave band each column reaches down to the wall top as a dark fascia, so steep roofs don't float.
+function roofU(rects) {
+  const R = rects.map(r => {
+    const X0 = r.x0 * S, X1 = r.x1 * S + S - 1, Z0 = r.z0 * S, Z1 = r.z1 * S + S - 1;
+    return { slope: 0.5, ...r, X0, X1, Z0, Z1, E: r.eave * S, dMax: Math.floor(Math.min(X1 - X0, Z1 - Z0) / 2) };
+  });
+  const bx0 = Math.min(...R.map(r => r.X0)), bx1 = Math.max(...R.map(r => r.X1)), bz0 = Math.min(...R.map(r => r.Z0)), bz1 = Math.max(...R.map(r => r.Z1));
+  for (let fx = bx0; fx <= bx1; fx++) for (let fz = bz0; fz <= bz1; fz++) {
+    let best = null, bh = -1e9, bd = 0, bdX = 0, bdZ = 0;
+    for (const r of R) {
+      if (fx < r.X0 || fx > r.X1 || fz < r.Z0 || fz > r.Z1) continue;
+      const dX = Math.min(fx - r.X0, r.X1 - fx), dZ = Math.min(fz - r.Z0, r.Z1 - fz), d = Math.min(dX, dZ), h = r.E + Math.floor(d * r.slope);
+      if (h > bh) { bh = h; best = r; bd = d; bdX = dX; bdZ = dZ; }
+    }
+    if (!best) continue;
+    const cap = bdX === bdZ || bd >= best.dMax - 1;
+    let c = cap ? P.roofCap : P.roof[Math.floor(bd / 2) % 3];
+    if (!cap && hash(fx >> 1, fz, 16) < 0.07) c = P.roof[(Math.floor(bd / 2) + 1 + (hash(fx, fz, 17) * 2 | 0)) % 3];   // replaced tiles
+    if (!cap && hash(fx, fz >> 2, 18) < 0.025) c = 0x8a7a5a;                                                          // lichen
+    const th = Math.ceil(best.slope) + 1, y0 = bd <= (best.over ?? 1) * S + 3 ? Math.min(bh - th + 1, best.E - 1) : bh - th + 1;
+    for (let y = y0; y <= bh; y++) fset(fx, y, fz, y < bh - th + 1 ? P.roofCap : c);
+    if (!cap && bd > 1 && hash(fx, fz, 15) < 0.02) fset(fx, bh + 1, fz, c);                                          // a lifted tile
+  }
+}
+
+// ---------- round towers ----------
+// T = roundTower(cx, cz, R, y0, top, o): a ring of wall RW thick (design) from design y0 to top, hollow inside; also
+// clears roofs that ran into it, so build it after them. o.wall(arc, fy) colours the ring (arc = fine position round
+// it, for courses and checker bands). T gives dist/ang/arc/outer per fine column for rWin, rSlit, coneRoof.
+function roundTower(cx, cz, R, y0, top, o = {}) {
+  const RW = o.RW ?? 1.5, wall = o.wall ?? ((a, fy) => col(P.wall, a, fy, 0));
+  const T = { c: [cx, cz], R, RW, top };
+  T.dist = (fx, fz) => Math.hypot(dc(fx) - cx, dc(fz) - cz);
+  T.ang = (fx, fz) => Math.atan2(dc(fz) - cz, dc(fx) - cx);
+  T.arc = (fx, fz) => Math.round((T.ang(fx, fz) + Math.PI) * R * S);
+  T.outer = (fx, fz) => [[1, 0], [-1, 0], [0, 1], [0, -1]].some(([a, b]) => T.dist(fx + a, fz + b) > R);
+  T.X0 = Math.floor((cx - R - 2) * S); T.X1 = Math.ceil((cx + R + 2) * S); T.Z0 = Math.floor((cz - R - 2) * S); T.Z1 = Math.ceil((cz + R + 2) * S);
+  for (let fx = T.X0; fx <= T.X1; fx++) for (let fz = T.Z0; fz <= T.Z1; fz++) {
+    const d = T.dist(fx, fz);
+    if (d > R) continue;
+    for (let fy = y0 * S; fy <= top * S + S - 1; fy++) {
+      if (d > R - RW) fset(fx, fy, fz, wall(T.arc(fx, fz), fy));
+      else fdel(fx, fy, fz);
+    }
+    for (let fy = top * S + S; fy <= top * S + 3 * S; fy++) if (d <= R - RW) fdel(fx, fy, fz);
+  }
+  return T;
+}
+// conical roof: tile rings, eight dark seams, iron finial with a vane. Solid down to the eave over the ring wall,
+// or the steep cone lifts off it and the connectivity pass deletes it.
+function coneRoof(T, H, over = 1) {
+  const [cx, cz] = T.c, Rr = T.R + over, E = T.top * S + S, Hf = H * S, k = Hf / (Rr * S), th = Math.ceil(k) + 1;
+  for (let fx = Math.floor((cx - Rr - 1) * S); fx <= Math.ceil((cx + Rr + 1) * S); fx++) for (let fz = Math.floor((cz - Rr - 1) * S); fz <= Math.ceil((cz + Rr + 1) * S); fz++) {
+    const d = T.dist(fx, fz);
+    if (d > Rr) continue;
+    const h = E + Math.round((Rr - d) / Rr * Hf), a = (T.ang(fx, fz) + Math.PI) / (2 * Math.PI) * 8;
+    const seam = Math.abs(a - Math.round(a)) * Rr * S * 0.8 < 0.5 && d > 1;
+    for (let y = d > T.R - T.RW ? E : Math.max(E, h - th + 1); y <= h; y++) {
+      let c = seam ? P.roofCap : P.roof[Math.floor(y / 2) % 3];
+      if (!seam && hash(fx, y, 19) < 0.06) c = P.roof[(Math.floor(y / 2) + 1) % 3];
+      fset(fx, y, fz, c);
+    }
+  }
+  const fx = Math.round(cx * S), fz = Math.round(cz * S), y0 = E + Hf + 1, vy = y0 + cells(1.2);
+  for (let y = y0 - 2; y < y0 + cells(1.5); y++) fset(fx, y, fz, P.iron);
+  fset(fx + 1, vy, fz, P.iron); fset(fx + 2, vy, fz, P.iron);                   // vane
+}
+// opening in a round tower wall at angle th (radians, 0 = +x), design y0..y1, w design units wide, round-arched head:
+// the arc offset th·d·S stands in for the plane coordinate. Outer cells removed, the next layer glass, a closed room
+// backdrop inside, a frame round it, a sill. o.lit / o.door: warm glowing room and a weak spot out through the glass.
+const angD = (a, b) => { let d = a - b; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; return d; };
+function rWin(T, th, y0, y1, w, o = {}) {
+  const Y0 = y0 * S, Y1 = y1 * S + S - 1, R = w * S / 2, yTop = Y1 + Math.ceil(R), lit = !!(o.lit || o.door), frameC = o.frame ?? P.trim;
+  const inside = (s, y, m) => {
+    if (y < Y0 - m || y > yTop + m) return false;
+    return y > Y1 ? Math.hypot(s, y - Y1) <= R + m - 0.3 : Math.abs(s) <= R + m - 0.5;
+  };
+  let src = null;
+  for (let fx = T.X0; fx <= T.X1; fx++) for (let fz = T.Z0; fz <= T.Z1; fz++) {
+    const d = T.dist(fx, fz);
+    if (d > T.R || d <= T.R - T.RW - 1.4) continue;
+    const s = angD(T.ang(fx, fz), th) * d * S;
+    if (Math.abs(s) > R + 3) continue;
+    for (let fy = Y0 - 1; fy <= yTop + 1; fy++) {
+      if (d > T.R - T.RW) {
+        if (inside(s, fy, 0)) { if (d > T.R - 0.6) fdel(fx, fy, fz); else fset(fx, fy, fz, GLASS, 'glass'); }
+        else if (inside(s, fy, 1) && T.outer(fx, fz)) fset(fx, fy, fz, frameC);
+      } else if (inside(s, fy, 1)) {
+        const t = (fy - Y0) / Math.max(1, yTop - Y0);
+        fset(fx, fy, fz, lit ? tmp.set(0xf0b860).lerp(new THREE.Color(0xffe2a6), t).getHex() : tmp.set(0x2a231e).lerp(new THREE.Color(0x4a3f34), t * 0.6).getHex(), lit);
+        if (lit && !src && fy === Y0 + 1) src = [fx, fy, fz];
+      }
+    }
+  }
+  for (let fx = T.X0; fx <= T.X1; fx++) for (let fz = T.Z0; fz <= T.Z1; fz++) {      // sill, one cell proud
+    const d = T.dist(fx, fz);
+    if (d > T.R + 0.6 || d <= T.R - T.RW || Math.abs(angD(T.ang(fx, fz), th) * d * S) > R + 1) continue;
+    fset(fx, Y0 - 1, fz, frameC);
+  }
+  if (src) {
+    const ox = Math.cos(th), oz = Math.sin(th);
+    lamp(src, (T.c[0] + ox * (T.R + 0.5)) * S, (Y0 + Y1) / 2, (T.c[1] + oz * (T.R + 0.5)) * S, { color: 0xffb860, power: 1, r: 9, wrap: 0, dir: [ox, 0, oz], cone: 0 });
+  }
+}
+// arrow slit in a round tower: outer cells removed, the next layer dark (fine y range)
+function rSlit(T, th, fy0, fy1) {
+  for (let fx = T.X0; fx <= T.X1; fx++) for (let fz = T.Z0; fz <= T.Z1; fz++) {
+    const d = T.dist(fx, fz);
+    if (d > T.R || d <= T.R - T.RW) continue;
+    if (Math.abs(angD(T.ang(fx, fz), th) * d * S) > 0.55) continue;
+    for (let fy = fy0; fy <= fy1; fy++) { if (T.outer(fx, fz)) fdel(fx, fy, fz); else fset(fx, fy, fz, 0x1e1a18); }
+  }
+}
+
+// ---------- lathe: round masses whose radius changes with height (towers, domes, decks, saucers, tanks) ----------
+// rAt(h) = design radius at design height h above the ground (0 = nothing). Only the skin is built: the outer 1.5 fine
+// cells, ledges where the radius steps between layers, caps top and bottom (o.open: no bottom cap). paint(fx, fy, fz, s)
+// returns [colour, e]; s = { a (fine arc position, for mullions), outer, up / down (face not covered by the layer
+// above / below: roofs, undersides), fy0, d, r (fine), ang, h }. up is d > rAbove, not d > rAbove - 1, or every outer
+// wall cell counts as a roof.
+function lathe(cx, cz, h0, h1, rAt, paint, o = {}) {
+  const fy0 = TOP + Math.round(h0 * S), fy1 = TOP + Math.round(h1 * S) - 1, R = [];
+  for (let fy = fy0 - 1; fy <= fy1 + 1; fy++) R.push(fy < fy0 || fy > fy1 ? 0 : Math.max(0, rAt((fy - TOP + 0.5) / S) * S));
+  const rMax = Math.max(...R);
+  for (let fx = Math.floor(cx * S - rMax - 2); fx <= Math.ceil(cx * S + rMax + 2); fx++)
+    for (let fz = Math.floor(cz * S - rMax - 2); fz <= Math.ceil(cz * S + rMax + 2); fz++) {
+      const ddx = dc(fx) - cx, ddz = dc(fz) - cz, d = Math.hypot(ddx, ddz) * S;
+      if (d > rMax) continue;
+      const ang = Math.atan2(ddz, ddx);
+      for (let fy = fy0; fy <= fy1; fy++) {
+        const i = fy - fy0 + 1, r = R[i];
+        if (r <= 0 || d > r) continue;
+        const lo = o.open && fy === fy0 ? r : R[i - 1], hi = R[i + 1];
+        if (d <= r - 1.5 && d <= Math.min(lo, hi) - 1.5) continue;
+        const [c, e] = paint(fx, fy, fz, { a: Math.floor((ang + Math.PI) * r), outer: d > r - 1, up: d > hi, down: d > lo, fy0, d, r, ang, h: (fy - TOP + 0.5) / S });
+        fset(fx, fy, fz, c, e);
+      }
+    }
+}
+
+// ---------- Gothic openings (pointed, equilateral arches) ----------
+// inside test for an opening A0..A1 (fine, along the plane), straight sides up to Y1, m = margin for the ring
+const pointed = (a, y, A0, A1, Y1, m = 0) => {
+  if (a < A0 - m || a > A1 + m) return false;
+  if (y <= Y1) return true;
+  const w = A1 - A0 + 1 + 2 * m;
+  return Math.hypot(a - (A0 - m - 0.5), y - Y1) <= w && Math.hypot(a - (A1 + m + 0.5), y - Y1) <= w;
+};
+// pointed door on a wall plane (same axis/l/dir convention as win()): oak planks one cell in with iron studs, an
+// arch ring (o.ring) round it. a0..a1, y0..y1 in design units (y1 = springing line).
+function gothicDoor(axis, l, dir, a0, a1, y0, y1, o = {}) {
+  const A0 = Math.round(a0 * S), A1 = Math.round(a1 * S) + S - 1, Y0 = Math.round(y0 * S), Y1 = Math.round(y1 * S) + S - 1;
+  const yTop = Y1 + Math.ceil((A1 - A0 + 1) * 0.87) + 2;
+  for (let a = A0 - 1; a <= A1 + 1; a++) for (let y = Y0; y <= yTop; y++) {
+    if (pointed(a, y, A0, A1, Y1)) {
+      pdel(axis, a, y, l);
+      pset(axis, a, y, l - dir, hash(a, y, 371) < 0.06 ? P.iron : (a - A0) % 2 ? 0x5a3f2c : 0x684c38);
+    } else if (pointed(a, y, A0, A1, Y1, 1)) pset(axis, a, y, l, o.ring ?? P.trim);
+  }
+}
+// pointed through-opening (gate passage): clears every cell between fine planes l0..l1, arch ring on both faces
+function archCut(axis, l0, l1, a0, a1, y0, y1, o = {}) {
+  const A0 = Math.round(a0 * S), A1 = Math.round(a1 * S) + S - 1, Y0 = Math.round(y0 * S), Y1 = Math.round(y1 * S) + S - 1;
+  const yTop = Y1 + Math.ceil((A1 - A0 + 1) * 0.87) + 2;
+  for (let a = A0 - 1; a <= A1 + 1; a++) for (let y = Y0; y <= yTop; y++) for (let l = l0; l <= l1; l++) {
+    if (pointed(a, y, A0, A1, Y1)) pdel(axis, a, y, l);
+    else if ((l === l0 || l === l1) && pointed(a, y, A0, A1, Y1, 1)) pset(axis, a, y, l, col(o.ring ?? P.trim, a, y, l));
+  }
+}
+
+// ---------- decks, piers, steel ----------
+// timber deck at fine height y over fine x0..x1, z0..z1 (planks run along x with o.alongX, else along z). Where the
+// ground is below the deck it stands on piles at the sides every 5 cells over water (o.water(fx, fz) true) and on a
+// solid footing (o.footing colour) over land; it stops where the ground reaches deck height. o.rail: 1.2 m handrail.
+function deck(x0, z0, x1, z1, y, o = {}) {
+  const water = o.water ?? (() => false), footing = o.footing ?? P.under;
+  for (let fx = x0; fx <= x1; fx++) for (let fz = z0; fz <= z1; fz++) {
+    const t = topAt(fx, fz);
+    if (t === -OUT || t >= y) continue;
+    const along = o.alongX ? fx - x0 : fz - z0;
+    fset(fx, y, fz, P.wood[along % 3]);
+    const side = o.alongX ? (fz === z0 || fz === z1) : (fx === x0 || fx === x1);
+    if (side && along % 5 === 0) for (let yy = t + 1; yy < y; yy++) fset(fx, yy, fz, pick(P.woodDark));
+    else if (!water(fx, fz) && t < y - 1) for (let yy = t + 1; yy < y; yy++) fset(fx, yy, fz, col(footing, fx, yy, fz));
+    if (side && o.rail && along % 4 === 0) for (let k = 1; k < cells(1.2); k++) fset(fx, y + k, fz, P.woodDark[0]);
+    if (side && o.rail) fset(fx, y + cells(1.2), fz, P.wood[1]);
+  }
+}
+// square lattice tower section (fine cells): corner columns ct thick, ring beams every seg layers, X braces on all
+// four faces. cc = columns/beams, cb = braces.
+function lattice(X0, X1, Z0, Z1, Y0, Y1, seg, cc, cb, ct = 1) {
+  for (const [x, z] of [[X0, Z0], [X1 - ct + 1, Z0], [X0, Z1 - ct + 1], [X1 - ct + 1, Z1 - ct + 1]]) fbox(x, Y0, z, x + ct - 1, Y1, z + ct - 1, cc);
+  for (let y = Y0; y <= Y1; y += seg) {
+    const y1 = Math.min(Y1, y + 1);
+    fbox(X0, y, Z0, X1, y1, Z0, cc); fbox(X0, y, Z1, X1, y1, Z1, cc);
+    fbox(X0, y, Z0, X0, y1, Z1, cc); fbox(X1, y, Z0, X1, y1, Z1, cc);
+  }
+  const L = (a, b, c, d, e, f) => limb(a / S, b / S, c / S, d / S, e / S, f / S, cb, 1);
+  for (let y = Y0; y + seg <= Y1; y += seg) {
+    const ya = y + 2, yb = y + seg - 1;
+    for (const z of [Z0, Z1]) { L(X0, ya, z, X1, yb, z); L(X1, ya, z, X0, yb, z); }
+    for (const x of [X0, X1]) { L(x, ya, Z0, x, yb, Z1); L(x, ya, Z1, x, yb, Z0); }
+  }
+}
+// truss beam along +x between fine x0..x1, z0..z1: top chord at yt, bottom chord sloping yb0 -> yb1, verticals and
+// diagonals every 6 cells
+function trussX(x0, x1, z0, z1, yt, yb0, yb1, c) {
+  fbox(x0, yt - 1, z0, x1, yt, z1, c);
+  const yb = x => Math.round(yb0 + (yb1 - yb0) * (x - x0) / Math.max(1, x1 - x0));
+  for (let x = x0; x <= x1; x++) fbox(x, yb(x), z0, x, yb(x) + 1, z1, c);
+  for (let x = x0; x <= x1; x += 6) {
+    fbox(x, yb(x), z0, x, yt, z0, c); fbox(x, yb(x), z1, x, yt, z1, c);
+    const xn = Math.min(x1, x + 6);
+    for (const z of [z0, z1]) limb(x / S, (yb(x) + 1) / S, z / S, xn / S, (yt - 1) / S, z / S, c, 1);
+  }
+}
+
+// ---------- sprites: detailed props authored in fine cells ----------
+// Author at SPRITE_S (cells of M_PER_UNIT / SPRITE_S metres); q() rescales to the current ?res. q(0) must be 0 —
+// with Math.max(1, …) rows 0 and 1 both map to cell 1 and every sprite floats a cell up.
+// s = sprite(ox, oy, oz, rot): local x = width, y = up, z = length (front = +z); rot turns it in 90° steps about y.
+// s(x, y, z, c, e) puts a cell, s.box(…) a box, s.w(x, y, z) gives design coordinates (for limb), s.f(…) fine (for lamp).
+const SPRITE_S = 3;
+const q = n => Math.round(n * S / SPRITE_S);
+function sprite(ox, oy, oz, rot = 0) {
+  const tr = (a, d) => rot === 0 ? [a, d] : rot === 1 ? [d, -a] : rot === 2 ? [-a, -d] : [-d, a];
+  const put = (x, y, z, c, e = false) => {
+    const cc = col(c, x + ox, y, z + oz);
+    for (let a = q(x); a < Math.max(q(x) + 1, q(x + 1)); a++) for (let b = q(y); b < Math.max(q(y) + 1, q(y + 1)); b++)
+      for (let d = q(z); d < Math.max(q(z) + 1, q(z + 1)); d++) { const [X, Z] = tr(a, d); fset(ox + X, oy + b, oz + Z, cc, e); }
+  };
+  put.box = (x0, y0, z0, x1, y1, z1, c, e) => { for (let x = x0; x <= x1; x++) for (let y = y0; y <= y1; y++) for (let z = z0; z <= z1; z++) put(x, y, z, c, e); };
+  put.w = (x, y, z) => { const [X, Z] = tr(q(x), q(z)); return [(ox + X) / S, (oy + q(y)) / S, (oz + Z) / S]; };
+  put.f = (x, y, z) => { const [X, Z] = tr(q(x), q(z)); return [ox + X, oy + q(y), oz + Z]; };
+  return put;
 }
 
 // ---------- demo scene: a small house (replace) ----------
@@ -337,8 +693,9 @@ lantern('x', BACK, -1, 35 * S, LY);
 lantern('z', LEFT, -1, 30 * S, LY);
 lantern('z', RIGHT, 1, 30 * S, LY);
 STAGE = 4;
-tree(14, 38, 9, 3.5);
-tree(44, 22, 10, 4);
+prop('tree-sw', [3.8, 5, 3.8]); tree(14, 38, 9, 3.5);    // name every prop for the inspectors
+prop('tree-ne', [4, 5.5, 4.2]); tree(44, 22, 10, 4);
+prop();
 
 // =====================================================================================================
 // ENGINE: connectivity, meshes, lighting, animation (keep; tune lights/camera to the scene)
@@ -354,15 +711,26 @@ const SCRUFF = { weeds: 0.45, litter: 0.4 };
     if (foot && hash(fx, fz, 81) < SCRUFF.weeds) {
       const n = hash(fx, fz, 82) < 0.4 ? 2 : 1;
       for (let k = 1; k <= n; k++) add.push([fx, t + k, fz, pick(P.weed)]);
-      if (hash(fx, fz, 83) < 0.12) add.push([fx, t + n + 1, fz, pick([0xf2d64a, 0xffffff, 0xc89ad8])]);
+      if (hash(fx, fz, 83) < 0.12) add.push([fx, t + n + 1, fz, pick(P.flower)]);
     }
   }
-  for (const [cx, cz, r] of CANOPY)
+  for (const [cx, cz, r, pal = P.litter] of CANOPY)
     for (let fx = Math.floor((cx - r) * S); fx <= Math.ceil((cx + r) * S); fx++) for (let fz = Math.floor((cz - r) * S); fz <= Math.ceil((cz + r) * S); fz++) {
       const d = Math.hypot(dc(fx) - cx, dc(fz) - cz) / r, v = V.get(key(fx, topAt(fx, fz), fz));
-      if (v && d < 1.1 && hash(fx, fz, 84) < SCRUFF.litter * (1.1 - d)) v.c = pick(P.litter);
+      if (v && !hardAt(fx, fz) && d < 1.1 && hash(fx, fz, 84) < SCRUFF.litter * (1.1 - d)) v.c = pick(pal);
     }
+  TAG = 9;                         // scruff grass: free-standing cells the bake keeps light (no grime/streaks/side AO)
   for (const [x, y, z, c] of add) fset(x, y, z, c);
+  TAG = 0;
+}
+
+// hollow solid masses (TAG >= 6: 6 leaves, 7 animals, 8 bales/logs/crops): drop every voxel with neighbours one and
+// two cells away on all six sides, keeping a 2-cell skin that stays face-connected
+{
+  const D = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]], drop = [];
+  for (const v of V.values()) if (v.g >= 6 && D.every(([a, b, c]) => fhas(v.x + a, v.y + b, v.z + c) && fhas(v.x + 2 * a, v.y + 2 * b, v.z + 2 * c))) drop.push(v);
+  for (const v of drop) fdel(v.x, v.y, v.z);
+  console.info(`hollowed ${drop.length} interior voxels`);
 }
 
 // keep only what is connected (face to face) to one seed on the ground surface
@@ -386,7 +754,7 @@ const SCRUFF = { weeds: 0.45, litter: 0.4 };
 }
 // only lamps whose fixture still glows emit light
 const bakedLights = LAMPS.filter(l => V.get(key(...l.src))?.e === true);
-if (bakedLights.length < LAMPS.length) console.warn(`lamps without a glowing source voxel dropped: ${LAMPS.length - bakedLights.length}`, LAMPS.filter(l => !bakedLights.includes(l)));
+if (bakedLights.length < LAMPS.length) console.warn(`lamps without a glowing source voxel dropped: ${LAMPS.length - bakedLights.length} at`, LAMPS.filter(l => !bakedLights.includes(l)).map(l => `[${l.src}] ${V.get(key(...l.src))?.p ?? '-'}`).join(' '));
 
 const vox = [...V.values()];
 const LAYER = 0.28 / S;            // seconds per fine layer
@@ -434,19 +802,40 @@ renderer.setSize(innerWidth, innerHeight);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.1;
+renderer.toneMappingExposure = 0.95;
 document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-const VIEW = 40;                   // half-height of the ortho view in world units
-const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 1000);
+// Sky as a texture: call useSkyTexture(dayStops, nightStops, at) when the canvas is opaque (bloom / EffectComposer),
+// where the CSS sky and the #night overlay can't show. setSky then redraws it, lerping day -> night.
+let drawSky = null;
+function useSkyTexture(day, nightStops, at) {
+  const cv = document.createElement('canvas'); cv.width = 2; cv.height = 256;
+  scene.background = new THREE.CanvasTexture(cv);
+  scene.background.colorSpace = THREE.SRGBColorSpace;
+  let last = -1;
+  drawSky = k => {
+    if (Math.abs(k - last) < 0.004) return;
+    last = k;
+    const g = cv.getContext('2d'), gr = g.createLinearGradient(0, 0, 0, 256), a = new THREE.Color(), b = new THREE.Color();
+    at.forEach((s, i) => gr.addColorStop(s, '#' + a.set(day[i]).lerp(b.set(nightStops[i]), k).getHexString()));
+    g.fillStyle = gr; g.fillRect(0, 0, 2, 256);
+    scene.background.needsUpdate = true;
+  };
+  drawSky(0);
+}
+if (Q.get('bg') !== 'css') useSkyTexture(SKY.day, SKY.night, SKY.at);   // default sky; ?bg=css falls back to the body gradient
+const VIEW = 40;                   // half-height of the view in world units at the target (ortho frame; the perspective camera matches it)
+const FOV = 28;                    // ?cam=persp vertical field of view in degrees: modest, so verticals stay near-parallel
+const cam = CAM === 'persp' ? new THREE.PerspectiveCamera(FOV, 1, 0.1, 1000) : new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 1000);
 const controls = new OrbitControls(cam, renderer.domElement);
 controls.target.set(0, 4, 0);
 controls.enableDamping = true;
 let userMoved = false;
 controls.addEventListener('start', () => { userMoved = true; });
 const orbitBox = document.getElementById('orbit');
-const ORBIT_R = 140, ORBIT_EL = 0.36;
+const ORBIT_EL = 0.36;             // camera elevation (~21°); a hero view wants 15–25°
+const ORBIT_R = CAM === 'persp' ? VIEW / Math.tan(FOV / 2 * Math.PI / 180) : 140;   // perspective: distance that frames VIEW at the target
 function placeCamera(az) {
   cam.position.set(Math.sin(az) * Math.cos(ORBIT_EL) * ORBIT_R, 4 + Math.sin(ORBIT_EL) * ORBIT_R, Math.cos(az) * Math.cos(ORBIT_EL) * ORBIT_R);
 }
@@ -454,33 +843,50 @@ let camAz = 0.3;                   // 0 = looking at the +z (front) side
 placeCamera(camAz);
 function resize() {
   const a = innerWidth / innerHeight;
-  const v = a < 1 ? VIEW / a : VIEW;
-  cam.left = -v * a; cam.right = v * a; cam.top = v; cam.bottom = -v;
+  if (cam.isPerspectiveCamera) { cam.aspect = a; cam.zoom = Math.min(1, a); }
+  else { const v = a < 1 ? VIEW / a : VIEW; cam.left = -v * a; cam.right = v * a; cam.top = v; cam.bottom = -v; }
   cam.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
 }
 addEventListener('resize', resize); resize();
 
-const hemi = new THREE.HemisphereLight(0xdfe8f0, 0x5a6048, 1.6);
+// Light defaults for a photographic look: soft cool sky fill, a warm sun a little stronger than it, exposure 0.95.
+// Match the photo (overcast: hemi up, sun down; dusk: low warm sun from behind). setSky scales these at night.
+const LIGHT = { hemi: 1.0, sun: 1.2, sky: 0xcfdcea, ground: 0x7a7262, sunColor: 0xffe3c4 };
+const hemi = new THREE.HemisphereLight(LIGHT.sky, LIGHT.ground, LIGHT.hemi);
 scene.add(hemi);
-const sun = new THREE.DirectionalLight(0xfff2dc, 1.6);
+const sun = new THREE.DirectionalLight(LIGHT.sunColor, LIGHT.sun);
 sun.position.set(-50, 70, 40);
+// The shadow map is only for voxels in motion: once the build settles, bake() has written per-face sun shadows and
+// setLights() cross-fades to them and turns the map off (no sawtooth from projective aliasing, no shadow pass per frame).
 sun.castShadow = true;
-sun.shadow.mapSize.set(4096, 4096);
-Object.assign(sun.shadow.camera, { left: -70, right: 70, top: 70, bottom: -70, near: 1, far: 300 }); // cover the island
-sun.shadow.bias = -0.0006;
-sun.shadow.normalBias = 0.02;
+sun.shadow.mapSize.set(SHADOW_HI ? 8192 : 4096, SHADOW_HI ? 8192 : 4096);
 scene.add(sun);
+// Fit the shadow camera to the voxel bounds (fine cells; fitShadowCamera is called by bake()): the bounds' corners go
+// into light space and the frustum wraps them with a small margin, so every texel is spent on the scene. The depth
+// bias is a fraction of near..far: with the range fitted, -0.00005 is well under 0.02 world units, so contact shadows
+// meet their casters (a bias set for a 300-unit range detached every shadow by a third of a voxel).
+function fitShadowCamera(x0, y0, z0, x1, y1, z1) {
+  const view = new THREE.Matrix4().lookAt(sun.position, new THREE.Vector3(), new THREE.Vector3(0, 1, 0)).setPosition(sun.position).invert();
+  const lo = new THREE.Vector3(1e9, 1e9, 1e9), hi = new THREE.Vector3(-1e9, -1e9, -1e9), p = new THREE.Vector3(), m = 2;
+  for (const x of [x0, x1 + 1]) for (const y of [y0, y1 + 1 + 8 * S]) for (const z of [z0, z1 + 1]) {   // + 8 design units up: dropping voxels start above the scene
+    p.set(x / S - CX, y / S - GY, z / S - CZ).applyMatrix4(view); lo.min(p); hi.max(p);
+  }
+  Object.assign(sun.shadow.camera, { left: lo.x - m, right: hi.x + m, bottom: lo.y - m, top: hi.y + m, near: -hi.z - m, far: -lo.z + m });
+  sun.shadow.camera.updateProjectionMatrix();
+  sun.shadow.bias = -0.00005;
+  sun.shadow.normalBias = 0.03;
+}
 const W = (fx, fy, fz) => new THREE.Vector3((fx + 0.5) / S - CX, (fy + 0.5) / S - GY, (fz + 0.5) / S - CZ);   // fine -> world
 // real PointLights only for hero lamps (they light glass and moving voxels; each costs per pixel)
 const warmLights = bakedLights.filter(l => l.hero).map(({ fx, fy, fz, color }) => {
   const l = new THREE.PointLight(color, 10, 10, 1.5); l.position.copy(W(fx, fy, fz)); l.userData.base = 10; scene.add(l); return l;
 });
 
-// soft voxel outlines
+// voxel outlines: a near-invisible border by default (the cubes read as surfaces), the full grid behind ?grid=1
 const cv = document.createElement('canvas'); cv.width = cv.height = 32;
 const g = cv.getContext('2d');
-g.fillStyle = '#dadada'; g.fillRect(0, 0, 32, 32);
+g.fillStyle = GRID ? '#dadada' : '#f4f4f4'; g.fillRect(0, 0, 32, 32);
 g.fillStyle = '#ffffff'; g.fillRect(3, 3, 26, 26);
 const tex = new THREE.CanvasTexture(cv);
 tex.colorSpace = THREE.SRGBColorSpace;
@@ -497,18 +903,54 @@ const geo = new THREE.BoxGeometry(1, 1, 1);
 const counts = [0, 0, 0];
 for (const v of vox) { v.m = v.e === 'glass' ? 2 : v.e ? 1 : 0; v.i = counts[v.m]++; }
 // lit material: baked lamp light (per-instance attribute `lamp`, filled by bake()) is added as emission, so it shows
-// on walls the sun and sky don't reach and at night. As albedo it got multiplied by the scene light and vanished.
+// on walls the sun and sky don't reach and at night. As albedo it is multiplied by the scene light and vanishes.
 const litMat = new THREE.MeshStandardMaterial({ map: tex, roughness: 0.9 });
 const lampK = { value: 0 };
+// Baked sun shadows: bake() writes, per instance, the shadowed fraction of each axis' sun-facing face (`sunSh`); the
+// vertex shader picks the face's component by its normal and the fragment shader scales the sun's *direct* term by
+// mix(shadow-map sample, 1 - baked, sunShK). Living in the direct term, it dims with the sun at night like the map does,
+// leaves sky fill and lamp emission alone, and a shadowed spot stays shadowed through the cross-fade (0 either way).
+const sunShK = { value: 0 };
+const LIGHTS_FRAG = (() => {
+  const src = THREE.ShaderChunk.lights_fragment_begin, info = 'getDirectionalLightInfo( directionalLight, directLight );';
+  const a = src.indexOf(info), b = src.indexOf('RE_Direct(', a);
+  if (a < 0 || b < 0 || !src.includes('DirectionalLight directionalLight;')) { console.warn('baked sun shadows: lights_fragment_begin changed, hook skipped'); return src; }
+  return src.slice(0, a).replace('DirectionalLight directionalLight;', 'DirectionalLight directionalLight;\n\tfloat sunMap;')
+    + info + '\n\t\tsunMap = 1.0;'
+    + src.slice(a + info.length, b).replace('directLight.color *= ( directLight.visible && receiveShadow ) ? getShadow(', 'sunMap = ( directLight.visible && receiveShadow ) ? getShadow(')
+    + 'directLight.color *= mix( sunMap, 1.0 - vSunSh, sunShK );\n\t\t' + src.slice(b);
+})();
+// Depth fade (aerial haze): the final colour blends toward the sky's horizon band by depth along the camera's view axis
+// (vViewPosition.z, so it works for the orthographic and the perspective camera). It starts `near` world units in front
+// of the target depth and reaches `strength` at `far` behind it. Per-normal tint: top faces take a little sky colour,
+// sides are slightly cooler and darker, undersides darker still, so the cubes read as lit surfaces rather than flat paint.
+const HAZE = { strength: 0.32, near: -12, far: 55 };
+const raw = h => new THREE.Color((h >> 16 & 255) / 255, (h >> 8 & 255) / 255, (h & 255) / 255);   // hex -> output-space components, no conversion
+const HAZE_DAY = raw(SKY.day[2]), HAZE_NIGHT = raw(SKY.night[2]);
+const hazeU = { hazeCol: { value: HAZE_DAY.clone() }, hazeC: { value: 140 }, hazeK: { value: HAZE.strength }, hazeNear: { value: HAZE.near }, hazeFar: { value: HAZE.far }, skyTint: { value: hemi.color } };
 litMat.onBeforeCompile = sh => {
   sh.uniforms.lampK = lampK;
-  sh.vertexShader = sh.vertexShader.replace('#include <common>', '#include <common>\nattribute vec3 lamp;\nvarying vec3 vLamp;')
-    .replace('#include <begin_vertex>', '#include <begin_vertex>\nvLamp = lamp;');
-  sh.fragmentShader = sh.fragmentShader.replace('#include <common>', '#include <common>\nvarying vec3 vLamp;\nuniform float lampK;')
-    .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\ntotalEmissiveRadiance += diffuseColor.rgb * vLamp * lampK;');
+  sh.uniforms.sunShK = sunShK;
+  Object.assign(sh.uniforms, hazeU);
+  sh.vertexShader = sh.vertexShader.replace('#include <common>', '#include <common>\nattribute vec3 lamp;\nattribute vec3 sunSh;\nvarying vec3 vLamp;\nvarying float vNy;\nvarying float vSunSh;')
+    .replace('#include <begin_vertex>', '#include <begin_vertex>\nvLamp = lamp;\nvNy = normal.y;\nvSunSh = dot(abs(normal), sunSh);');
+  sh.fragmentShader = sh.fragmentShader.replace('#include <common>', '#include <common>\nvarying vec3 vLamp;\nvarying float vNy;\nvarying float vSunSh;\nuniform float lampK;\nuniform float sunShK;\nuniform vec3 hazeCol;\nuniform vec3 skyTint;\nuniform float hazeC, hazeK, hazeNear, hazeFar;')
+    .replace('#include <lights_fragment_begin>', LIGHTS_FRAG)
+    .replace('#include <color_fragment>', `#include <color_fragment>
+  {
+    float up = clamp(vNy, 0.0, 1.0), down = clamp(-vNy, 0.0, 1.0);
+    vec3 skyN = skyTint / max(0.001, max(skyTint.r, max(skyTint.g, skyTint.b)));
+    vec3 nt = mix(vec3(0.93, 0.945, 0.985), mix(vec3(1.0), skyN, 0.22) * 1.03, up);
+    nt = mix(nt, vec3(0.82, 0.84, 0.9), down);
+    diffuseColor.rgb *= nt;
+  }`)
+    .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\ntotalEmissiveRadiance += diffuseColor.rgb * vLamp * lampK;')
+    .replace('#include <colorspace_fragment>', `#include <colorspace_fragment>
+  gl_FragColor.rgb = mix(gl_FragColor.rgb, hazeCol, hazeK * smoothstep(hazeC + hazeNear, hazeC + hazeFar, vViewPosition.z));`);
 };
 const litGeo = geo.clone();
 litGeo.setAttribute('lamp', new THREE.InstancedBufferAttribute(new Float32Array(Math.max(1, counts[0]) * 3), 3));
+litGeo.setAttribute('sunSh', new THREE.InstancedBufferAttribute(new Float32Array(Math.max(1, counts[0]) * 3), 3));   // per axis: shadow on the sun-facing face
 const meshes = [litMat, glowMat, glassMat].map((mat, m) => {
   const mesh = new THREE.InstancedMesh(m === 0 ? litGeo : geo, mat, Math.max(1, counts[m]));
   mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
@@ -527,14 +969,24 @@ for (const v of vox) {
 // ---------- bake: ambient occlusion into the lit mesh's instance colours, baked lamps into its `lamp` attribute ----------
 // AO: from every exposed face cast 9 short rays (normal ± tangents) through an occupancy grid; near hits
 // darken. Openings, eaves, porches and corners get depth for free. Glass does not occlude.
+// Sun shadows: from every exposed face that faces the sun, 3 slightly jittered rays toward the sun (up to sunReach design
+// units; glass and glow voxels don't occlude); the shadowed fraction goes to the `sunSh` attribute per face and the shader
+// darkens the sun's direct term by sunShadow × that once the build settles (1 = as dark as the shadow map; lower lets a
+// little sun leak into the shade as fake bounce). Shadows start at the caster's foot and follow the voxel grid exactly.
 // Returns A = weathered + AO colours; the lamp light goes to the `lamp` attribute, faded in by setLights().
 // gain: lamp emission strength (emission ignores sun/sky, so it reads the same on shaded walls and at night).
-const BAKE = { ao: 0.6, reach: 8, gain: 1 };
+const BAKE = { ao: 0.6, reach: 8, gain: 1, sunShadow: 1, sunReach: 30 };
 // Weathering: nothing real is evenly coloured. Broad blotches, odd stones/boards off-shade, grime splashed
 // up the foot of walls, rain streaks down them, moss on what faces the sky. Strengths 0 = off.
-const WEATHER = { patch: 0.14, speckle: 0.12, grime: 0.35, grimeH: 1.8, streak: 0.14, moss: 0.35 };
-const GRIME = new THREE.Color(0x4f4a34), MOSS = new THREE.Color(0x587a2e);
+// hue: each blotch also drifts slightly warm or cool, so large same-material areas are not one flat tone.
+const WEATHER = { patch: 0.14, hue: 0.06, speckle: 0.12, grime: 0.35, grimeH: 1.8, streak: 0.14, moss: 0.2 };
+const GRIME = new THREE.Color(0x4f4a34), MOSS = new THREE.Color(0x5e7540);
 function weather(v, fn, r, g, b) {
+  if (v.g === 7) return [r, g, b];                              // animals stay clean: AO only
+  if (v.g === 9) {                                              // scruff grass: blotch and hue drift only, never grime or moss
+    const m = 1 + (vnoise(v.x, v.z, 7 * S, 91) - 0.5) * 2 * WEATHER.patch, hd = (vnoise(v.x, v.z, 9 * S, 95) - 0.5) * 2 * WEATHER.hue;
+    return [r * m * (1 + hd), g * m, b * m * (1 - hd)];
+  }
   const side = fn.some(n => n[1] === 0), up = fn.some(n => n[1] === 1);
   const h = (v.y - topAt(v.x, v.z)) / S;                        // design units above the local ground
   let m = 1 + (vnoise(v.x + v.y * 0.7, v.z - v.y * 0.5, 7 * S, 91) - 0.5) * 2 * WEATHER.patch;
@@ -543,9 +995,11 @@ function weather(v, fn, r, g, b) {
   let tk = 0, tint = GRIME;
   if (side && h >= 0.5 && h < WEATHER.grimeH + 0.5) tk = WEATHER.grime * (1 - (h - 0.5) / WEATHER.grimeH) * (0.5 + vnoise(v.x + v.z, v.y, 3, 92));
   const mo = vnoise(v.x, v.z, 4 * S, 94);
-  if (up && h > 1 && mo > 0.6) { tk = Math.min(0.6, WEATHER.moss * (mo - 0.6) / 0.4 * 2.2); tint = MOSS; }
+  // no moss on props (STAGE 4) other than leaves (TAG 6): it tints iron lantern caps green
+  if (up && h > 1 && mo > 0.6 && !(v.st === 4 && v.g !== 6)) { tk = Math.min(0.6, WEATHER.moss * (mo - 0.6) / 0.4 * 2.2); tint = MOSS; }
   tk = Math.max(0, Math.min(0.6, tk));
-  return [r * m * (1 - tk) + tint.r * tk, g * m * (1 - tk) + tint.g * tk, b * m * (1 - tk) + tint.b * tk];
+  const hd = (vnoise(v.x - v.y * 0.4, v.z + v.y * 0.6, 9 * S, 95) - 0.5) * 2 * WEATHER.hue;   // per-blotch hue drift: + warm, − cool
+  return [r * m * (1 + hd) * (1 - tk) + tint.r * tk, g * m * (1 - tk) + tint.g * tk, b * m * (1 - hd) * (1 - tk) + tint.b * tk];
 }
 function bake() {
   const t0 = performance.now();
@@ -566,6 +1020,33 @@ function bake() {
   const lights = bakedLights.map(l => ({ ...l, x: l.fx, y: l.fy, z: l.fz, r: l.r * S, col: new THREE.Color(l.color) }));
   const base = meshes[0].instanceColor.array, A = new Float32Array(base), LL = meshes[0].geometry.attributes.lamp.array;
   const L = BAKE.reach * S / 2, hits = lights.map(() => 0);
+  // sun rays per face: origin just off the face (centre and two tangent offsets), direction the sun's, the off-centre rays
+  // tilted a little so the edge isn't binary. Each ray walks the grid cell by cell (3D DDA), so a one-cell tuft that a
+  // ray only clips still shadows its neighbour; stepping and rounding misses it and leaves small shadows faint.
+  const SD = sun.position.clone().normalize(), SS = meshes[0].geometry.attributes.sunSh.array;   // world axes = fine-grid axes
+  const sunReach = BAKE.sunReach * S;
+  const SUN = N.map(n => {
+    if (n[0] * SD.x + n[1] * SD.y + n[2] * SD.z <= 0) return null;                            // faces away from the sun: dark anyway
+    const ax = n.findIndex(c => c !== 0), [ta, tb] = [0, 1, 2].filter(i => i !== ax);
+    return { ax, rays: [[0, 0, 0], [0.3, 0.3, 0.02], [-0.3, -0.3, -0.02]].map(([ja, jb, jt]) => {
+      const o = n.map(c => c * 0.501), d = [SD.x, SD.y, SD.z]; o[ta] += ja; o[tb] += jb; d[ta] += jt;   // 0.501: start inside the empty neighbour
+      const len = Math.hypot(...d), u = d.map(c => c / len);
+      return { o, s: u.map(Math.sign), dt: u.map(c => c ? Math.abs(1 / c) : Infinity), u };
+    }) };
+  });
+  const sunRay = (ox, oy, oz, r) => {                                     // 1 if the ray from (ox, oy, oz) hits a lit voxel within reach
+    let cx = Math.round(ox), cy = Math.round(oy), cz = Math.round(oz), t = 0;
+    let tx = r.u[0] ? (cx + r.s[0] * 0.5 - ox) / r.u[0] : Infinity, ty = r.u[1] ? (cy + r.s[1] * 0.5 - oy) / r.u[1] : Infinity, tz = r.u[2] ? (cz + r.s[2] * 0.5 - oz) / r.u[2] : Infinity;
+    while (t < sunReach) {
+      if (tx < ty && tx < tz) { cx += r.s[0]; t = tx; tx += r.dt[0]; }
+      else if (ty < tz) { cy += r.s[1]; t = ty; ty += r.dt[1]; }
+      else { cz += r.s[2]; t = tz; tz += r.dt[2]; }
+      if (!inB(cx, cy, cz)) return 0;                                       // left the scene: nothing more to hit
+      if (occ[gi(cx, cy, cz)] === 1) return 1;
+    }
+    return 0;
+  };
+  let sunT = 0, sunFaces = 0;
   for (const v of vox) {
     if (v.m !== 0) continue;
     const fn = [];
@@ -574,6 +1055,13 @@ function bake() {
       const n = N[f];
       if (solid(v.x + n[0], v.y + n[1], v.z + n[2])) continue;
       fn.push(n);
+      const su = SUN[f];
+      if (su) {                                                     // sun shadow on this face: fraction of rays that hit a lit voxel
+        let sh = 0;
+        for (const r of su.rays) sh += sunRay(v.x + r.o[0], v.y + r.o[1], v.z + r.o[2], r);
+        SS[v.i * 3 + su.ax] = sh / su.rays.length; sunFaces++; sunT += sh;
+      }
+      if (v.g === 9 && n[1] !== 1) continue;                      // scruff grass: only the top face is occluded (a tuft's sides see the lawn one cell away)
       for (const d of RAYS[f]) for (let k = 1; k <= L; k++) if (solid(v.x + d[0] * k, v.y + d[1] * k, v.z + d[2] * k)) { occl += 1 - (k - 1) / L; break; }
     }
     if (!fn.length) continue;                                     // hidden voxel: leave as is
@@ -582,6 +1070,7 @@ function bake() {
     for (let li = 0; li < lights.length; li++) {
       const l = lights[li], dx = l.x - v.x, dy = l.y - v.y, dz = l.z - v.z, dist = Math.hypot(dx, dy, dz);
       if (dist > l.r || dist < 0.5) continue;
+      if (l.shadow === false && v.y < topAt(v.x, v.z) - S) continue;   // shadowless lamps (fire in steam) must not shine through the island
       let face = 0, nb = fn[0];
       for (const n of fn) { const f = (n[0] * dx + n[1] * dy + n[2] * dz) / dist; if (f > face) { face = f; nb = n; } }
       if (face <= 0) continue;
@@ -604,11 +1093,25 @@ function bake() {
     A[o] = w[0] * ao; A[o + 1] = w[1] * ao; A[o + 2] = w[2] * ao;
     LL[o] = lr / ao; LL[o + 1] = lg / ao; LL[o + 2] = lb / ao;      // the shader multiplies by the AO'd colour; lamps aren't occluded twice
   }
+  meshes[0].geometry.attributes.sunSh.needsUpdate = true;
+  fitShadowCamera(x0, y0, z0, x1, y1, z1);
   const dark = hits.map((n, i) => n < 20 ? i : -1).filter(i => i >= 0);
-  console.info(`bake: ${Math.round(performance.now() - t0)} ms, ${lights.length} baked lamps, lit voxels per lamp ~${Math.round(hits.reduce((a, b) => a + b, 0) / Math.max(1, hits.length))}` + (dark.length ? `; lamps reaching almost nothing (inside geometry?): ${dark.join(', ')}` : ''));
+  console.info(`bake: ${Math.round(performance.now() - t0)} ms, ${lights.length} baked lamps, lit voxels per lamp ~${Math.round(hits.reduce((a, b) => a + b, 0) / Math.max(1, hits.length))}, sun-facing faces in shadow ${Math.round(100 * sunT / Math.max(1, 3 * sunFaces))}%` + (dark.length ? `; lamps reaching almost nothing (inside geometry?): ${dark.join(', ')}` : ''));
   return A;
 }
 const colA = bake();
+// palette lint: photographic colours are muted. Warn for every P colour with sRGB saturation above 0.4 or lightness
+// outside 0.12–0.85; keys in ACCENT are exempt. Fix the palette (resample the photo), don't silence the warning.
+{
+  const c = new THREE.Color(), hsl = {}, bad = [];
+  for (const k in P) if (!ACCENT.has(k)) for (const h of [].concat(P[k])) {
+    if (typeof h !== 'number') continue;
+    c.setHex(h).getHSL(hsl, THREE.SRGBColorSpace);
+    if (hsl.s > 0.4 || hsl.l < 0.12 || hsl.l > 0.85) bad.push(`P.${k} #${h.toString(16).padStart(6, '0')} s ${hsl.s.toFixed(2)} l ${hsl.l.toFixed(2)}`);
+  }
+  if (bad.length) console.warn(`palette lint: ${bad.length} colour(s) outside the photographic range (s <= 0.4, 0.12 <= l <= 0.85):\n` + bad.join('\n'));
+  else console.info('palette lint: ok');
+}
 let bakeK = -1, bakeForce = null;
 function blendBake(k) {                                         // lamps off (0) .. on (1+); bakeK -1 rewrites the colours
   if (bakeForce !== null) k = bakeForce;
@@ -731,7 +1234,7 @@ head.visible = false;
 group.add(head);
 
 // blueprint intro: an outline of every exposed voxel above the ground, shown for BLUEPRINT s before the build.
-// Slightly smaller than a voxel, so once the real ones land they hide it.
+// Slightly smaller than a voxel, so when the real ones land they hide it.
 const BLUEPRINT = 2.5;
 const ghost = (() => {
   const c = document.createElement('canvas'); c.width = c.height = 32;
@@ -787,7 +1290,7 @@ function startDemolish() {
   first = COUNT; if (doneAt < 0) doneAt = t;
   demoAt = t;
 }
-function demolish(d) {               // returns false once everything has fallen
+function demolish(d) {               // returns false when everything has fallen
   let live = false;
   for (let i = 0; i < COUNT; i++) {
     const r = d - REL[i];
@@ -844,21 +1347,33 @@ function pile(d) {                  // returns false when the heap has rebuilt t
 }
 // sky=night: dusk falls a couple of seconds after the build; glow and hero lights are pushed past 1 to stay bright
 const nightDiv = document.getElementById('night'), DAY_HEMI = hemi.color.clone(), NIGHT_HEMI = new THREE.Color(0x8ea4d6);
-let night = 0;
+let night = 0, nightForce = null;
 function setSky(dt) {
   const want = ANIM.sky === 'night' && doneAt >= 0 && demoAt < 0 && pileAt < 0 && t - doneAt > 2 ? 1 : 0;
   night += (want - night) * Math.min(1, dt * 0.45);
+  if (nightForce !== null) night = nightForce;
   nightDiv.style.opacity = night.toFixed(3);
   document.body.classList.toggle('dark', night > 0.5);
-  hemi.intensity = 1.6 * (1 - 0.72 * night);
+  hemi.intensity = LIGHT.hemi * (1 - 0.72 * night);
   hemi.color.copy(DAY_HEMI).lerp(NIGHT_HEMI, night);
-  sun.intensity = 1.6 * (1 - 0.88 * night);
+  sun.intensity = LIGHT.sun * (1 - 0.88 * night);
   glassMat.envMapIntensity = 0.9 * (1 - 0.85 * night);          // the studio env's light bars read as things behind the glass at night
+  hazeU.hazeCol.value.copy(HAZE_DAY).lerp(HAZE_NIGHT, night);
+  if (drawSky) drawSky(night);
 }
-function setLights(k) {            // dim while building, full once complete
+let shadowK = 0, shadowForce = null;   // sun shadows: 0 = shadow map (voxels in motion), 1 = baked per-face (settled scene)
+function setLights(k, settled, dt) {   // dim while building, full when complete; settled: every voxel has landed and nothing is flying
   warmLights.forEach(l => { l.intensity = l.userData.base * k; });
   glowMat.color.setScalar(0.35 + 0.65 * k);
   blendBake(Math.min(1, k));       // baked lamps are emissive: no night boost needed, the dark around them does it
+  // Cross-fade the sun's shadow from the map to the bake over ~1 s after the build settles, fast back when anything moves.
+  // Both scale the same direct term, so the mix never doubles a shadow; the map is switched off once the bake carries it
+  // (no shadow pass per frame, and no projective sawtooth), and back on for any motion so flying voxels keep casting.
+  const want = shadowForce ?? (settled ? 1 : 0);
+  shadowK += (want - shadowK) * Math.min(1, dt * (want > shadowK ? 2.5 : 10));
+  if (Math.abs(want - shadowK) < 0.01) shadowK = want;
+  sunShK.value = BAKE.sunShadow * shadowK;
+  sun.castShadow = shadowK < 1;
 }
 
 const bar = document.querySelector('#bar i');
@@ -896,8 +1411,78 @@ for (const k in ANIM) {
 window.__seeAz = az => { camAz = az; placeCamera(az); };   // frame any side when testing
 window.__zoom = (z, x = 0, y = 4, zz = 0) => { cam.zoom = z; cam.updateProjectionMatrix(); controls.target.set(x, y, zz); };   // close-ups (world units)
 window.__lamps = bakedLights;                                    // the lamps that made it into the bake
+// per-prop report for the inspectors: measured size in metres vs the declared real size, lamps, glow voxels
+{
+  const R = {}, cell = M_PER_UNIT / S;
+  for (const v of vox) if (v.p) {
+    const r = R[v.p] ||= { n: 0, glow: 0, glass: 0, lamps: 0, x0: 1e9, y0: 1e9, z0: 1e9, x1: -1e9, y1: -1e9, z1: -1e9 };
+    r.n++; if (v.e === true) r.glow++; if (v.e === 'glass') r.glass++;
+    r.x0 = Math.min(r.x0, v.x); r.y0 = Math.min(r.y0, v.y); r.z0 = Math.min(r.z0, v.z);
+    r.x1 = Math.max(r.x1, v.x); r.y1 = Math.max(r.y1, v.y); r.z1 = Math.max(r.z1, v.z);
+  }
+  for (const l of bakedLights) { const p = V.get(key(...l.src))?.p; if (R[p]) R[p].lamps++; }
+  for (const name in PROPS) {
+    const r = R[name];
+    if (!r) { console.warn(`prop ${name}: no voxels left`); continue; }
+    r.m = [r.x1 - r.x0 + 1, r.y1 - r.y0 + 1, r.z1 - r.z0 + 1].map(d => +(d * cell).toFixed(2));   // x, y (height), z
+    r.centre = W((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2, (r.z0 + r.z1) / 2).toArray().map(c => +c.toFixed(1));
+    r.issues = [];
+    const real = PROPS[name].real;
+    if (real) {   // compare sorted footprint dims and the height; one cell of rounding is allowed
+      const [a, b] = [[r.m[0], r.m[2]].sort((p, q) => p - q), [real[0], real[2]].sort((p, q) => p - q)];
+      r.scale = [a[0] / b[0], r.m[1] / real[1], a[1] / b[1]].map(k => +k.toFixed(2));
+      [[a[0], b[0]], [r.m[1], real[1]], [a[1], b[1]]].forEach(([m, t], i) => {
+        if (m < t - cell || m > t * 1.2 + cell) r.issues.push(`${['width', 'height', 'length'][i]} ${m} m vs real ${t} m`);
+      });
+    }
+    if (r.glow && !r.lamps) r.issues.push(`${r.glow} glowing voxels but no lamp: it glows without lighting anything`);
+    if (r.issues.length) console.warn(`prop ${name}:`, r.issues.join('; '));
+  }
+  window.__props = R;
+}
+// frame one prop for a close-up: side angle (default: current), padding around its bounding box
+window.__seeProp = (name, az = camAz, pad = 1.8) => {
+  const r = window.__props[name];
+  if (!r) return `no prop ${name}`;
+  orbitBox.checked = false; userMoved = false;
+  __seeAz(az);
+  __zoom(VIEW / (Math.max(...r.m) / M_PER_UNIT / 2 * pad + 1), ...r.centre);
+  return r;
+};
+window.__night = k => { nightForce = k ?? null; };            // force the sky (0 day .. 1 night) for checks; no arg: automatic
 window.__hero = on => warmLights.forEach(l => { l.visible = on; });   // hero PointLights on/off for comparison
+// photo comparison: overlays the reference photo (object-fit: cover) at `opacity` over the render and prints the mean colour
+// of each 3×3 screen region for render and photo (hex, sRGB saturation/lightness, and the differences). Frame the camera
+// at the photo's angle first (__seeAz, drag), then __compare('ref/house.webp'); __compare() removes the overlay.
+window.__compare = (src, opacity = 0.5) => new Promise((resolve, reject) => {
+  let ov = document.getElementById('cmp');
+  if (!src) { ov?.remove(); return resolve(null); }
+  if (!ov) { ov = document.createElement('img'); ov.id = 'cmp'; Object.assign(ov.style, { position: 'fixed', inset: 0, width: '100%', height: '100%', objectFit: 'cover', pointerEvents: 'none', zIndex: 1 }); document.body.appendChild(ov); }
+  ov.style.opacity = opacity; ov.src = src;
+  const img = new Image();
+  img.onload = () => {
+    const w = renderer.domElement.width, h = renderer.domElement.height;
+    const grab = draw => { const c = document.createElement('canvas'); c.width = w; c.height = h; const g = c.getContext('2d', { willReadFrequently: true }); draw(g); return g.getImageData(0, 0, w, h).data; };
+    renderer.render(scene, cam);                                                   // read the frame right after rendering it
+    const R = grab(g => g.drawImage(renderer.domElement, 0, 0));
+    const sc = Math.max(w / img.naturalWidth, h / img.naturalHeight), iw = img.naturalWidth * sc, ih = img.naturalHeight * sc;   // cover
+    const F = grab(g => g.drawImage(img, (w - iw) / 2, (h - ih) / 2, iw, ih));
+    const c = new THREE.Color(), hsl = {}, rows = [];
+    const mean = (d, x0, y0, x1, y1) => { let r = 0, g = 0, b = 0, n = 0; for (let y = y0; y < y1; y += 4) for (let x = x0; x < x1; x += 4) { const o = (y * w + x) * 4; r += d[o]; g += d[o + 1]; b += d[o + 2]; n++; } return [r / n, g / n, b / n]; };
+    const fmt = ([r, g, b]) => { c.setRGB(r / 255, g / 255, b / 255, THREE.SRGBColorSpace).getHSL(hsl, THREE.SRGBColorSpace); return { hex: '#' + c.getHexString(), s: +hsl.s.toFixed(2), l: +hsl.l.toFixed(2) }; };
+    for (let j = 0; j < 3; j++) for (let i = 0; i < 3; i++) {
+      const box = [Math.floor(i * w / 3), Math.floor(j * h / 3), Math.floor((i + 1) * w / 3), Math.floor((j + 1) * h / 3)];
+      const a = fmt(mean(R, ...box)), b = fmt(mean(F, ...box));
+      rows.push({ region: `${['top', 'mid', 'bottom'][j]}-${['left', 'centre', 'right'][i]}`, render: a.hex, photo: b.hex, 'render s/l': `${a.s} / ${a.l}`, 'photo s/l': `${b.s} / ${b.l}`, ds: +(a.s - b.s).toFixed(2), dl: +(a.l - b.l).toFixed(2) });
+    }
+    console.table(rows);
+    resolve(rows);
+  };
+  img.onerror = () => reject(new Error('__compare: could not load ' + src));
+  img.src = src;
+});
 window.__bake = on => { bakeForce = on === undefined ? null : on ? 1 : 0; };   // force baked lamps on/off for comparison (no arg: auto)
+window.__shadow = m => { shadowForce = m === 'map' ? 0 : m === 'bake' ? 1 : null; return { k: shadowK, castShadow: sun.castShadow }; };   // force the sun's shadow source: 'map', 'bake', or auto (no arg); returns the current state
 
 const clock = new THREE.Clock();
 renderer.setAnimationLoop(() => {
@@ -914,15 +1499,16 @@ renderer.setAnimationLoop(() => {
   }
   head.visible = ANIM.order === 'scan' && t >= 0 && first < COUNT && demoAt < 0;
   if (head.visible) head.position.y = minY + Math.min(maxY - minY, Math.floor(t / SCAN)) + 0.55;
-  // blueprint: fade in during the lead-in, hold through the build, fade out once complete
+  // blueprint: fade in during the lead-in, hold through the build, fade out when complete
   const bp = ANIM.intro !== 'blueprint' || demoAt >= 0 || pileAt >= 0 ? 0
     : t < 0 ? Math.min(1, (t + BLUEPRINT) / 0.8) : doneAt < 0 ? 1 : Math.max(0, 1 - (t - doneAt) / 1.2);
   ghost.visible = bp > 0; ghost.material.opacity = bp;
   setSky(dt);
   const out = demoAt >= 0 ? demoAt : pileAt;
   setLights((out >= 0 ? Math.max(0.15, 1 - (t - out) * 0.85)
-    : doneAt < 0 ? 0.15 : 0.15 + 0.85 * Math.min(1, (t - doneAt) / 1.5)) * (1 + 1.2 * night));
+    : doneAt < 0 ? 0.15 : 0.15 + 0.85 * Math.min(1, (t - doneAt) / 1.5)) * (1 + 1.2 * night), out < 0 && doneAt >= 0 && first >= COUNT, dt);
   controls.update();
+  hazeU.hazeC.value = cam.position.distanceTo(controls.target);   // depth of the target along the view axis
   renderer.render(scene, cam);
 });
 </script>

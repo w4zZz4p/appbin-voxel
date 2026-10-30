@@ -10,7 +10,7 @@
   #wrap canvas { max-width: 100%; display: block; }
   .crop { position: absolute; border: 2px solid #ff2d6f; color: #fff; background: rgba(255,45,111,.12); font-weight: 600; text-shadow: 0 0 3px #000; padding: 1px 3px; box-sizing: border-box; }
   .row { display: flex; gap: 6px; align-items: center; margin: 4px 0; }
-  .sw { width: 64px; height: 22px; border-radius: 3px; font-size: 10px; display: flex; align-items: end; justify-content: center; color: #fff; text-shadow: 0 0 2px #000; }
+  .sw { width: 92px; height: 34px; border-radius: 3px; font-size: 10px; line-height: 1.2; display: flex; align-items: end; justify-content: center; text-align: center; color: #fff; text-shadow: 0 0 2px #000; }
   pre { background: #fff; padding: 8px; border-radius: 6px; white-space: pre-wrap; }
 </style>
 </head>
@@ -21,8 +21,10 @@
     palette-sampler.html?img=../../../ref/house.webp
       &crops=stone:0.20,0.45,0.30,0.60;roof:0.35,0.36,0.45,0.40;lawn:0.10,0.82,0.90,0.98
       &sky=0.40,0.60,0.45     (x range to average for the sky gradient, optional bottom y; default: down to the first crop)
-      &k=4                    (clusters per crop)
+      &k=5                    (clusters per crop; 5–6 is the useful range, default 5)
   Crops are fractions of width/height: x0,y0,x1,y1. Result: on the page, and as JSON in window.__palette.
+  Each cluster carries hex, share and hsl [h 0–360, s 0–1, l 0–1]; a cluster with s > 0.4 or l outside 0.12–0.85 is marked
+  '!' — scene palettes stay inside that range (see the skill's reference/colour-and-materials.md).
 -->
 <div id="wrap"><canvas id="cv"></canvas></div>
 <div id="out"></div>
@@ -31,6 +33,15 @@
 const q = new URLSearchParams(location.search);
 const hex = c => '#' + c.map(v => Math.round(v).toString(16).padStart(2, '0')).join('');
 const lum = c => 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+function hsl(c) {                              // sRGB [r,g,b] 0–255 -> [h deg, s, l]
+  const r = c[0] / 255, g = c[1] / 255, b = c[2] / 255, mx = Math.max(r, g, b), mn = Math.min(r, g, b), l = (mx + mn) / 2, d = mx - mn;
+  if (d < 1e-6) return [0, 0, +l.toFixed(2)];
+  const s = d / (1 - Math.abs(2 * l - 1));
+  let h = mx === r ? ((g - b) / d) % 6 : mx === g ? (b - r) / d + 2 : (r - g) / d + 4;
+  h = Math.round(((h * 60) + 360) % 360);
+  return [h, +s.toFixed(2), +l.toFixed(2)];
+}
+const muted = ([h, s, l]) => s <= 0.4 && l >= 0.12 && l <= 0.85;
 function kmeans(px, k) {                       // px: [[r,g,b]], returns [{c, share}] sorted by share
   if (!px.length) return [];
   const sorted = [...px].sort((a, b) => lum(a) - lum(b));
@@ -47,7 +58,7 @@ function kmeans(px, k) {                       // px: [[r,g,b]], returns [{c, sh
     cs = sum.map((s, j) => s[3] ? [s[0] / s[3], s[1] / s[3], s[2] / s[3]] : cs[j]);
   }
   const n = cs.map(() => 0); lab.forEach(l => n[l]++);
-  return cs.map((c, j) => ({ hex: hex(c), share: +(n[j] / px.length).toFixed(2) })).filter(c => c.share > 0.03).sort((a, b) => b.share - a.share);
+  return cs.map((c, j) => ({ hex: hex(c), share: +(n[j] / px.length).toFixed(2), hsl: hsl(c) })).filter(c => c.share > 0.03).sort((a, b) => b.share - a.share);
 }
 const img = new Image();
 img.onload = () => {
@@ -58,7 +69,7 @@ img.onload = () => {
   const at = (x, y) => { const o = (y * W + x) * 4; return [data[o], data[o + 1], data[o + 2]]; };
   const result = { crops: {}, sky: [] };
   const out = document.getElementById('out'), wrap = document.getElementById('wrap');
-  const k = parseInt(q.get('k')) || 4;
+  const k = parseInt(q.get('k')) || 5;
   let firstY = 1;
   for (const part of (q.get('crops') || '').split(';').filter(Boolean)) {
     const [name, r] = part.split(':'), [x0, y0, x1, y1] = r.split(',').map(Number);
@@ -70,7 +81,7 @@ img.onload = () => {
     d.className = 'crop'; d.textContent = name;
     Object.assign(d.style, { left: x0 * 100 + '%', top: y0 * 100 + '%', width: (x1 - x0) * 100 + '%', height: (y1 - y0) * 100 + '%' });
     wrap.appendChild(d);
-    out.insertAdjacentHTML('beforeend', `<div class="row"><b style="width:70px">${name}</b>${result.crops[name].map(c => `<div class="sw" style="background:${c.hex}">${c.hex} ${Math.round(c.share * 100)}%</div>`).join('')}</div>`);
+    out.insertAdjacentHTML('beforeend', `<div class="row"><b style="width:70px">${name}</b>${result.crops[name].map(c => `<div class="sw" style="background:${c.hex}" title="hsl(${c.hsl[0]} ${Math.round(c.hsl[1] * 100)}% ${Math.round(c.hsl[2] * 100)}%)">${c.hex} ${Math.round(c.share * 100)}%<br>h${c.hsl[0]} s${c.hsl[1]} l${c.hsl[2]}${muted(c.hsl) ? '' : ' !'}</div>`).join('')}</div>`);
   }
   const sky = q.get('sky');
   if (sky) {                                    // 8 gradient stops from the top of the photo down to the first crop
@@ -79,7 +90,8 @@ img.onload = () => {
       const y = Math.round(i / 7 * yEnd * (H - 1)), acc = [0, 0, 0];
       let n = 0;
       for (let x = Math.round(sx0 * W); x < sx1 * W; x += 2) { const c = at(x, y); acc[0] += c[0]; acc[1] += c[1]; acc[2] += c[2]; n++; }
-      result.sky.push({ at: Math.round(i / 7 * 100) + '%', hex: hex(acc.map(v => v / n)) });
+      const m = acc.map(v => v / n);
+      result.sky.push({ at: Math.round(i / 7 * 100) + '%', hex: hex(m), hsl: hsl(m) });
     }
     out.insertAdjacentHTML('beforeend', `<div class="row"><b style="width:70px">sky</b>${result.sky.map(s => `<div class="sw" style="background:${s.hex}">${s.hex}</div>`).join('')}</div>`);
     result.css = `linear-gradient(${result.sky.map(s => `${s.hex} ${s.at}`).join(', ')})`;

@@ -1,0 +1,2175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neon District</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; font-family: system-ui, sans-serif; }
+  body { background: linear-gradient(#3a585f 0%, #496366 50%, #597579 100%); } /* sky fallback; the canvas is opaque (bloom), the SKY texture shows */
+  canvas { display: block; position: relative; z-index: 1; }
+  #night { position: fixed; inset: 0; opacity: 0; pointer-events: none; background: linear-gradient(#0b141c 0%, #14222c 55%, #22343c 100%); } /* sky=night fades this in */
+  #ui { z-index: 2; position: fixed; left: 16px; bottom: 16px; display: flex; gap: 8px; align-items: center; color: #2c3336; font-size: 13px; flex-wrap: wrap; }
+  #ui button { background: rgba(255,255,255,.5); color: #222; border: 1px solid rgba(0,0,0,.15); border-radius: 6px; padding: 6px 12px; cursor: pointer; font: inherit; }
+  #ui button:hover { background: rgba(255,255,255,.75); }
+  #ui select { background: rgba(255,255,255,.5); color: #222; border: 1px solid rgba(0,0,0,.15); border-radius: 6px; padding: 5px 6px; font: inherit; cursor: pointer; }
+  #bar { width: 160px; height: 4px; background: rgba(0,0,0,.15); border-radius: 2px; overflow: hidden; }
+  #bar i { display: block; height: 100%; width: 0; background: #d98a2e; }
+  #ui.hidden { display: none; }
+  body.dark #ui { color: #dfe6f2; }
+  body.dark #ui button, body.dark #ui select { background: rgba(20,30,55,.6); color: #e6ecf5; border-color: rgba(255,255,255,.2); }
+  label { display: flex; gap: 4px; align-items: center; user-select: none; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="night"></div>
+<div id="ui">
+  <button id="replay">Replay (R)</button>
+  <button id="pause">Pause (Space)</button>
+  <label><input type="checkbox" id="loop" checked> Loop</label>
+  <label><input type="checkbox" id="orbit" checked> Orbit</label>
+  <label>Intro <select id="intro"><option value="none">None</option><option value="blueprint">Blueprint</option></select></label>
+  <label>Order <select id="order"><option value="layers">Layers</option><option value="scan">3D print</option><option value="stages">Stages</option></select></label>
+  <label>Motion <select id="motion"><option value="drop">Drop</option><option value="grow">Grow</option><option value="swarm">Swarm</option><option value="tornado">Tornado</option><option value="slide">Slide</option><option value="pop">Pop</option><option value="tumble">Tumble</option><option value="squash">Squash</option><option value="flash">Flash</option></select></label>
+  <label>Detail <select id="res"><option value="1">1 · coarse</option><option value="2">2</option><option value="3">3</option><option value="4">4 · fine</option></select></label>
+  <label>Ending <select id="outro"><option value="reset">Reset</option><option value="demolish">Demolish</option><option value="pile">Pile &amp; rebuild</option></select></label>
+  <label>Sky <select id="sky"><option value="day">Day</option><option value="night">Day → night</option></select></label>
+  <div id="bar"><i></i></div>
+  <span id="info" style="opacity:.75"></span>
+</div>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+// Voxel subdivision: each design unit is S×S×S small voxels. Override with ?res=1..4
+const Q = new URLSearchParams(location.search);
+const S = Math.max(1, Math.min(4, parseInt(Q.get('res')) || 2));
+const GRID = Q.get('grid') === '1';                      // ?grid=1 draws the full cube grid; by default the cube border is near-invisible
+const CAM = Q.get('cam') === 'persp' ? 'persp' : 'ortho'; // ?cam=persp: perspective hero view (modest FOV, 15–25° elevation); default orthographic
+// Animation style (see the skill's reference/animation.md). Set the scene's defaults here; ?intro= ?order= ?motion= ?outro= ?sky= override.
+//   intro:  none | blueprint (see-through outline of the finished model first, then it fills in)
+//   order:  layers (bottom up, jittered) | scan (3D printer: strict layers, sweeping head) | stages (by STAGE tag)
+//   motion: drop | grow | swarm | tornado | slide | pop | tumble | squash | flash (see POSE)
+//   outro:  reset (hold, then restart) | demolish (collapse in reverse build order, rebuild) | pile (heap up, rebuild from the heap)
+//   sky:    day | night (dusk falls a few seconds after the build completes)
+const ANIM = { intro: 'none', order: 'layers', motion: 'drop', outro: 'reset', sky: 'day' };
+for (const k in ANIM) ANIM[k] = Q.get(k) || ANIM[k];
+if (!Q.has('motion') && ANIM.order === 'scan') ANIM.motion = 'grow';
+
+// =====================================================================================================
+// ENGINE: helpers (keep as is)
+// =====================================================================================================
+function hash(x, z, s = 0) {
+  let h = Math.imul(x | 0, 374761393) ^ Math.imul(z | 0, 668265263) ^ Math.imul(s | 0, 1442695041);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  h ^= h >>> 16;
+  return (h >>> 0) / 4294967295;
+}
+function vnoise(x, z, sc, s = 0) {
+  x /= sc; z /= sc;
+  const xi = Math.floor(x), zi = Math.floor(z), xf = x - xi, zf = z - zi;
+  const u = xf * xf * (3 - 2 * xf), v = zf * zf * (3 - 2 * zf);
+  const a = hash(xi, zi, s), b = hash(xi + 1, zi, s), c = hash(xi, zi + 1, s), d = hash(xi + 1, zi + 1, s);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+let seed = 1234;
+const rnd = () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+const pick = a => a[Math.floor(rnd() * a.length)];
+
+// Fine-grid voxel store; e = false (lit), true (glowing), 'glass' (semi-transparent).
+// The +256 key offset matters: the island underside goes to negative y.
+// TAG marks what a voxel is so passes can treat it differently (4 terrain, >= 6 hollowed, 7 animal, 9 scruff grass; see reference/lighting.md).
+const V = new Map();
+const key = (x, y, z) => ((x + 256) * 1024 + (y + 256)) * 1024 + (z + 256);
+// STAGE groups voxels for ?order=stages: lower stages build first (0 ground, 1 walls, 2 openings, 3 roof, 4 props).
+let TAG = 0, STAGE = 0;
+// PROP names what is being built so the prop inspectors can find it (window.__props, __seeProp; skill reference/inspection.md).
+// prop(name, [w, h, l] in metres) before each prop, prop() after; M_PER_UNIT = metres per design unit.
+const M_PER_UNIT = 1.0, PROPS = {};        // a design unit is 1 m here (city scale)
+let PROP = null;
+const prop = (name = null, real = null) => { PROP = name; if (name) PROPS[name] = { real }; };
+const fset = (x, y, z, c, e = false) => V.set(key(x, y, z), { x, y, z, c, e, g: TAG, st: STAGE, p: PROP });
+const fdel = (x, y, z) => V.delete(key(x, y, z));
+const fhas = (x, y, z) => V.has(key(x, y, z));
+const dc = f => (f - (S - 1) / 2) / S;                 // fine cell -> design coordinate
+const col = (c, x, y, z) => typeof c === 'function' ? c(x, y, z) : Array.isArray(c) ? c[Math.floor(hash(x * 7 + y, z, 3) * c.length)] : c;
+function fbox(x0, y0, z0, x1, y1, z1, c, e = false) {
+  for (let x = x0; x <= x1; x++) for (let y = y0; y <= y1; y++) for (let z = z0; z <= z1; z++) fset(x, y, z, col(c, x, y, z), e);
+}
+const box = (x0, y0, z0, x1, y1, z1, c, e) => fbox(x0 * S, y0 * S, z0 * S, x1 * S + S - 1, y1 * S + S - 1, z1 * S + S - 1, c, e);
+function shell(x0, y0, z0, x1, y1, z1, c) {            // hollow box, one fine voxel thick (design units)
+  const X0 = x0 * S, X1 = x1 * S + S - 1, Y0 = y0 * S, Y1 = y1 * S + S - 1, Z0 = z0 * S, Z1 = z1 * S + S - 1;
+  for (let x = X0; x <= X1; x++) for (let y = Y0; y <= Y1; y++) for (let z = Z0; z <= Z1; z++)
+    if (x === X0 || x === X1 || y === Y0 || y === Y1 || z === Z0 || z === Z1) fset(x, y, z, col(c, x, y, z));
+}
+// plane helpers: axis 'x' = wall at fixed fine z (a runs along x), 'z' = wall at fixed fine x (a runs along z)
+const pset = (axis, a, y, l, c, e) => axis === 'x' ? fset(a, y, l, c, e) : fset(l, y, a, c, e);
+const pdel = (axis, a, y, l) => axis === 'x' ? fdel(a, y, l) : fdel(l, y, a);
+function disc(cx, cz, r0, r1, fy0, fy1, c, e) {        // ring/disc, design centre + radii, fine y range
+  for (let fx = Math.floor((cx - r1 - 1) * S); fx <= Math.ceil((cx + r1 + 1) * S); fx++)
+    for (let fz = Math.floor((cz - r1 - 1) * S); fz <= Math.ceil((cz + r1 + 1) * S); fz++) {
+      const d = Math.hypot(dc(fx) - cx, dc(fz) - cz);
+      if (d >= r0 && d <= r1) for (let fy = fy0; fy <= fy1; fy++) fset(fx, fy, fz, col(c, fx, fy, fz), e);
+    }
+}
+function blob(cx, cy, cz, r, pal, sy = 1, rough = 0.6, e = false) {   // noisy ellipsoid (leaves, bushes, smoke)
+  const R = r + 1;
+  for (let fx = Math.floor((cx - R) * S); fx <= Math.ceil((cx + R) * S); fx++)
+    for (let fy = Math.floor((cy - R * sy) * S); fy <= Math.ceil((cy + R * sy) * S); fy++)
+      for (let fz = Math.floor((cz - R) * S); fz <= Math.ceil((cz + R) * S); fz++) {
+        const d = Math.hypot(dc(fx) - cx, (dc(fy) - cy) / sy, dc(fz) - cz);
+        if (d <= r + (rnd() - 0.5) * rough) fset(fx, fy, fz, typeof pal === 'function' ? pal(fx, fy, fz) : pick(pal), e);   // pal: array or fn(fx, fy, fz)
+      }
+}
+// face-connected line between two design points (trunks, branches, poles): steps one axis at a time
+function limb(x0, y0, z0, x1, y1, z1, pal, thick = 1) {
+  const n = Math.ceil(Math.hypot(x1 - x0, y1 - y0, z1 - z0) * S * 1.5);
+  const put = (fx, fy, fz) => { for (let a = 0; a < thick; a++) for (let b = 0; b < thick; b++) fset(fx + a, fy, fz + b, col(pal, fx + a, fy, fz + b)); };
+  let px = Math.round(x0 * S), py = Math.round(y0 * S), pz = Math.round(z0 * S);
+  put(px, py, pz);
+  for (let i = 1; i <= n; i++) {
+    const t = i / n, fx = Math.round((x0 + (x1 - x0) * t) * S), fy = Math.round((y0 + (y1 - y0) * t) * S), fz = Math.round((z0 + (z1 - z0) * t) * S);
+    while (px !== fx) { px += Math.sign(fx - px); put(px, py, pz); }
+    while (pz !== fz) { pz += Math.sign(fz - pz); put(px, py, pz); }
+    while (py !== fy) { py += Math.sign(fy - py); put(px, py, pz); }
+  }
+}
+
+// =====================================================================================================
+// SCENE: palette, ground, buildings, props (replace with your scene)
+// =====================================================================================================
+// Colours are sampled from the photo (palette-sampler.html) and stay muted: sRGB saturation <= 0.4, lightness 0.12–0.85
+// (the palette lint after the bake warns otherwise). Keys named in ACCENT (glow, flowers, signage) are exempt.
+const P = {
+  // kept for the template helpers (trees, scruff, decks); tuned to a night city
+  lawn: [0x3a5a34, 0x3f6238, 0x35532f], topsoil: [0x2a2d33, 0x262930], lawnDry: [0x4a5a3a, 0x445236],
+  soil: [0x2e2622, 0x29221e, 0x332a24],
+  under: [0x4a5058, 0x42484f, 0x3a4046, 0x33383e],
+  wall: [0x2a3644, 0x24303c], trim: 0x3a4652, roof: [0x2a2e34, 0x30343a, 0x262a30], roofCap: 0x1e2226,
+  leaf: [0x2e5a3a, 0x376844, 0x284e32], weed: [0x3a6a3a, 0x4a7a44, 0x2e5a30, 0x5a8a4a], litter: [0x4a4a30, 0x5a5236, 0x3e3e2a],
+  bark: [0x3a3028, 0x2e261f], black: 0x1b1e23, iron: 0x2a2e34,
+  tuft: [0x4a5a3c, 0x506040], flower: [0xd9c36a, 0xe8e4d8, 0xb79ac0],
+  spruce: [0x1e3020, 0x263826], cypress: [0x1e2a18, 0x263424], wood: [0x6a6058, 0x5e544c, 0x746860], woodDark: [0x3e3028, 0x342820],
+  // city ground
+  asphalt: [0x232a31, 0x262d35, 0x20262d, 0x293038],
+  asphaltWet: [0x30404c, 0x2a3844, 0x35505c],
+  puddle: 0x203a48,
+  paving: [0x3a3f46, 0x3e444b, 0x363b42, 0x41474e],
+  kerb: 0x565c64,
+  plaza: [0x484845, 0x50504c],
+  lotLine: 0xb0b4b0, marking: 0xc8ccc4,
+  // buildings (sampled from the photo, lifted a little for the scene light)
+  steel: [0x1c2b38, 0x1a2836, 0x1f3040, 0x182533],   // hero tower frame (photo 0x092b45 / 0x0a516c, lifted + desaturated for the lint)
+  fin: 0x16202a, spandrel: 0x24384a, steelLight: 0x2a4a60,
+  navy: [0x172330, 0x15202c, 0x1a2734],              // monolith (photo 0x030f1b / 0x061f2f)
+  concrete: [0x202c38, 0x1c2834, 0x24323e, 0x1a2630], // mid-rise (photo 0x031324 / 0x083343)
+  concrete2: [0x2a3038, 0x262c34, 0x2e343c],
+  brick: [0x4a3a3c, 0x443436, 0x503e40],              // noodle bar (photo 0x6e5356)
+  // neon (sampled)
+  neonCyan: 0x14f1f4, neonCyan2: 0x62d5dc, neonCyanDim: 0x127388, screenOff: 0x064056,
+  neonMag: 0xe032ad, neonMagBright: 0xfbdaeb, neonMagDim: 0x741746,
+  neonRed: 0xe92115, neonOrange: 0xf46e3b, neonRedDark: 0x4b0910, signText: 0xfae5c2,
+  warmWin: 0xf2d8a1, warmWin2: 0xc39e81, whiteWin: 0xdce8f0, coolWin: 0x9fe8f0, lobby: 0xcfe0e8,
+  winDark: 0x15202a, winDim: 0x4a4640,
+  metal: [0x3a4048, 0x343a42, 0x40464e], metalDark: 0x22262c,
+  smoke: [0x8a96a0, 0x96a2ac, 0x7e8a94],   // pale: night bake darkens it
+  awning: [0x7a1e1e, 0x5a1414],
+};
+const GLOW = 0xffd27a;
+const GLASS = 0x3f7fa8;            // night glass: a shade darker than the template's day blue
+// neon, lit rooms and the awning are accents: saturated on purpose, exempt from the palette lint
+const ACCENT = new Set(['neonCyan', 'neonCyan2', 'neonCyanDim', 'screenOff', 'neonMag', 'neonMagBright', 'neonMagDim', 'neonRed', 'neonOrange', 'neonRedDark', 'signText', 'warmWin', 'warmWin2', 'whiteWin', 'coolWin', 'lobby', 'awning', 'flower']);
+// sky: the photo's teal haze (sampled; the white top stop was the photo's border and is dropped). Night: the same, darker.
+const SKY = { day: [0x46626a, 0x527078, 0x5f8587, 0x587579], night: [0x0b141c, 0x14222c, 0x22343c, 0x1c2c34], at: [0, 0.5, 0.72, 1] };   // __compare: the photo's upper thirds average 0x55..0x67
+
+const CX = 48, CZ = 48;            // island centre (design units)
+const GY = 3, TOP = GY * S;        // pavement surface is fine layer TOP-1 (roads TOP-2); things stand from TOP
+
+// ---------- island: irregular lobed outline, rounded rim bumps, one iceberg rock mass underneath ----------
+const ISLAND = 11;
+const LOBES = [2, 3, 5].map((n, i) => ({ n, a: [3.0, 2.2, 1.2][i] * (0.6 + hash(n, i, ISLAND) * 0.8), p: hash(i, n, ISLAND + 1) * 6.283 }));
+function edgeR(x, z) {
+  const th = Math.atan2(z - CZ, x - CX), K = 14;
+  const u = (th / (2 * Math.PI) + 0.5) * K + (vnoise(th * 4 + 9, 3, 1, 8) - 0.5) * 0.5;
+  const k = Math.floor(u), f = u - k, bump = Math.sin(Math.PI * f) ** 2;
+  const amp = 0.6 + Math.pow(hash(((k % K) + K) % K, 0, 61 + ISLAND), 2) * 5;
+  const lobe = LOBES.reduce((s, l) => s + l.a * Math.sin(l.n * th + l.p), 0);
+  const ragged = (vnoise(x, z, 9, 62 + ISLAND) - 0.5) * 5 + (vnoise(x, z, 3.5, 63) - 0.5) * 1.6;
+  return 45 + lobe + ragged + amp * bump;
+}
+const LO = -12 * S, WD = (2 * CX + 24) * S, OUT = 1 << 14;
+const bottom = new Int32Array(WD * WD).fill(OUT), top = new Int32Array(WD * WD).fill(-OUT);
+const idx = (fx, fz) => (fx - LO) * WD + (fz - LO);
+const inGrid = (fx, fz) => fx >= LO && fz >= LO && fx < LO + WD && fz < LO + WD;
+const botAt = (fx, fz) => inGrid(fx, fz) ? bottom[idx(fx, fz)] : OUT;
+const topAt = (fx, fz) => inGrid(fx, fz) ? top[idx(fx, fz)] : -OUT;
+
+// ---------- city plan: (u, v) design offsets from the island centre; roads are bands ----------
+const U = f => Math.floor(f / S) - CX;           // fine cell -> design unit offset from the centre
+const ROADS = [
+  { axis: 'z', a0: -3, a1: 5 },       // avenue, runs front-back between the hero tower and block C
+  { axis: 'x', a0: 9, a1: 15 },       // cross street behind the front row
+  { axis: 'x', a0: -14, a1: -10 },    // back service street
+  { axis: 'x', a0: 27, a1: 33 },      // boulevard nearest the camera
+];
+const roadAt = (u, v) => ROADS.find(r => { const a = r.axis === 'z' ? u : v; return a >= r.a0 && a < r.a1; });
+const inRect = (u, v, r) => u >= r[0] && u < r[2] && v >= r[1] && v < r[3];
+const PARK = [-34, 17, -22, 26];                                            // front-left plaza
+const LOT = [23, 17, 34, 26];                                               // front-right parking lot
+const PLANTERS = [[-32, 18, -29, 21], [-27, 22, -23, 25], [-33, 22, -30, 25]];
+function groundKind(fx, fz) {
+  const u = U(fx), v = U(fz);
+  if (roadAt(u, v)) return 'road';
+  if (inRect(u, v, PARK)) return PLANTERS.some(p => inRect(u, v, p)) ? 'planter' : 'plaza';
+  if (inRect(u, v, LOT)) return 'lot';
+  return 'pave';
+}
+const hardAt = (fx, fz) => groundKind(fx, fz) !== 'planter';   // the whole slab is paved: scruff only in planters
+const heightAt = () => 0;
+for (let fx = LO; fx < LO + WD; fx++) for (let fz = LO; fz < LO + WD; fz++) {
+  const x = dc(fx), z = dc(fz), dx = x - CX, dz = z - CZ;
+  const e = edgeR(x, z) - Math.pow(dx ** 4 + dz ** 4, 0.25);
+  if (e < 0) continue;
+  top[idx(fx, fz)] = TOP - 1 - (groundKind(fx, fz) === 'road' ? 1 : 0);         // roads one cell below the kerb
+  const ra = Math.min(1, Math.hypot(x - CX - 3, z - CZ + 2) / 50);
+  const facet = (Math.floor(vnoise(x, z, 6, 51) * 5) / 5 - 0.4) * 5;
+  const depth = 2 + Math.min(1, e / 4) * (30 * Math.pow(1 - ra, 1.4) + facet * (1 - ra));
+  bottom[idx(fx, fz)] = TOP - 1 - Math.max(S, Math.round(depth * S));
+}
+// ground colour per fine cell: wet asphalt with markings, crosswalks and puddles; paving with kerbs; plaza pattern; lot bays
+function groundC(fx, fz, e) {
+  const u = U(fx), v = U(fz), k = groundKind(fx, fz);
+  if (e < 1.3) return k === 'road' ? 0x2a2e34 : P.kerb;                               // rim edging
+  if (k === 'road') {
+    const r = roadAt(u, v), lat = r.axis === 'z' ? fx : fz, along = r.axis === 'z' ? fz : fx, la = r.axis === 'z' ? u : v, au = r.axis === 'z' ? v : u;
+    const cross = ROADS.some(o => o.axis !== r.axis && (au >= o.a0 - 3 && au < o.a0 || au >= o.a1 && au < o.a1 + 3));
+    const inter = ROADS.some(o => o.axis !== r.axis && au >= o.a0 && au < o.a1);
+    if (cross && !inter && lat % 4 < 2 && hash(fx, fz, 78) > 0.12) return P.marking;          // zebra crossing
+    const mid = Math.floor((r.a0 + r.a1) / 2);
+    if (!inter && !cross && la === mid && lat % S === 0 && Math.floor(along / 5) % 2 === 0 && hash(fx, fz, 79) > 0.1) return P.marking;   // dashed centre line
+    if (vnoise(fx, fz, 6, 77) > 0.74) return P.puddle;
+    if (hash(fx, fz, 76) < 0.004) return P.metalDark;                                          // manhole
+    return hash(fx, fz, 75) < 0.2 ? P.asphaltWet[Math.floor(hash(fx, fz, 74) * 3)] : col(P.asphalt, fx, 0, fz);
+  }
+  if (k === 'lot') {
+    if ((fx - FXC(LOT[0])) % 5 === 0 && v >= 18 && v < 23 && hash(fx, fz, 81) > 0.2) return P.lotLine;   // bay lines
+    if (vnoise(fx, fz, 6, 77) > 0.77) return P.puddle;
+    return col(P.asphalt, fx, 0, fz);
+  }
+  if (k === 'plaza') return hash(fx, fz, 84) < 0.06 ? 0x3e3e3a : P.plaza[(Math.floor(fx / 4) + Math.floor(fz / 4)) % 2];
+  if (k === 'planter') return col(P.soil, fx, 0, fz);
+  if ([[1, 0], [-1, 0], [0, 1], [0, -1]].some(([a, b]) => groundKind(fx + a, fz + b) === 'road')) return P.kerb;
+  if (hash(fx, fz, 82) < 0.003) return P.metalDark;                                            // drain
+  if (vnoise(fx, fz, 7, 83) > 0.8) return 0x30353c;                                            // worn, darker patch
+  return col(P.paving, fx, 0, fz);
+}
+const FXC = u => (CX + u) * S;    // fine x of a design offset (used before FX is defined below)
+TAG = 4; STAGE = 0;
+for (let fx = LO; fx < LO + WD; fx++) for (let fz = LO; fz < LO + WD; fz++) {
+  const b = botAt(fx, fz);
+  if (b === OUT) continue;
+  const t = topAt(fx, fz), x = dc(fx), z = dc(fz);
+  const e = edgeR(x, z) - Math.pow((x - CX) ** 4 + (z - CZ) ** 4, 0.25);
+  const nb = [[1, 0], [-1, 0], [0, 1], [0, -1]].map(([a, c]) => [botAt(fx + a, fz + c), topAt(fx + a, fz + c)]);
+  for (let fy = b; fy <= t; fy++) {
+    if (fy !== b && fy !== t && nb.every(([nbot, ntop]) => nbot < fy && ntop > fy)) continue;
+    let c;
+    if (fy > t - 2 * S) c = fy === t || nb.some(([n]) => n === OUT) ? groundC(fx, fz, e) : pick(P.topsoil);
+    else c = P.under[Math.min(3, Math.floor((TOP - fy) / (7 * S)))];
+    fset(fx, fy, fz, c);
+  }
+}
+TAG = 0;
+
+// ---------- light sources ----------
+// Only fixtures emit light. lamp() registers a baked light (see the skill's reference/lighting.md) tied to the glowing
+// voxel `src` of its fixture; positions are fine cells. Lamps whose src is not a glow voxel after the scene is
+// built are dropped with a warning, so light never comes from an empty spot. hero: also a real PointLight.
+const LAMPS = [];
+const lamp = (src, fx, fy, fz, o = {}) => LAMPS.push({ src, fx, fy, fz, color: 0xffc070, power: 1.6, r: 3.5, ...o });
+
+// ---------- building parts ----------
+// window: frame + mullions on the wall plane, glass recessed one voxel, reveal, room two voxels behind,
+// sill, arch band, keystone. dir = +1/-1 is the direction the wall faces. Lit rooms and doors spill a little
+// light out through the glass.
+const tmp = new THREE.Color();
+function win(axis, l, dir, a0, a1, y0, y1, o = {}) {
+  const A0 = a0 * S, A1 = a1 * S + S - 1, Y0 = y0 * S, Y1 = y1 * S + S - 1;
+  const ac = (A0 + A1) / 2, R = (A1 - A0) / 2;
+  const lit = o.lit ?? hash(a0 * 3 + l, y0, 9) > 0.62;
+  const curtain = hash(a0, y0 + l, 10) > 0.35;
+  const yTop = o.arch ? Y1 + Math.ceil(R) : Y1, ym = Math.floor((Y0 + Y1) / 2);
+  // the room backdrop (l - 3·dir) is closed behind every cell, mullions included: the house is a hollow shell,
+  // and any gap shows its empty, lamp-lit inside through the glass
+  for (let a = A0; a <= A1; a++) for (let y = Y0; y <= yTop; y++) {
+    let frame, edge;
+    if (y > Y1) {
+      const d = Math.hypot(a - ac, y - Y1);
+      if (d > R + 0.5) continue;
+      edge = d > R - 0.7;
+      frame = edge || Math.abs(a - ac) < 0.6;
+    } else {
+      edge = a === A0 || a === A1 || y === Y0 || y === Y1;
+      frame = edge || (a - A0) % 4 === 0 || y === ym;
+    }
+    if (frame) pset(axis, a, y, l, P.trim);
+    if (edge) { for (let k = 1; k <= 3; k++) pset(axis, a, y, l - k * dir, 0xb8ac94); continue; }   // reveal
+    if (!frame) { pdel(axis, a, y, l); pset(axis, a, y, l - dir, GLASS, 'glass'); }
+    const t = (y - Y0) / Math.max(1, yTop - Y0), drape = curtain && !o.door && (a - A0) % 6 < 2;
+    const c = lit || o.door ? (drape ? 0xf5e4c4 : tmp.set(0xf0b860).lerp(new THREE.Color(0xffe2a6), t).getHex())
+                            : (drape ? 0xbfb39a : tmp.set(0x2a231e).lerp(new THREE.Color(0x4a3f34), t * 0.6).getHex());
+    pset(axis, a, y, l - 3 * dir, c, lit || o.door);
+  }
+  for (let a = A0 - 1; a <= A1 + 1; a++) { pset(axis, a, Y0 - 1, l, P.trim); pset(axis, a, Y0 - 1, l + dir, P.trim); } // sill
+  for (let a = A0 - 1; a <= A1 + 1; a++) pset(axis, a, yTop + 1, l, P.trim);                                         // lintel
+  if (lit || o.door) {
+    const src = axis === 'x' ? [A0 + 1, Y0 + 1, l - 3 * dir] : [l - 3 * dir, Y0 + 1, A0 + 1];
+    const at = [ac, (Y0 + Y1) / 2, l + dir], [fx, fy, fz] = axis === 'x' ? at : [at[2], at[1], at[0]];
+    lamp(src, fx, fy, fz, { color: 0xffb860, power: 1, r: 9, wrap: 0, dir: axis === 'x' ? [0, 0, dir] : [dir, 0, 0], cone: 0 });
+  }
+}
+// wall lantern: bracket keeps it attached; the light sits in its glowing 2×2 glass
+function lantern(axis, l, dir, a, y, o = {}) {
+  pset(axis, a, y + 2, l + dir, P.black);
+  for (let i = 0; i < 2; i++) for (let k = 0; k < 2; k++) pset(axis, a + i, y + k, l + 2 * dir, GLOW, true);
+  for (let i = 0; i < 2; i++) { pset(axis, a + i, y + 2, l + 2 * dir, P.black); pset(axis, a + i, y - 1, l + 2 * dir, P.black); }
+  const at = [a + 0.5, y + 0.5, l + 2 * dir];
+  lamp(axis === 'x' ? [a, y, l + 2 * dir] : [l + 2 * dir, y, a], ...(axis === 'x' ? at : [at[2], at[1], at[0]]), o);
+}
+// ground uplight a few cells in front of a wall: black housing, glowing lens, a spot washing up the facade
+function uplight(axis, l, dir, a, o = {}) {
+  const t = topAt(axis === 'x' ? a : l + 3 * dir, axis === 'x' ? l + 3 * dir : a) + 1;
+  for (let i = 0; i < 2; i++) { pset(axis, a + i, t, l + 3 * dir, P.black); pset(axis, a + i, t + 1, l + 3 * dir, o.color ?? GLOW, true); }   // lens in the lamp colour
+  const at = [a + 0.5, t + 1.5, l + 3 * dir];
+  lamp(axis === 'x' ? [a, t + 1, l + 3 * dir] : [l + 3 * dir, t + 1, a], ...(axis === 'x' ? at : [at[2], at[1], at[0]]),
+    { color: 0xffa850, power: 5, r: 16, dir: [0, 1, 0], cone: 0.15, ...o });
+}
+// hipped roof, two voxels thick so the steps stay face-connected
+function hip(x0, x1, z0, z1, eave, slope = 0.5) {
+  const X0 = x0 * S, X1 = x1 * S + S - 1, Z0 = z0 * S, Z1 = z1 * S + S - 1, E = eave * S;
+  let dMax = 0;
+  for (let fx = X0; fx <= X1; fx++) for (let fz = Z0; fz <= Z1; fz++) dMax = Math.max(dMax, Math.min(fx - X0, X1 - fx, fz - Z0, Z1 - fz));
+  for (let fx = X0; fx <= X1; fx++) for (let fz = Z0; fz <= Z1; fz++) {
+    const dX = Math.min(fx - X0, X1 - fx), dZ = Math.min(fz - Z0, Z1 - fz), d = Math.min(dX, dZ);
+    const h = E + Math.floor(d * slope);
+    const cap = dX === dZ || d >= dMax - 1;
+    let c = cap ? P.roofCap : P.roof[Math.floor(d / 2) % 3];
+    if (!cap && hash(fx >> 1, fz, 16) < 0.07) c = P.roof[(Math.floor(d / 2) + 1 + (hash(fx, fz, 17) * 2 | 0)) % 3];   // replaced tiles
+    fset(fx, h, fz, c); fset(fx, h - 1, fz, c);
+    if (!cap && d > 1 && hash(fx, fz, 15) < 0.025) fset(fx, h + 1, fz, c);         // a lifted / slipped tile
+    if (d <= 1) fset(fx, E - 1, fz, P.trim);
+  }
+}
+// metres -> fine cells (at least one): real-size props and fixtures
+const cells = m => Math.max(1, Math.round(m / M_PER_UNIT * S));
+// face-connected line between two fine points (stays, ropes, cables): steps one axis at a time
+function fline(x0, y0, z0, x1, y1, z1, c) {
+  const n = Math.max(Math.abs(x1 - x0), Math.abs(y1 - y0), Math.abs(z1 - z0)) * 2;
+  let px = x0, py = y0, pz = z0;
+  fset(px, py, pz, col(c, px, py, pz));
+  for (let i = 1; i <= n; i++) {
+    const t = i / n, fx = Math.round(x0 + (x1 - x0) * t), fy = Math.round(y0 + (y1 - y0) * t), fz = Math.round(z0 + (z1 - z0) * t);
+    while (px !== fx) { px += Math.sign(fx - px); fset(px, py, pz, col(c, px, py, pz)); }
+    while (pz !== fz) { pz += Math.sign(fz - pz); fset(px, py, pz, col(c, px, py, pz)); }
+    while (py !== fy) { py += Math.sign(fy - py); fset(px, py, pz, col(c, px, py, pz)); }
+  }
+}
+
+// ---------- trees and plants (stand on the terrain: topAt, not GY) ----------
+// trees are never plumb or symmetric: leaning trunk with a kink, 3-5 uneven crown clumps with gaps, root flare,
+// the odd yellowed leaf, a slight tint of its own. Leaves are TAG 6 (hollowed to a skin). Crown footprints go to
+// CANOPY for leaf litter. o: lean (0.22), sy (crown squash, 0.75), spread (clump spread, 1.6), low (holm-oak dome
+// whose skirt hangs to ~1/3 of the height instead of a ball on a bare pole), trunk (fine cells thick, 2; 1 at 1 m units).
+const CANOPY = [];
+function tree(x, z, h, r, pal = P.leaf, o = {}) {
+  const px = Math.round(x * S), pz = Math.round(z * S), gy = (topAt(px, pz) + 1) / S, tag = TAG;
+  const lean = o.lean ?? 0.22, sy = o.sy ?? 0.75, spread = o.spread ?? 1.6;
+  const lx = (rnd() - 0.5) * h * lean, lz = (rnd() - 0.5) * h * lean, kx = x + lx * 0.35, kz = z + lz * 0.35, tx = x + lx, tz = z + lz;
+  limb(x, gy, z, kx, gy + h * 0.5, kz, P.bark, o.trunk ?? 2);
+  limb(kx, gy + h * 0.5, kz, tx, gy + h, tz, P.bark, o.trunk ?? 2);
+  for (const [a, b] of [[-1, 0], [2, 0], [0, -1], [0, 2], [-1, 1], [2, 1]]) if (rnd() < 0.55) fset(px + a, topAt(px + a, pz + b) + 1, pz + b, pick(P.bark));   // root flare
+  const dh = (rnd() - 0.5) * 0.03, dl = (rnd() - 0.5) * 0.08;
+  const own = pal.map(c => tmp.set(c).offsetHSL(dh, 0, dl).getHex());
+  const leaves = [...own, ...own, ...own, ...own, ...own, ...own, 0x8a8848];      // ~5% yellowed
+  const n = o.low ? 5 + Math.floor(rnd() * 3) : 3 + Math.floor(rnd() * 3);
+  for (let i = 0; i < n; i++) {
+    const main = i === 0, rr = main ? r : r * (0.5 + rnd() * 0.4);
+    const dx = main ? 0 : (rnd() - 0.5) * r * spread, dz = main ? 0 : (rnd() - 0.5) * r * spread;
+    const dy = main ? (o.low ? -rr * sy * 0.35 : 0) : o.low ? (rnd() - 0.85) * r * sy * 1.2 : (rnd() - 0.65) * r * sy;
+    limb(kx, gy + h * 0.5, kz, tx + dx, gy + h + dy - rr * 0.5 * sy, tz + dz, P.bark, 1);   // branch into each clump
+    TAG = 6; blob(tx + dx, gy + h + dy, tz + dz, rr, leaves, sy + rnd() * 0.15, 1.5); TAG = tag;
+    CANOPY.push([tx + dx, tz + dz, rr]);
+  }
+}
+// spruce/fir: straight trunk, whorled tiers narrowing to a spire. Each layer steps in by under a cell so the
+// hollowed skin stays face-connected; the trunk goes in after the leaves or the hollowing cuts the crown loose.
+function spruce(x, z, h, r, pal = P.spruce) {
+  const px = Math.round(x * S), pz = Math.round(z * S), b = topAt(px, pz) + 1, H = Math.round(h * S), cx = dc(px), cz = dc(pz), tag = TAG;
+  const dl = (rnd() - 0.5) * 0.06, own = pal.map(c => tmp.set(c).offsetHSL((rnd() - 0.5) * 0.02, 0, dl).getHex());
+  TAG = 6;
+  for (let fy = b + Math.round(H * 0.15); fy <= b + H; fy++) {
+    const t = (fy - b) / H, tier = ((fy - b) % 5) / 4;
+    const rr = r * Math.min(1, (1 - t) * 1.15) - 0.8 * tier + 0.6 + (rnd() - 0.5) * 0.3;
+    disc(cx, cz, 0, Math.max(0.3, rr), fy, fy, own);
+  }
+  TAG = tag;
+  for (let fy = b; fy < b + Math.round(H * 0.75); fy++) fset(px, fy, pz, pick(P.bark));
+  CANOPY.push([cx, cz, r * 0.8]);
+}
+// cypress: a narrow, slightly wavering column
+function cypress(x, z, h, r, pal = P.cypress) {
+  const px = Math.round(x * S), pz = Math.round(z * S), b = topAt(px, pz) + 1, tag = TAG;
+  for (let fy = b; fy < b + cells(1); fy++) fset(px, fy, pz, pick(P.bark));
+  TAG = 6;
+  for (let fy = b + cells(0.6); fy <= b + h * S; fy++) {
+    const t = (fy - b) / (h * S), rr = r * Math.min(1, Math.sin(Math.PI * Math.pow(t, 0.75)) * 1.15) + (rnd() - 0.5) * 0.4;
+    disc(x + Math.sin(fy * 0.3) * 0.15, z, 0, Math.max(0.5, rr), fy, fy, pal);
+  }
+  TAG = tag;
+}
+function shrub(x, z, r, pal = P.leaf) {
+  const gy = (topAt(Math.round(x * S), Math.round(z * S)) + 1) / S, tag = TAG;
+  TAG = 6; blob(x, gy + r * 0.3, z, r, pal, 0.65, 1.0); TAG = tag;
+}
+
+// ---------- more light fixtures (all register their light at a glowing voxel) ----------
+// lamp post on the terrain, ~2.6 m: iron pole, one glowing cell, cap and finial
+function lampPost(x, z, o = {}) {
+  const fx = Math.round(x * S), fz = Math.round(z * S), b = topAt(fx, fz) + 1, H = cells(2.4);
+  fset(fx, b, fz, P.iron);
+  for (let y = b + 1; y < b + H; y++) fset(fx, y, fz, P.iron);
+  fset(fx, b + H, fz, o.color ?? GLOW, true);                     // head in the lamp colour
+  fset(fx, b + H + 1, fz, P.black);
+  fset(fx, b + H + 2, fz, P.black);                                            // finial
+  lamp([fx, b + H, fz], fx, b + H, fz, { power: 1.2, r: 9, ...o });            // r must reach the ground from 2.4 m up
+}
+// one-cell wall lamp (use at S >= 3, where the 2×2 lantern() is 0.7 m of glass): iron cap and foot, touching the wall
+function wallLamp(axis, l, dir, a, y, o = {}) {
+  pset(axis, a, y + 1, l + dir, P.iron);
+  pset(axis, a, y, l + dir, GLOW, true);
+  pset(axis, a, y - 1, l + dir, P.iron);
+  lamp(axis === 'x' ? [a, y, l + dir] : [l + dir, y, a], ...(axis === 'x' ? [a, y, l + 2 * dir] : [l + 2 * dir, y, a]), o);
+}
+// free-standing ground uplight at fine (fx, fz). Defaults are the daytime setting (narrow cone); at dusk/night
+// pass { power: 5, cone: 0.15 }. Baked light is emission and shows in daylight too.
+function uplightAt(fx, fz, o = {}) {
+  const t = topAt(fx, fz) + 1;
+  fset(fx, t, fz, P.black); fset(fx, t + 1, fz, GLOW, true);
+  lamp([fx, t + 1, fz], fx, t + 1.5, fz, { color: 0xffa850, power: 2.4, r: 20, dir: [0, 1, 0], cone: 0.72, ...o });
+}
+// firelight: a shadowless lamp tied to the nearest flame voxel (TAG 5, glowing) within R fine cells of a design
+// point. Use for flames and for light bounced off steam; warns if no flame is near.
+function nearFlame(fx, fy, fz, R = 3 * S) {
+  let best = null, bd = Infinity;
+  for (let x = fx - R; x <= fx + R; x++) for (let y = fy - R; y <= fy + R; y++) for (let z = fz - R; z <= fz + R; z++) {
+    const v = V.get(key(x, y, z)), d = (x - fx) ** 2 + (y - fy) ** 2 + (z - fz) ** 2;
+    if (v && v.e === true && v.g === 5 && d < bd) { bd = d; best = [x, y, z]; }
+  }
+  return best;
+}
+function fireLamp(x, y, z, o = {}) {
+  const f = [Math.round(x * S), Math.round(y * S), Math.round(z * S)], src = nearFlame(...f, o.reach ?? 3 * S);
+  if (!src) { console.warn(`fireLamp at ${x}, ${y}, ${z}: no flame voxel within reach`); return; }
+  lamp(src, ...f, { shadow: false, ...o });
+}
+
+// ---------- roofs ----------
+// one roof over several rectangles: the upper envelope of per-rectangle hips gives clean valleys where wings meet.
+// rects: { x0, x1, z0, z1 (design), eave (design y), slope (fine rise per fine run), over (eave overhang, design; 1) }.
+// Over the eave band each column reaches down to the wall top as a dark fascia, so steep roofs don't float.
+function roofU(rects) {
+  const R = rects.map(r => {
+    const X0 = r.x0 * S, X1 = r.x1 * S + S - 1, Z0 = r.z0 * S, Z1 = r.z1 * S + S - 1;
+    return { slope: 0.5, ...r, X0, X1, Z0, Z1, E: r.eave * S, dMax: Math.floor(Math.min(X1 - X0, Z1 - Z0) / 2) };
+  });
+  const bx0 = Math.min(...R.map(r => r.X0)), bx1 = Math.max(...R.map(r => r.X1)), bz0 = Math.min(...R.map(r => r.Z0)), bz1 = Math.max(...R.map(r => r.Z1));
+  for (let fx = bx0; fx <= bx1; fx++) for (let fz = bz0; fz <= bz1; fz++) {
+    let best = null, bh = -1e9, bd = 0, bdX = 0, bdZ = 0;
+    for (const r of R) {
+      if (fx < r.X0 || fx > r.X1 || fz < r.Z0 || fz > r.Z1) continue;
+      const dX = Math.min(fx - r.X0, r.X1 - fx), dZ = Math.min(fz - r.Z0, r.Z1 - fz), d = Math.min(dX, dZ), h = r.E + Math.floor(d * r.slope);
+      if (h > bh) { bh = h; best = r; bd = d; bdX = dX; bdZ = dZ; }
+    }
+    if (!best) continue;
+    const cap = bdX === bdZ || bd >= best.dMax - 1;
+    let c = cap ? P.roofCap : P.roof[Math.floor(bd / 2) % 3];
+    if (!cap && hash(fx >> 1, fz, 16) < 0.07) c = P.roof[(Math.floor(bd / 2) + 1 + (hash(fx, fz, 17) * 2 | 0)) % 3];   // replaced tiles
+    if (!cap && hash(fx, fz >> 2, 18) < 0.025) c = 0x8a7a5a;                                                          // lichen
+    const th = Math.ceil(best.slope) + 1, y0 = bd <= (best.over ?? 1) * S + 3 ? Math.min(bh - th + 1, best.E - 1) : bh - th + 1;
+    for (let y = y0; y <= bh; y++) fset(fx, y, fz, y < bh - th + 1 ? P.roofCap : c);
+    if (!cap && bd > 1 && hash(fx, fz, 15) < 0.02) fset(fx, bh + 1, fz, c);                                          // a lifted tile
+  }
+}
+
+// ---------- round towers ----------
+// T = roundTower(cx, cz, R, y0, top, o): a ring of wall RW thick (design) from design y0 to top, hollow inside; also
+// clears roofs that ran into it, so build it after them. o.wall(arc, fy) colours the ring (arc = fine position round
+// it, for courses and checker bands). T gives dist/ang/arc/outer per fine column for rWin, rSlit, coneRoof.
+function roundTower(cx, cz, R, y0, top, o = {}) {
+  const RW = o.RW ?? 1.5, wall = o.wall ?? ((a, fy) => col(P.wall, a, fy, 0));
+  const T = { c: [cx, cz], R, RW, top };
+  T.dist = (fx, fz) => Math.hypot(dc(fx) - cx, dc(fz) - cz);
+  T.ang = (fx, fz) => Math.atan2(dc(fz) - cz, dc(fx) - cx);
+  T.arc = (fx, fz) => Math.round((T.ang(fx, fz) + Math.PI) * R * S);
+  T.outer = (fx, fz) => [[1, 0], [-1, 0], [0, 1], [0, -1]].some(([a, b]) => T.dist(fx + a, fz + b) > R);
+  T.X0 = Math.floor((cx - R - 2) * S); T.X1 = Math.ceil((cx + R + 2) * S); T.Z0 = Math.floor((cz - R - 2) * S); T.Z1 = Math.ceil((cz + R + 2) * S);
+  for (let fx = T.X0; fx <= T.X1; fx++) for (let fz = T.Z0; fz <= T.Z1; fz++) {
+    const d = T.dist(fx, fz);
+    if (d > R) continue;
+    for (let fy = y0 * S; fy <= top * S + S - 1; fy++) {
+      if (d > R - RW) fset(fx, fy, fz, wall(T.arc(fx, fz), fy));
+      else fdel(fx, fy, fz);
+    }
+    for (let fy = top * S + S; fy <= top * S + 3 * S; fy++) if (d <= R - RW) fdel(fx, fy, fz);
+  }
+  return T;
+}
+// conical roof: tile rings, eight dark seams, iron finial with a vane. Solid down to the eave over the ring wall,
+// or the steep cone lifts off it and the connectivity pass deletes it.
+function coneRoof(T, H, over = 1) {
+  const [cx, cz] = T.c, Rr = T.R + over, E = T.top * S + S, Hf = H * S, k = Hf / (Rr * S), th = Math.ceil(k) + 1;
+  for (let fx = Math.floor((cx - Rr - 1) * S); fx <= Math.ceil((cx + Rr + 1) * S); fx++) for (let fz = Math.floor((cz - Rr - 1) * S); fz <= Math.ceil((cz + Rr + 1) * S); fz++) {
+    const d = T.dist(fx, fz);
+    if (d > Rr) continue;
+    const h = E + Math.round((Rr - d) / Rr * Hf), a = (T.ang(fx, fz) + Math.PI) / (2 * Math.PI) * 8;
+    const seam = Math.abs(a - Math.round(a)) * Rr * S * 0.8 < 0.5 && d > 1;
+    for (let y = d > T.R - T.RW ? E : Math.max(E, h - th + 1); y <= h; y++) {
+      let c = seam ? P.roofCap : P.roof[Math.floor(y / 2) % 3];
+      if (!seam && hash(fx, y, 19) < 0.06) c = P.roof[(Math.floor(y / 2) + 1) % 3];
+      fset(fx, y, fz, c);
+    }
+  }
+  const fx = Math.round(cx * S), fz = Math.round(cz * S), y0 = E + Hf + 1, vy = y0 + cells(1.2);
+  for (let y = y0 - 2; y < y0 + cells(1.5); y++) fset(fx, y, fz, P.iron);
+  fset(fx + 1, vy, fz, P.iron); fset(fx + 2, vy, fz, P.iron);                   // vane
+}
+// opening in a round tower wall at angle th (radians, 0 = +x), design y0..y1, w design units wide, round-arched head:
+// the arc offset th·d·S stands in for the plane coordinate. Outer cells removed, the next layer glass, a closed room
+// backdrop inside, a frame round it, a sill. o.lit / o.door: warm glowing room and a weak spot out through the glass.
+const angD = (a, b) => { let d = a - b; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; return d; };
+function rWin(T, th, y0, y1, w, o = {}) {
+  const Y0 = y0 * S, Y1 = y1 * S + S - 1, R = w * S / 2, yTop = Y1 + Math.ceil(R), lit = !!(o.lit || o.door), frameC = o.frame ?? P.trim;
+  const inside = (s, y, m) => {
+    if (y < Y0 - m || y > yTop + m) return false;
+    return y > Y1 ? Math.hypot(s, y - Y1) <= R + m - 0.3 : Math.abs(s) <= R + m - 0.5;
+  };
+  let src = null;
+  for (let fx = T.X0; fx <= T.X1; fx++) for (let fz = T.Z0; fz <= T.Z1; fz++) {
+    const d = T.dist(fx, fz);
+    if (d > T.R || d <= T.R - T.RW - 1.4) continue;
+    const s = angD(T.ang(fx, fz), th) * d * S;
+    if (Math.abs(s) > R + 3) continue;
+    for (let fy = Y0 - 1; fy <= yTop + 1; fy++) {
+      if (d > T.R - T.RW) {
+        if (inside(s, fy, 0)) { if (d > T.R - 0.6) fdel(fx, fy, fz); else fset(fx, fy, fz, GLASS, 'glass'); }
+        else if (inside(s, fy, 1) && T.outer(fx, fz)) fset(fx, fy, fz, frameC);
+      } else if (inside(s, fy, 1)) {
+        const t = (fy - Y0) / Math.max(1, yTop - Y0);
+        fset(fx, fy, fz, lit ? tmp.set(0xf0b860).lerp(new THREE.Color(0xffe2a6), t).getHex() : tmp.set(0x2a231e).lerp(new THREE.Color(0x4a3f34), t * 0.6).getHex(), lit);
+        if (lit && !src && fy === Y0 + 1) src = [fx, fy, fz];
+      }
+    }
+  }
+  for (let fx = T.X0; fx <= T.X1; fx++) for (let fz = T.Z0; fz <= T.Z1; fz++) {      // sill, one cell proud
+    const d = T.dist(fx, fz);
+    if (d > T.R + 0.6 || d <= T.R - T.RW || Math.abs(angD(T.ang(fx, fz), th) * d * S) > R + 1) continue;
+    fset(fx, Y0 - 1, fz, frameC);
+  }
+  if (src) {
+    const ox = Math.cos(th), oz = Math.sin(th);
+    lamp(src, (T.c[0] + ox * (T.R + 0.5)) * S, (Y0 + Y1) / 2, (T.c[1] + oz * (T.R + 0.5)) * S, { color: 0xffb860, power: 1, r: 9, wrap: 0, dir: [ox, 0, oz], cone: 0 });
+  }
+}
+// arrow slit in a round tower: outer cells removed, the next layer dark (fine y range)
+function rSlit(T, th, fy0, fy1) {
+  for (let fx = T.X0; fx <= T.X1; fx++) for (let fz = T.Z0; fz <= T.Z1; fz++) {
+    const d = T.dist(fx, fz);
+    if (d > T.R || d <= T.R - T.RW) continue;
+    if (Math.abs(angD(T.ang(fx, fz), th) * d * S) > 0.55) continue;
+    for (let fy = fy0; fy <= fy1; fy++) { if (T.outer(fx, fz)) fdel(fx, fy, fz); else fset(fx, fy, fz, 0x1e1a18); }
+  }
+}
+
+// ---------- lathe: round masses whose radius changes with height (towers, domes, decks, saucers, tanks) ----------
+// rAt(h) = design radius at design height h above the ground (0 = nothing). Only the skin is built: the outer 1.5 fine
+// cells, ledges where the radius steps between layers, caps top and bottom (o.open: no bottom cap). paint(fx, fy, fz, s)
+// returns [colour, e]; s = { a (fine arc position, for mullions), outer, up / down (face not covered by the layer
+// above / below: roofs, undersides), fy0, d, r (fine), ang, h }. up is d > rAbove, not d > rAbove - 1, or every outer
+// wall cell counts as a roof.
+function lathe(cx, cz, h0, h1, rAt, paint, o = {}) {
+  const fy0 = TOP + Math.round(h0 * S), fy1 = TOP + Math.round(h1 * S) - 1, R = [];
+  for (let fy = fy0 - 1; fy <= fy1 + 1; fy++) R.push(fy < fy0 || fy > fy1 ? 0 : Math.max(0, rAt((fy - TOP + 0.5) / S) * S));
+  const rMax = Math.max(...R);
+  for (let fx = Math.floor(cx * S - rMax - 2); fx <= Math.ceil(cx * S + rMax + 2); fx++)
+    for (let fz = Math.floor(cz * S - rMax - 2); fz <= Math.ceil(cz * S + rMax + 2); fz++) {
+      const ddx = dc(fx) - cx, ddz = dc(fz) - cz, d = Math.hypot(ddx, ddz) * S;
+      if (d > rMax) continue;
+      const ang = Math.atan2(ddz, ddx);
+      for (let fy = fy0; fy <= fy1; fy++) {
+        const i = fy - fy0 + 1, r = R[i];
+        if (r <= 0 || d > r) continue;
+        const lo = o.open && fy === fy0 ? r : R[i - 1], hi = R[i + 1];
+        if (d <= r - 1.5 && d <= Math.min(lo, hi) - 1.5) continue;
+        const [c, e] = paint(fx, fy, fz, { a: Math.floor((ang + Math.PI) * r), outer: d > r - 1, up: d > hi, down: d > lo, fy0, d, r, ang, h: (fy - TOP + 0.5) / S });
+        fset(fx, fy, fz, c, e);
+      }
+    }
+}
+
+// ---------- Gothic openings (pointed, equilateral arches) ----------
+// inside test for an opening A0..A1 (fine, along the plane), straight sides up to Y1, m = margin for the ring
+const pointed = (a, y, A0, A1, Y1, m = 0) => {
+  if (a < A0 - m || a > A1 + m) return false;
+  if (y <= Y1) return true;
+  const w = A1 - A0 + 1 + 2 * m;
+  return Math.hypot(a - (A0 - m - 0.5), y - Y1) <= w && Math.hypot(a - (A1 + m + 0.5), y - Y1) <= w;
+};
+// pointed door on a wall plane (same axis/l/dir convention as win()): oak planks one cell in with iron studs, an
+// arch ring (o.ring) round it. a0..a1, y0..y1 in design units (y1 = springing line).
+function gothicDoor(axis, l, dir, a0, a1, y0, y1, o = {}) {
+  const A0 = Math.round(a0 * S), A1 = Math.round(a1 * S) + S - 1, Y0 = Math.round(y0 * S), Y1 = Math.round(y1 * S) + S - 1;
+  const yTop = Y1 + Math.ceil((A1 - A0 + 1) * 0.87) + 2;
+  for (let a = A0 - 1; a <= A1 + 1; a++) for (let y = Y0; y <= yTop; y++) {
+    if (pointed(a, y, A0, A1, Y1)) {
+      pdel(axis, a, y, l);
+      pset(axis, a, y, l - dir, hash(a, y, 371) < 0.06 ? P.iron : (a - A0) % 2 ? 0x5a3f2c : 0x684c38);
+    } else if (pointed(a, y, A0, A1, Y1, 1)) pset(axis, a, y, l, o.ring ?? P.trim);
+  }
+}
+// pointed through-opening (gate passage): clears every cell between fine planes l0..l1, arch ring on both faces
+function archCut(axis, l0, l1, a0, a1, y0, y1, o = {}) {
+  const A0 = Math.round(a0 * S), A1 = Math.round(a1 * S) + S - 1, Y0 = Math.round(y0 * S), Y1 = Math.round(y1 * S) + S - 1;
+  const yTop = Y1 + Math.ceil((A1 - A0 + 1) * 0.87) + 2;
+  for (let a = A0 - 1; a <= A1 + 1; a++) for (let y = Y0; y <= yTop; y++) for (let l = l0; l <= l1; l++) {
+    if (pointed(a, y, A0, A1, Y1)) pdel(axis, a, y, l);
+    else if ((l === l0 || l === l1) && pointed(a, y, A0, A1, Y1, 1)) pset(axis, a, y, l, col(o.ring ?? P.trim, a, y, l));
+  }
+}
+
+// ---------- decks, piers, steel ----------
+// timber deck at fine height y over fine x0..x1, z0..z1 (planks run along x with o.alongX, else along z). Where the
+// ground is below the deck it stands on piles at the sides every 5 cells over water (o.water(fx, fz) true) and on a
+// solid footing (o.footing colour) over land; it stops where the ground reaches deck height. o.rail: 1.2 m handrail.
+function deck(x0, z0, x1, z1, y, o = {}) {
+  const water = o.water ?? (() => false), footing = o.footing ?? P.under;
+  for (let fx = x0; fx <= x1; fx++) for (let fz = z0; fz <= z1; fz++) {
+    const t = topAt(fx, fz);
+    if (t === -OUT || t >= y) continue;
+    const along = o.alongX ? fx - x0 : fz - z0;
+    fset(fx, y, fz, P.wood[along % 3]);
+    const side = o.alongX ? (fz === z0 || fz === z1) : (fx === x0 || fx === x1);
+    if (side && along % 5 === 0) for (let yy = t + 1; yy < y; yy++) fset(fx, yy, fz, pick(P.woodDark));
+    else if (!water(fx, fz) && t < y - 1) for (let yy = t + 1; yy < y; yy++) fset(fx, yy, fz, col(footing, fx, yy, fz));
+    if (side && o.rail && along % 4 === 0) for (let k = 1; k < cells(1.2); k++) fset(fx, y + k, fz, P.woodDark[0]);
+    if (side && o.rail) fset(fx, y + cells(1.2), fz, P.wood[1]);
+  }
+}
+// square lattice tower section (fine cells): corner columns ct thick, ring beams every seg layers, X braces on all
+// four faces. cc = columns/beams, cb = braces.
+function lattice(X0, X1, Z0, Z1, Y0, Y1, seg, cc, cb, ct = 1) {
+  for (const [x, z] of [[X0, Z0], [X1 - ct + 1, Z0], [X0, Z1 - ct + 1], [X1 - ct + 1, Z1 - ct + 1]]) fbox(x, Y0, z, x + ct - 1, Y1, z + ct - 1, cc);
+  for (let y = Y0; y <= Y1; y += seg) {
+    const y1 = Math.min(Y1, y + 1);
+    fbox(X0, y, Z0, X1, y1, Z0, cc); fbox(X0, y, Z1, X1, y1, Z1, cc);
+    fbox(X0, y, Z0, X0, y1, Z1, cc); fbox(X1, y, Z0, X1, y1, Z1, cc);
+  }
+  const L = (a, b, c, d, e, f) => limb(a / S, b / S, c / S, d / S, e / S, f / S, cb, 1);
+  for (let y = Y0; y + seg <= Y1; y += seg) {
+    const ya = y + 2, yb = y + seg - 1;
+    for (const z of [Z0, Z1]) { L(X0, ya, z, X1, yb, z); L(X1, ya, z, X0, yb, z); }
+    for (const x of [X0, X1]) { L(x, ya, Z0, x, yb, Z1); L(x, ya, Z1, x, yb, Z0); }
+  }
+}
+// truss beam along +x between fine x0..x1, z0..z1: top chord at yt, bottom chord sloping yb0 -> yb1, verticals and
+// diagonals every 6 cells
+function trussX(x0, x1, z0, z1, yt, yb0, yb1, c) {
+  fbox(x0, yt - 1, z0, x1, yt, z1, c);
+  const yb = x => Math.round(yb0 + (yb1 - yb0) * (x - x0) / Math.max(1, x1 - x0));
+  for (let x = x0; x <= x1; x++) fbox(x, yb(x), z0, x, yb(x) + 1, z1, c);
+  for (let x = x0; x <= x1; x += 6) {
+    fbox(x, yb(x), z0, x, yt, z0, c); fbox(x, yb(x), z1, x, yt, z1, c);
+    const xn = Math.min(x1, x + 6);
+    for (const z of [z0, z1]) limb(x / S, (yb(x) + 1) / S, z / S, xn / S, (yt - 1) / S, z / S, c, 1);
+  }
+}
+
+// ---------- sprites: detailed props authored in fine cells ----------
+// Author at SPRITE_S (cells of M_PER_UNIT / SPRITE_S metres); q() rescales to the current ?res. q(0) must be 0 —
+// with Math.max(1, …) rows 0 and 1 both map to cell 1 and every sprite floats a cell up.
+// s = sprite(ox, oy, oz, rot): local x = width, y = up, z = length (front = +z); rot turns it in 90° steps about y.
+// s(x, y, z, c, e) puts a cell, s.box(…) a box, s.w(x, y, z) gives design coordinates (for limb), s.f(…) fine (for lamp).
+const SPRITE_S = 3;
+const q = n => Math.round(n * S / SPRITE_S);
+function sprite(ox, oy, oz, rot = 0) {
+  const tr = (a, d) => rot === 0 ? [a, d] : rot === 1 ? [d, -a] : rot === 2 ? [-a, -d] : [-d, a];
+  const put = (x, y, z, c, e = false) => {
+    const cc = col(c, x + ox, y, z + oz);
+    for (let a = q(x); a < Math.max(q(x) + 1, q(x + 1)); a++) for (let b = q(y); b < Math.max(q(y) + 1, q(y + 1)); b++)
+      for (let d = q(z); d < Math.max(q(z) + 1, q(z + 1)); d++) { const [X, Z] = tr(a, d); fset(ox + X, oy + b, oz + Z, cc, e); }
+  };
+  put.box = (x0, y0, z0, x1, y1, z1, c, e) => { for (let x = x0; x <= x1; x++) for (let y = y0; y <= y1; y++) for (let z = z0; z <= z1; z++) put(x, y, z, c, e); };
+  put.w = (x, y, z) => { const [X, Z] = tr(q(x), q(z)); return [(ox + X) / S, (oy + q(y)) / S, (oz + Z) / S]; };
+  put.f = (x, y, z) => { const [X, Z] = tr(q(x), q(z)); return [ox + X, oy + q(y), oz + Z]; };
+  return put;
+}
+
+// ---------- Neon District: scene ----------
+// M_PER_UNIT = 1.0 m, S = 2 -> a fine voxel is 0.5 m; a storey is 3.5 units (7 fine rows).
+// (u, v) are design offsets from the island centre; FX/FZ/FY give the first fine cell of a design coordinate.
+const X = u => CX + u, Z = v => CZ + v;
+const FX = u => (CX + u) * S, FZ = v => (CZ + v) * S, FY = y => Math.round(y * S);
+const BY = TOP;                                   // fine level everything on the pavement stands on
+const FLOOR = 7;                                  // fine rows per storey
+const inWall = (x, z, X0, X1, Z0, Z1) => x === X0 || x === X1 || z === Z0 || z === Z1;
+const darker = (c, k) => tmp.set(c).multiplyScalar(k).getHex();
+// nearest glowing voxel within R cells of a fine point (lamp sources whose exact cell depends on a pattern)
+function findGlow(fx, fy, fz, R = 3) {
+  let best = null, bd = Infinity;
+  for (let x = fx - R; x <= fx + R; x++) for (let y = fy - R; y <= fy + R; y++) for (let z = fz - R; z <= fz + R; z++) {
+    const v = V.get(key(x, y, z)), d = (x - fx) ** 2 + (y - fy) ** 2 + (z - fz) ** 2;
+    if (v && v.e === true && d < bd) { bd = d; best = [x, y, z]; }
+  }
+  if (!best) console.warn(`findGlow: nothing glowing near ${fx},${fy},${fz}`);
+  return best;
+}
+// sub-prop inside a bigger prop: names its voxels, then hands the name back to the enclosing prop
+let PROP_STACK = [];
+const subProp = (name, real) => { PROP_STACK.push(PROP); if (name) prop(name, real); };
+const endSub = () => { PROP = PROP_STACK.pop() ?? null; };
+
+// ---------- neon fixtures (every glowing thing registers its light) ----------
+// flush LED / neon panel on a wall plane: replaces the wall cells; darker "content pixels" break the flat colour; dark frame
+function screenPanel(axis, l, dir, A0, A1, Y0, Y1, o = {}) {
+  const c = o.c ?? P.neonCyan2, px = o.px ?? P.neonCyanDim;
+  subProp(o.name, [(A1 - A0 + 3) / S, (Y1 - Y0 + 3) / S, 0.5 + (o.depth ?? 0)]);
+  for (let a = A0 - 1; a <= A1 + 1; a++) for (let y = Y0 - 1; y <= Y1 + 1; y++) {
+    if (o.clear !== false) pdel(axis, a, y, l + dir);
+    if (a < A0 || a > A1 || y < Y0 || y > Y1) { if (o.frame !== false) pset(axis, a, y, l, o.frameC ?? P.metalDark); continue; }
+    const p = (a !== A0 || y !== Y0) && hash(a, y, 405 + l) < (o.pxP ?? 0.3);
+    pset(axis, a, y, l, p ? px : Array.isArray(c) ? c[Math.floor(hash(a >> 1, y >> 1, 406) * c.length)] : c, !p);
+  }
+  if (o.lamp !== false) {
+    const ac = (A0 + A1) >> 1, yc = (Y0 + Y1) >> 1, src = axis === 'x' ? [A0, Y0, l] : [l, Y0, A0];
+    const at = axis === 'x' ? [ac, yc, l + 2 * dir] : [l + 2 * dir, yc, ac];
+    lamp(src, ...at, { color: o.lampC ?? (Array.isArray(c) ? c[0] : c), power: o.power ?? 1.2, r: o.r ?? Math.max(6, (A1 - A0 + 1) / S * 1.1), wrap: 0.35 });   // no cone: a halo on the wall around the panel
+  }
+  endSub();
+}
+// billboard proud of the wall: steel backing board one cell out (touching the wall), the lit panel on its face, a catwalk under it
+function billboard(axis, l, dir, A0, A1, Y0, Y1, o = {}) {
+  subProp(o.name, [(A1 - A0 + 3) / S, (Y1 - Y0 + 4) / S, 1.0]);
+  for (let a = A0 - 1; a <= A1 + 1; a++) for (let y = Y0 - 1; y <= Y1 + 1; y++) pset(axis, a, y, l + dir, P.metalDark);
+  screenPanel(axis, l + 2 * dir, dir, A0, A1, Y0, Y1, { ...o, name: undefined });
+  for (let a = A0 - 1; a <= A1 + 1; a++) { pset(axis, a, Y0 - 2, l + dir, P.metalDark); pset(axis, a, Y0 - 2, l + 2 * dir, P.metal[0]); }
+  endSub();
+}
+// blade sign: a one-cell-thick vertical neon sign standing out from the wall on brackets, rows of lit "characters" with dark gaps
+function vsign(axis, l, dir, a, Y0, Y1, c, o = {}) {
+  const depth = o.depth ?? 4, back = o.back ?? P.metalDark;
+  subProp(o.name, [0.5, (Y1 - Y0 + 1) / S, depth / S]);
+  for (let y = Y0; y <= Y1; y++) {
+    if ((y - Y0) % 6 === 0 || y === Y1) pset(axis, a, y, l + dir, P.iron);                       // brackets
+    const ch = (y - Y0) % 3 !== 2;
+    for (let k = 2; k <= depth; k++) {
+      const on = ch && !(k === depth && hash(a, y, 407) < 0.5);
+      pset(axis, a, y, l + k * dir, on ? c : back, on);
+    }
+  }
+  let yy = (Y0 + Y1) >> 1; if ((yy - Y0) % 3 === 2) yy--;
+  const src = axis === 'x' ? [a, yy, l + 2 * dir] : [l + 2 * dir, yy, a], at = axis === 'x' ? [a, yy, l + dir] : [l + dir, yy, a];   // lamp in the gap by the wall: a halo beside the blade
+  lamp(src, ...at, { color: c, power: o.power ?? 1.6, r: o.r ?? 11, wrap: 0.5 });
+  endSub();
+}
+// horizontal neon tube along a wall, one cell out
+function strip(axis, l, dir, A0, A1, y, c, o = {}) {
+  for (let a = A0; a <= A1; a++) {
+    pset(axis, a, y, l + dir, c, true);
+    if ((a - A0) % (o.every ?? 10) === 5) {
+      const src = axis === 'x' ? [a, y, l + dir] : [l + dir, y, a], at = axis === 'x' ? [a, y, l + 2 * dir] : [l + 2 * dir, y, a];
+      lamp(src, ...at, { color: c, power: o.power ?? 0.6, r: o.r ?? 5, wrap: 0.5 });
+    }
+  }
+}
+// glowing ring on a roof edge (setback ledges, crowns)
+function ringStrip(X0, X1, Z0, Z1, y, c, o = {}) {
+  let n = 0;
+  for (let x = X0; x <= X1; x++) for (let z = Z0; z <= Z1; z++) {
+    if (!inWall(x, z, X0, X1, Z0, Z1)) continue;
+    fset(x, y, z, c, true);
+    if (n++ % (o.every ?? 12) === 0) lamp([x, y, z], x, y + 1, z, { color: c, power: o.power ?? 0.6, r: o.r ?? 6, wrap: 0.5 });
+  }
+}
+// red aviation light: one glowing cell with a small pool
+function aviation(fx, fy, fz, o = {}) {
+  fset(fx, fy, fz, 0xff3030, true);
+  lamp([fx, fy, fz], fx, fy, fz, { color: 0xff3030, power: o.power ?? 0.8, r: o.r ?? 5, wrap: 0.6 });
+}
+// mast: a one-cell pole (2x2 at the foot) with an aviation light on top; stands on fine (fx, fy0, fz)
+function mast(fx, fy0, fz, h, o = {}) {
+  for (let y = fy0; y < fy0 + Math.min(h, 4); y++) fbox(fx, y, fz, fx + 1, y, fz + 1, P.iron);
+  for (let y = fy0; y < fy0 + h; y++) fset(fx, y, fz, P.iron);
+  if (o.rung) for (let y = fy0 + 6; y < fy0 + h; y += 5) fset(fx + 1, y, fz, P.iron);
+  aviation(fx, fy0 + h, fz, o);
+}
+
+// ---------- building parts ----------
+// window grid on a wall plane (fine cells): panes w x wh at every floor, glass at the wall plane with a closed backdrop one
+// cell inside; lit rooms glow (warm, white or cool), some have blinds, some are dim; the rest are dark glass
+function facade(axis, l, dir, A0, A1, Y0, Y1, o = {}) {
+  const w = o.w ?? 3, wh = o.wh ?? 4, gap = o.gap ?? 2, fh = o.floorH ?? FLOOR, sill = o.sill ?? 2, litP = o.lit ?? 0.35, seed = o.seed ?? 0;
+  const pal = o.pal ?? [P.warmWin, P.warmWin, P.warmWin2, P.whiteWin, P.coolWin];
+  let gotLamp = false;
+  for (let f0 = Y0 + (o.skipGround ? fh : 0); f0 + sill + wh <= Y1; f0 += fh) {
+    const off = Math.floor(hash(l, 0, seed + 9) * 2);                                   // constant per face: windows stack on shared lines
+    for (let a0 = A0 + off; a0 + w - 1 <= A1; a0 += w + gap) {
+      const lit = hash(a0, f0, seed) < litP, c = pal[Math.floor(hash(f0, a0, seed + 1) * pal.length)];
+      const blinds = hash(a0 + 1, f0, seed + 2) < 0.3, dim = hash(a0, f0 + 1, seed + 3) < 0.3;
+      if (lit && !dim && (!gotLamp || hash(a0, f0, seed + 5) < 0.1)) {
+        gotLamp = true;
+        const src = axis === 'x' ? [a0, f0 + sill, l - dir] : [l - dir, f0 + sill, a0], at = axis === 'x' ? [a0 + 1, f0 + sill + 1, l + 2 * dir] : [l + 2 * dir, f0 + sill + 1, a0 + 1];
+        lamp(src, ...at, { color: c, power: 0.7, r: 5, wrap: 0.4 });
+      }
+      for (let a = a0; a < a0 + w; a++) for (let y = f0 + sill; y < f0 + sill + wh; y++) {
+        pset(axis, a, y, l, GLASS, 'glass');
+        let bc = P.winDark, e = false;
+        if (lit && dim) bc = P.winDim;
+        else if (lit) { e = true; bc = blinds && (y - f0) % 2 ? darker(c, 0.5) : c; }
+        else if (hash(a, y, 77) < 0.08) bc = 0x1a2a38;
+        pset(axis, a, y, l - dir, bc, e);
+      }
+    }
+  }
+}
+// narrow slit windows (one cell wide, 4 high) every 3 cells: the monolith's look; lit ones warm orange
+function slits(axis, l, dir, A0, A1, Y0, Y1, o = {}) {
+  const litP = o.lit ?? 0.25, seed = o.seed ?? 0;
+  for (let f0 = Y0; f0 + 6 <= Y1; f0 += FLOOR) for (let a = A0 + 1; a <= A1 - 1; a += 3) {
+    const lit = hash(a, f0, seed) < litP, c = hash(a, f0, seed + 1) < 0.7 ? 0xf2a860 : P.whiteWin;
+    for (let y = f0 + 1; y < f0 + 5; y++) { pset(axis, a, y, l, GLASS, 'glass'); pset(axis, a, y, l - dir, lit ? c : P.winDark, lit); }
+  }
+}
+// curtain wall between fins (the hero): floor-high glass with a steel mullion every 3 cells; rooms lit in runs
+function curtain(axis, l, dir, A0, A1, Y0, Y1, o = {}) {
+  const seed = o.seed ?? 0, pal = [P.whiteWin, P.coolWin, P.lobby, P.warmWin];
+  for (let f0 = Y0; f0 + FLOOR <= Y1 + 1; f0 += FLOOR) {
+    const nseg = Math.ceil((A1 - A0 + 1) / 6);
+    for (let s = 0; s < nseg; s++) {
+      const lit = hash(s, f0, seed) < (o.lit ?? 0.42), c = pal[Math.floor(hash(f0, s, seed + 1) * pal.length)], dim = hash(s, f0 + 3, seed) < 0.3;
+      for (let a = A0 + s * 6; a < Math.min(A1 + 1, A0 + s * 6 + 6); a++) {
+        if ((a - A0) % 6 === 0) continue;                                                 // fin column
+        if ((a - A0) % 6 === 3) { for (let y = f0 + 1; y < f0 + FLOOR - 1; y++) pset(axis, a, y, l, P.fin); continue; }   // mullion
+        for (let y = f0 + 1; y < f0 + FLOOR - 1; y++) {
+          pset(axis, a, y, l, GLASS, 'glass');
+          pset(axis, a, y, l - dir, lit ? (dim ? P.winDim : (y - f0) === 1 && hash(a, y, 5) < 0.4 ? darker(c, 0.6) : c) : P.winDark, lit && !dim);
+        }
+      }
+    }
+  }
+}
+// stacked LED panels up a face (the hero's ribbon): 5 rows each, 2-row steel gap; lit cyan, white, dim or off; a lamp on alternate lit ones
+function screenRibbon(axis, l, dir, A0, A1, Y0, Y1, o = {}) {
+  let k = 0;
+  for (let y0 = Y0; y0 + 5 <= Y1; y0 += 7, k++) {
+    const h = hash(A0, y0, 404 + l), glow = h < 0.7, c = h < 0.5 ? P.neonCyan2 : h < 0.7 ? 0xbafdfc : h < 0.86 ? P.neonCyanDim : P.screenOff;
+    for (let a = A0; a <= A1; a++) for (let y = y0; y < y0 + 5; y++) {
+      const p = (a !== A0 || y !== y0) && hash(a, y, 405) < 0.28;
+      pset(axis, a, y, l, p ? (glow ? P.neonCyanDim : 0x021f35) : c, glow && !p);
+    }
+    for (let a = A0 - 1; a <= A1 + 1; a++) { pset(axis, a, y0 - 1, l, P.fin); pset(axis, a, y0 + 5, l, P.fin); }
+    if (glow && k % 2 === 0) {
+      const ac = (A0 + A1) >> 1, src = axis === 'x' ? [A0, y0, l] : [l, y0, A0], at = axis === 'x' ? [ac, y0 + 2, l + 2 * dir] : [l + 2 * dir, y0 + 2, ac];
+      lamp(src, ...at, { color: c, power: 1.0, r: 9, wrap: 0.35 });
+    }
+  }
+  for (let y = Y0 - 1; y <= Y1; y++) { pset(axis, A0 - 1, y, l, P.fin); pset(axis, A1 + 1, y, l, P.fin); }
+  for (let a = A0 - 1; a <= A1 + 1; a++) for (let y = Y0 - 1; y <= Y1; y++) pdel(axis, a, y, l + dir);   // no fins over the screens
+}
+// lit ground-floor shop fronts along a face: glass between brick/steel pillars, a glowing interior with shelves and figures, a door
+function retail(axis, l, dir, A0, A1, o = {}) {
+  const Y0 = BY, seed = o.seed ?? 0, cols = o.cols ?? [P.warmWin, P.coolWin, 0xf8f3d0, P.neonMagBright];
+  let n = 0;
+  for (let a0 = A0; a0 + 5 <= A1; a0 += 8, n++) {
+    const c = cols[Math.floor(hash(a0, l, seed) * cols.length)], dark = hash(a0, l, seed + 2) < 0.2;
+    for (let a = a0; a < a0 + 7 && a <= A1; a++) for (let y = Y0 + 1; y <= Y0 + 5; y++) {
+      pset(axis, a, y, l, GLASS, 'glass');
+      const thing = hash(a, y, seed + 3) < 0.22;
+      pset(axis, a, y, l - dir, dark ? (thing ? 0x1a1a22 : 0x10161c) : thing ? 0x3a2a24 : c, !dark && !thing);
+    }
+    if (!dark) {
+      const src = axis === 'x' ? [a0, Y0 + 1, l - dir] : [l - dir, Y0 + 1, a0];
+      if (hash(a0, Y0 + 1, seed + 3) >= 0.22) { const at = axis === 'x' ? [a0 + 3, Y0 + 3, l + 2 * dir] : [l + 2 * dir, Y0 + 3, a0 + 3]; lamp(src, ...at, { color: c, power: 1.1, r: 8, dir: axis === 'x' ? [0, 0, dir] : [dir, 0, 0], cone: 0, wrap: 0.1 }); }
+      if (n % 2 === 1) for (let y = Y0; y <= Y0 + 4; y++) { pdel(axis, a0 + 3, y, l); pset(axis, a0 + 3, y, l - dir, c, true); }   // open doorway
+    }
+    for (let a = a0 - 1; a <= a0 + 7; a++) pset(axis, a, Y0 + 6, l + dir, hash(a, l, seed + 4) < 0.5 ? P.metalDark : P.metal[1]);   // fascia / sign board
+  }
+}
+// a mid-rise block: hollow shell with floor bands, parapet, flat roof; windows on every face; optional lit ground floor
+function block(name, u0, v0, u1, v1, h, o = {}) {
+  const X0 = FX(u0), X1 = FX(u1) - 1, Z0 = FZ(v0), Z1 = FZ(v1) - 1, Y0 = BY, Y1 = BY + Math.round(h * S) - 1;
+  const pal = o.pal ?? P.concrete, sp = o.spandrel ?? darker(pal[0], 1.35);
+  prop(name, [u1 - u0, h + (o.extraH ?? 0.5), v1 - v0]);
+  STAGE = 1;
+  for (let x = X0; x <= X1; x++) for (let z = Z0; z <= Z1; z++) for (let y = Y0; y <= Y1; y++) {
+    if (y === Y1) { fset(x, y, z, hash(x, z, 31) < 0.05 ? 0x30353b : col(P.roof, x, y, z)); continue; }
+    if (!inWall(x, z, X0, X1, Z0, Z1)) continue;
+    fset(x, y, z, (y - Y0) % FLOOR === FLOOR - 1 && o.bands !== false ? sp : col(pal, x, y, z));
+  }
+  for (let x = X0; x <= X1; x++) for (let z = Z0; z <= Z1; z++) if (inWall(x, z, X0, X1, Z0, Z1)) fset(x, Y1 + 1, z, o.parapetC ?? P.roofCap);
+  if (o.piers) for (const [x, z] of [[X0, Z0], [X1, Z0], [X0, Z1], [X1, Z1]]) for (let y = Y0; y <= Y1 + 1; y++) fset(x, y, z, P.fin);
+  STAGE = 2;
+  const faces = { front: ['x', Z1, 1, X0 + 2, X1 - 2], back: ['x', Z0, -1, X0 + 2, X1 - 2], right: ['z', X1, 1, Z0 + 2, Z1 - 2], left: ['z', X0, -1, Z0 + 2, Z1 - 2] };
+  for (const f in faces) {
+    const [axis, l, dir, A0, A1] = faces[f], ret = (o.retail ?? []).includes(f);
+    facade(axis, l, dir, A0, A1, Y0, Y1 - 2, { ...o.win, seed: (hash(X0, Z0, l) * 1000) | 0, skipGround: ret || o.win?.skipGround });
+    if (ret) retail(axis, l, dir, A0, A1, { seed: (hash(l, X0, Z0) * 1000) | 0 });
+  }
+  const b = { X0, X1, Z0, Z1, Y0, Y1, name, cx: (X0 + X1) / 2, cz: (Z0 + Z1) / 2 };
+  STAGE = 3;
+  roofStuff(b, o.roof ?? {});
+  prop();
+  return b;
+}
+// rooftop clutter: AC units, a water tank on legs, vent pipes, an antenna with a red light on tall blocks
+function roofStuff(b, o) {
+  const y = b.Y1 + 1, s = (hash(b.X0, b.Z0, 61) * 100) | 0;
+  const spots = [];
+  const free = (x, z, r) => spots.every(([sx, sz, sr]) => Math.abs(sx - x) > sr + r + 1 || Math.abs(sz - z) > sr + r + 1);
+  const place = (r, tries = 12) => {
+    for (let i = 0; i < tries; i++) {
+      const x = b.X0 + 3 + Math.floor(hash(s, i, 62) * (b.X1 - b.X0 - 6 - 2 * r)) + r, z = b.Z0 + 3 + Math.floor(hash(i, s, 63) * (b.Z1 - b.Z0 - 6 - 2 * r)) + r;
+      if (free(x, z, r)) { spots.push([x, z, r]); return [x, z]; }
+    }
+    return null;
+  };
+  const nAC = o.ac ?? 2 + Math.floor(hash(s, 1, 64) * 3);
+  for (let i = 0; i < nAC; i++) { const p = place(1); if (p) { fbox(p[0], y, p[1], p[0] + 1, y + 1, p[1] + 1, P.metal); fset(p[0], y + 2, p[1], P.metalDark); } }
+  if (o.tank !== false) { const p = place(2); if (p) {
+    for (const [a, c] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) fbox(p[0] + a, y, p[1] + c, p[0] + a, y + 1, p[1] + c, P.iron);
+    disc(dc(p[0]), dc(p[1]), 0, 1.0, y + 2, y + 5, P.metal); disc(dc(p[0]), dc(p[1]), 0, 0.5, y + 6, y + 6, P.metalDark);
+  } }
+  for (let i = 0; i < (o.vents ?? 2); i++) { const p = place(0); if (p) { for (let k = 0; k < 2 + (i % 2); k++) fset(p[0], y + k, p[1], P.metal[1]); fset(p[0], y + 2 + (i % 2), p[1], P.metalDark); } }
+  if (o.mast) { const p = place(1); if (p) mast(p[0], y, p[1], o.mast, { rung: true }); }
+  if (o.corners) for (const [x, z] of [[b.X0, b.Z0], [b.X1, b.Z0], [b.X0, b.Z1], [b.X1, b.Z1]]) aviation(x, y + 1, z, { power: 0.5, r: 3 });
+}
+
+// ---------- street props ----------
+function fsprite(ox, oy, oz, rot = 0) {
+  const tr = (a, d) => rot === 0 ? [a, d] : rot === 1 ? [d, -a] : rot === 2 ? [-a, -d] : [-d, a];
+  const put = (x, y, z, c, e = false) => { const [Xr, Zr] = tr(x, z); fset(ox + Xr, oy + y, oz + Zr, col(c, x, y, z), e); };
+  put.f = (x, y, z) => { const [Xr, Zr] = tr(x, z); return [ox + Xr, oy + y, oz + Zr]; };
+  return put;
+}
+const CAR_COLS = { silver: 0x8a8f96, black: 0x23272e, red: 0xa83028, taxi: 0xd9b22a, blue: 0x3a5a88, white: 0xd8d8d4, green: 0x3a6a4a };
+// hatchback 4 x 3 x 8 cells (2.0 x 1.5 x 4.0 m): wheels and sills, body with lit head and tail lights, glass cabin, roof. front = local +z
+function car(name, u, v, rot, c, o = {}) {
+  const fx = FX(u), fz = FZ(v), base = topAt(fx, fz) + 1;
+  prop(name, [1.8, 1.5, 4.1]);
+  const s = fsprite(fx, base, fz, rot), dark = 0x15171b, body = typeof c === 'string' ? CAR_COLS[c] : c, roofC = darker(body, 0.8);
+  for (let z = 0; z < 8; z++) for (let x = 0; x < 4; x++) {
+    const side = x === 0 || x === 3, wheel = side && (z === 1 || z === 6);
+    s(x, 0, z, wheel ? 0x0c0d10 : side || z === 0 || z === 7 ? darker(body, 0.75) : dark);
+    let c1 = body, e = false;
+    if (z === 7 && side) { c1 = o.parked ? 0x9a9a90 : 0xfff0c8; e = !o.parked; }      // headlights (dark lenses when parked)
+    else if (z === 0 && side) { c1 = o.parked ? 0x5a1a1a : 0xff2a1a; e = !o.parked; }  // tail lights
+    else if (z === 5 || z === 2) c1 = side ? body : GLASS;                   // screens between pillars
+    else if (z === 3 || z === 4) c1 = side ? GLASS : 0x1e2026;               // side windows, seats
+    s(x, 1, z, c1, c1 === GLASS ? 'glass' : e);
+    if (z >= 2 && z <= 5) s(x, 2, z, hash(x, z, 9) < 0.1 ? darker(roofC, 0.9) : roofC);
+  }
+  if (!o.parked) { const [hx, hy, hz] = s.f(0, 1, 7), [ax, ay, az] = s.f(1.5, 1, 9), d = [ax - hx, 0, az - hz], n = Math.hypot(d[0], d[2]) || 1;
+    lamp([hx, hy, hz], ax, ay, az, { color: 0xfff0c8, power: 1.2, r: 7, dir: [d[0] / n, -0.2, d[2] / n], cone: 0.45, wrap: 0.1 }); }
+  if (o.roofSign) { const [rx, ry, rz] = s.f(1, 3, 3); fbox(rx, ry, rz, rx + (rot % 2 ? 0 : 1), ry, rz + (rot % 2 ? 1 : 0), P.warmWin, true); lamp([rx, ry, rz], rx, ry + 1, rz, { color: P.warmWin, power: 0.6, r: 3, wrap: 0.6 }); }
+  prop();
+}
+// delivery van 4 x 4 x 11 cells (2.0 x 2.0 x 5.5 m)
+function van(name, u, v, rot, c) {
+  const fx = FX(u), fz = FZ(v), base = topAt(fx, fz) + 1;
+  prop(name, [2.0, 2.1, 5.5]);
+  const s = fsprite(fx, base, fz, rot), body = typeof c === 'string' ? CAR_COLS[c] : c;
+  for (let z = 0; z < 11; z++) for (let x = 0; x < 4; x++) {
+    const side = x === 0 || x === 3, wheel = side && (z === 1 || z === 8);
+    s(x, 0, z, wheel ? 0x0c0d10 : side || z === 0 || z === 10 ? darker(body, 0.7) : 0x15171b);
+    for (let y = 1; y <= 3; y++) {
+      let c1 = body, e = false, g = false;
+      if (y === 1 && z === 10 && side) { c1 = 0xfff0c8; e = true; }
+      else if (y === 1 && z === 0 && side) { c1 = 0xff2a1a; e = true; }
+      else if (y === 2 && z === 10 && !side) g = true;                                   // windscreen
+      else if (y === 2 && z >= 8 && z <= 9 && side) g = true;                            // cab side windows
+      else if (y === 3 && z >= 9) continue;                                              // cab roof lower than the box
+      else if (!side && z > 0 && z < 10 && y < 3) c1 = 0x1a1c22;                        // inside the box
+      if (y === 3 && z <= 8 && (z === 0 || z === 8 || side)) c1 = darker(body, 0.85);
+      s(x, y, z, g ? GLASS : c1, g ? 'glass' : e);
+    }
+  }
+  const [hx, hy, hz] = s.f(0, 1, 10), [ax, ay, az] = s.f(1.5, 1, 12), d = [ax - hx, 0, az - hz], n = Math.hypot(d[0], d[2]) || 1;
+  lamp([hx, hy, hz], ax, ay, az, { color: 0xfff0c8, power: 1.2, r: 7, dir: [d[0] / n, -0.2, d[2] / n], cone: 0.45, wrap: 0.1 });
+  prop();
+}
+// a pedestrian: legs, coat, head; optional umbrella (3x3 canopy held over the head)
+function person(name, fx, fz, o = {}) {
+  const b = topAt(fx, fz) + 1, coat = o.coat ?? pick([0x2a2a34, 0x3a2e2a, 0x1e2a3a, 0x4a3a44, 0x2e3a2e]);
+  prop(name, o.umbrella ? [1.5, 2.5, 1.5] : [0.6, 2.0, 0.6]);
+  fset(fx, b, fz, 0x1a1a22); fset(fx, b + 1, fz, coat); fset(fx, b + 2, fz, coat); fset(fx, b + 3, fz, o.hood ? coat : 0x8a6a58);
+  if (o.umbrella) for (let a = -1; a <= 1; a++) for (let c = -1; c <= 1; c++) fset(fx + a, b + 4, fz + c, o.umbrella === true ? 0x8a2020 : o.umbrella);
+  prop();
+}
+// vending machine against a wall: body two cells deep, glowing front panel
+function vending(name, axis, l, dir, a, o = {}) {
+  const b = topAt(axis === 'x' ? a : l + dir, axis === 'x' ? l + dir : a) + 1, c = o.c ?? P.coolWin;
+  prop(name, [1.0, 2.0, 1.0]);
+  for (let i = 0; i < 2; i++) for (let y = b; y < b + 4; y++) { pset(axis, a + i, y, l + dir, 0x2a3038); pset(axis, a + i, y, l + 2 * dir, y >= b + 1 && y <= b + 2 ? c : y === b + 3 ? 0x2a3038 : P.metalDark, y >= b + 1 && y <= b + 2); }
+  const src = axis === 'x' ? [a, b + 1, l + 2 * dir] : [l + 2 * dir, b + 1, a], at = axis === 'x' ? [a + 0.5, b + 2, l + 3 * dir] : [l + 3 * dir, b + 2, a + 0.5];
+  lamp(src, ...at, { color: c, power: 0.9, r: 4, wrap: 0.4 });
+  prop();
+}
+function dumpster(name, fx, fz, rot = 0, c = 0x1e3a2a) {
+  const b = topAt(fx, fz) + 1, s = fsprite(fx, b, fz, rot);
+  prop(name, [1.8, 1.5, 1.0]);
+  for (let x = 0; x < 4; x++) for (let z = 0; z < 2; z++) { s(x, 0, z, darker(c, 0.8)); s(x, 1, z, c); s(x, 2, z, hash(x, z, 3) < 0.15 ? darker(c, 0.6) : darker(c, 0.9)); }
+  prop();
+}
+function bench(name, fx, fz, alongX = true) {
+  const b = topAt(fx, fz) + 1;
+  prop(name, [1.8, 0.9, 0.5]);
+  for (let i = 0; i < 4; i++) { const x = alongX ? fx + i : fx, z = alongX ? fz : fz + i; if (i === 0 || i === 3) fset(x, b, z, P.iron); fset(x, b + 1, z, P.wood[i % 3]); if (alongX) fset(x, b + 2, z + 0, i === 1 ? P.wood[0] : P.wood[2]); else fset(x, b + 2, z, P.wood[1]); }
+  prop();
+}
+function crates(name, fx, fz, n = 3) {
+  const b = topAt(fx, fz) + 1;
+  prop(name, null);
+  for (let i = 0; i < n; i++) { const x = fx + (i % 2) * 2, z = fz + Math.floor(i / 2), y = b + (i === 2 ? 1 : 0); fbox(x, y, z, x + 1, y, z, [0x5a4a34, 0x4e4030]); }
+  prop();
+}
+// street lamp: 7 m pole, arm over the road, cool white head hanging under the arm end
+function streetLamp(name, u, v, dx, dz, o = {}) {
+  const fx = FX(u), fz = FZ(v), b = topAt(fx, fz) + 1, Hh = cells(7);
+  prop(name, [0.5, 7, 1.5]);
+  for (let y = b; y < b + Hh; y++) fset(fx, y, fz, y === b ? P.metalDark : P.iron);
+  fset(fx + dx, b + Hh - 1, fz + dz, P.iron); fset(fx + 2 * dx, b + Hh - 1, fz + 2 * dz, P.iron);
+  fset(fx + 2 * dx, b + Hh - 2, fz + 2 * dz, 0xd8ecff, true);
+  lamp([fx + 2 * dx, b + Hh - 2, fz + 2 * dz], fx + 2 * dx, b + Hh - 2.5, fz + 2 * dz, { color: 0xd8ecff, power: o.power ?? 2.2, r: o.r ?? 13, dir: [0, -1, 0], cone: 0.15, wrap: 0.3 });
+  prop();
+}
+// street tree in a planter: one-cell trunk, a few crown clumps with a branch into each
+function cityTree(name, u, v, h, r) {
+  prop(name, [r * 2.4, h + r * 0.8, r * 2.4]);   // clumps spread a little past the main crown
+  const x = X(u), z = Z(v), px = Math.round(x * S), pz = Math.round(z * S), gy = (topAt(px, pz) + 1) / S, tag = TAG;
+  const lx = (rnd() - 0.5) * h * 0.2, lz = (rnd() - 0.5) * h * 0.2, kx = x + lx * 0.4, kz = z + lz * 0.4, tx = x + lx, tz = z + lz;
+  limb(x, gy, z, kx, gy + h * 0.55, kz, P.bark, 1);
+  limb(kx, gy + h * 0.55, kz, tx, gy + h, tz, P.bark, 1);
+  const n = 3 + Math.floor(rnd() * 2), own = P.leaf.map(c => tmp.set(c).offsetHSL((rnd() - 0.5) * 0.03, 0, (rnd() - 0.5) * 0.06).getHex());
+  for (let i = 0; i < n; i++) {
+    const main = i === 0, rr = main ? r : r * (0.5 + rnd() * 0.4), dx = main ? 0 : (rnd() - 0.5) * r * 1.5, dz = main ? 0 : (rnd() - 0.5) * r * 1.5, dy = main ? 0 : (rnd() - 0.6) * r * 0.8;
+    limb(kx, gy + h * 0.55, kz, tx + dx, gy + h + dy - rr * 0.4, tz + dz, P.bark, 1);
+    TAG = 6; blob(tx + dx, gy + h + dy, tz + dz, rr, own, 0.8 + rnd() * 0.15, 1.3); TAG = tag;
+    CANOPY.push([tx + dx, tz + dz, rr]);
+  }
+  prop();
+}
+// steam from a rooftop vent: a short pipe and a column of overlapping puffs drifting sideways (TAG 1)
+function steam(name, fx, fz, y0, n = 4) {
+  prop(name, null);
+  for (let y = y0; y < y0 + 3; y++) fset(fx, y, fz, P.metal[1]);
+  const tag = TAG, st = STAGE; TAG = 1; STAGE = 4;
+  for (let i = 0; i < n; i++) blob(dc(fx) + Math.sin(i * 1.3) * 0.35 * i, dc(y0 + 2) + 0.6 + i * 1.1, dc(fz) + Math.cos(i * 0.9) * 0.3 * i, 0.8 + i * 0.35, P.smoke, 0.8, 0.8);   // dc(): centred on the pipe
+  TAG = tag; STAGE = st; prop();
+}
+
+// =====================================================================================================
+// THE DISTRICT
+// =====================================================================================================
+// ---------- hero tower: steel-framed glass spire with a ribbon of LED screens, setback at 62, crown at 90, mast to 106 ----------
+function heroTower() {
+  const U0 = -18, V0 = -9, U1 = -5, V1 = 5, H1 = 62, H2 = 90;
+  prop('hero-tower', [15, 107, 16]);
+  const shaft = (u0, v0, u1, v1, y0, y1) => {
+    const X0 = FX(u0), X1 = FX(u1) - 1, Z0 = FZ(v0), Z1 = FZ(v1) - 1, Y0 = FY(y0), Y1 = FY(y1) - 1;
+    STAGE = 1;
+    for (let x = X0; x <= X1; x++) for (let z = Z0; z <= Z1; z++) for (let y = Y0; y <= Y1; y++) {
+      if (y === Y1) { fset(x, y, z, col(P.roof, x, y, z)); continue; }
+      if (!inWall(x, z, X0, X1, Z0, Z1)) continue;
+      fset(x, y, z, (y - BY) % FLOOR === FLOOR - 1 ? P.spandrel : col(P.steel, x, y, z));
+    }
+    const faces = [['x', Z1, 1, X0, X1], ['x', Z0, -1, X0, X1], ['z', X1, 1, Z0, Z1], ['z', X0, -1, Z0, Z1]];
+    for (const [axis, l, dir, A0, A1] of faces) {
+      for (let a = A0; a <= A1; a += 6) for (let y = Y0; y <= Y1; y++) pset(axis, a, y, l + dir, P.fin);          // vertical fins, one cell proud
+      for (let y = Y0; y <= Y1; y++) pset(axis, A1, y, l + dir, P.fin);
+    }
+    STAGE = 2;
+    for (const [axis, l, dir, A0, A1] of faces) curtain(axis, l, dir, A0, A1, Y0, Y1 - 1, { seed: l + y0 });
+    return { X0, X1, Z0, Z1, Y0, Y1 };
+  };
+  const lo = shaft(U0, V0, U1, V1, GY, GY + H1), hi = shaft(U0 + 1, V0 + 1, U1 - 1, V1 - 1, GY + H1, GY + H2);
+  STAGE = 2;
+  // the LED ribbon up the front, lower and upper shaft
+  screenRibbon('x', lo.Z1, 1, FX(-13), FX(-9) + 1, BY + 2 * FLOOR + 2, lo.Y1 - 2);
+  screenRibbon('x', hi.Z1, 1, FX(-13), FX(-9) + 1, hi.Y0 + 3, hi.Y1 - 2);
+  // side (+x, toward the avenue): a red billboard low down, a cyan blade sign, a magenta panel higher up, a big cyan screen at 50
+  billboard('z', lo.X1, 1, FZ(-6), FZ(-1) + 1, FY(GY + 22), FY(GY + 27), { c: [P.neonRed, P.neonOrange], px: P.neonRedDark, power: 1.6, r: 14, name: 'sign-hero-red' });
+  vsign('z', lo.X1, 1, FZ(2), FY(GY + 12), FY(GY + 40), P.neonCyan2, { power: 1.4, r: 9, name: 'sign-hero-blade' });
+  screenPanel('z', lo.X1, 1, FZ(-7), FZ(-1) + 1, FY(GY + 50), FY(GY + 57), { c: [P.neonCyan2, P.neonCyan], power: 1.4, r: 14 });
+  screenPanel('z', lo.X1, 1, FZ(0), FZ(3) + 1, FY(GY + 45), FY(GY + 48), { c: P.neonMag, px: P.neonMagDim, power: 1.2, r: 8 });
+  // left side (-x, toward block A's alley): a tall cyan panel and a white one
+  screenPanel('z', lo.X0, -1, FZ(-4), FZ(2) + 1, FY(GY + 30), FY(GY + 36), { c: [P.neonCyan2, P.neonCyan], power: 1.3, r: 12 });
+  vsign('z', lo.X0, -1, FZ(-7), FY(GY + 8), FY(GY + 26), P.neonMag, { power: 1.3, r: 8 });
+  // back: a few panels so the back view isn't blank
+  screenPanel('x', lo.Z0, -1, FX(-16), FX(-12) + 1, FY(GY + 38), FY(GY + 43), { c: P.neonOrange, px: P.neonRedDark, power: 1.3, r: 10 });
+  screenPanel('x', hi.Z0, -1, FX(-14), FX(-10) + 1, FY(GY + 72), FY(GY + 78), { c: [P.neonCyan2, P.neonCyan], power: 1.3, r: 12 });
+  // lobby: two storeys of glass on the front and avenue side, white-lit, an entrance opening under a canopy
+  for (const [axis, l, dir, A0, A1] of [['x', lo.Z1, 1, lo.X0, lo.X1], ['z', lo.X1, 1, lo.Z0, lo.Z1]]) {
+    for (let a = A0 + 1; a <= A1 - 1; a++) for (let y = BY + 1; y < BY + 2 * FLOOR - 1; y++) {
+      if ((a - A0) % 6 === 0 || y === BY + FLOOR - 1) { pset(axis, a, y, l, P.fin); continue; }
+      pset(axis, a, y, l, GLASS, 'glass');
+      const thing = hash(a, y, 511) < 0.18;
+      pset(axis, a, y, l - dir, thing ? 0x2a3440 : hash(a >> 2, 0, 512) < 0.5 ? P.lobby : P.whiteWin, !thing);
+    }
+    const src = axis === 'x' ? [A0 + 1, BY + 2, l - dir] : [l - dir, BY + 2, A0 + 1];
+    if (hash(A0 + 1, BY + 2, 511) >= 0.18) lamp(src, ...(axis === 'x' ? [(A0 + A1) / 2, BY + 4, l + 3] : [l + 3, BY + 4, (A0 + A1) / 2]), { color: P.lobby, power: 1.3, r: 12, dir: axis === 'x' ? [0, 0, 1] : [1, 0, 0], cone: 0, wrap: 0.15 });
+  }
+  for (let a = FX(-11); a <= FX(-10) + 1; a++) for (let y = BY; y <= BY + 5; y++) { fdel(a, y, lo.Z1); fset(a, y, lo.Z1 - 1, P.lobby, true); }   // entrance
+  STAGE = 3;
+  // canopy over the entrance: slab on two posts, cyan under-strip
+  fbox(FX(-13), BY + 6, lo.Z1 + 1, FX(-9) + 1, BY + 6, lo.Z1 + 4, P.metalDark);
+  for (const x of [FX(-13), FX(-9) + 1]) for (let y = BY; y < BY + 6; y++) fset(x, y, lo.Z1 + 4, P.iron);
+  strip('x', lo.Z1 + 4, 0, FX(-13), FX(-9) + 1, BY + 5, P.neonCyan2, { every: 6, power: 0.7, r: 5 });   // dir 0: on the slab's underside edge
+  // setback ledge ring and crown
+  ringStrip(lo.X0, lo.X1, lo.Z0, lo.Z1, lo.Y1 + 1, P.neonCyan2, { every: 10 });
+  for (let x = hi.X0; x <= hi.X1; x++) for (let z = hi.Z0; z <= hi.Z1; z++) if (inWall(x, z, hi.X0, hi.X1, hi.Z0, hi.Z1)) { fset(x, hi.Y1 + 1, z, P.steelLight); fset(x, hi.Y1 + 2, z, P.steelLight); }
+  ringStrip(hi.X0, hi.X1, hi.Z0, hi.Z1, hi.Y1 + 3, 0xbafdfc, { every: 10 });
+  shell(X(-14), GY + H2, Z(-5), X(-9), GY + H2 + 4, Z(0), P.fin);                          // mechanical penthouse
+  mast(FX(-11), FY(GY + H2 + 5), FZ(-2), FY(11), { rung: true, power: 1.0, r: 6 });
+  aviation(FX(-11) + 1, FY(GY + H2 + 10), FZ(-2), { power: 0.6, r: 4 });
+  // AC and vents on the ledge
+  prop();
+  // uplights washing the steel at the base (free-standing fixtures on the plaza)
+  for (const [i, a] of [FX(-17), FX(-15), FX(-7)].entries()) { prop(`uplight-hero-${i}`, [1, 0.5, 0.5]); uplight('x', lo.Z1, 1, a, { color: 0x62d5dc, power: 3.5, r: 26, cone: 0.15 }); prop(); }
+  return lo;
+}
+
+// ---------- monolith: dark slab tower with a sloped top, orange slit windows, a red neon stripe, antennas ----------
+function monolith() {
+  const U0 = 8, V0 = -30, U1 = 18, V1 = -18, X0 = FX(U0), X1 = FX(U1) - 1, Z0 = FZ(V0), Z1 = FZ(V1) - 1, Y0 = BY;
+  prop('monolith', [10, 78, 12]);
+  const topX = fx => FY(GY + 58) + Math.round((X1 - fx) / (X1 - X0) * 8 * S);                 // slopes up toward -x
+  STAGE = 1;
+  for (let x = X0; x <= X1; x++) for (let z = Z0; z <= Z1; z++) {
+    const T = topX(x), wall = inWall(x, z, X0, X1, Z0, Z1);
+    for (let y = Y0; y <= T; y++) {
+      if (wall) fset(x, y, z, (y - Y0) % FLOOR === FLOOR - 1 ? 0x1a2a38 : col(P.navy, x, y, z));
+      else if (y >= T - 1) fset(x, y, z, col(P.roof, x, y, z));
+    }
+    if (wall) fset(x, T + 1, z, P.roofCap);
+  }
+  STAGE = 2;
+  slits('x', Z1, 1, X0 + 1, X1 - 1, Y0 + 1, FY(GY + 56), { seed: 21 });
+  slits('x', Z0, -1, X0 + 1, X1 - 1, Y0 + 1, FY(GY + 56), { seed: 22, lit: 0.18 });
+  slits('z', X1, 1, Z0 + 1, Z1 - 1, Y0 + 1, FY(GY + 56), { seed: 23 });
+  slits('z', X0, -1, Z0 + 1, Z1 - 1, Y0 + 1, FY(GY + 62), { seed: 24, lit: 0.3 });
+  for (let y = FY(GY + 18); y <= FY(GY + 54); y++) { fset(FX(17), y, Z1 + 1, P.neonRed, true); if ((y - FY(GY + 18)) % 12 === 6) lamp([FX(17), y, Z1 + 1], FX(17), y, Z1 + 2, { color: P.neonRed, power: 0.7, r: 6, wrap: 0.5 }); }
+  screenPanel('z', X1, 1, Z0 + 3, Z0 + 9, FY(GY + 30), FY(GY + 35), { c: [P.neonOrange, P.neonRed], px: P.neonRedDark, power: 1.3, r: 10 });
+  screenPanel('x', Z1, 1, X0 + 2, X0 + 7, FY(GY + 8), FY(GY + 12), { c: P.whiteWin, px: 0x4a5a66, power: 1.1, r: 8 });
+  STAGE = 3;
+  mast(X0 + 2, topX(X0 + 3) + 1, Z0 + 2, FY(12), { rung: true, power: 1.0, r: 6 });   // foot on the lower of its two roof columns
+  mast(X1 - 3, topX(X1 - 2) + 1, Z1 - 3, FY(6), { power: 0.7, r: 4 });
+  prop();
+}
+
+// ---------- noodle bar: two-storey brick shop with a glowing front, awning and lanterns, a red roof sign ----------
+function noodleBar() {
+  const b = block('noodle-bar', 7, 17, 21, 25, 8, { pal: P.brick, spandrel: 0x3a2c2e, win: { w: 3, wh: 3, gap: 3, lit: 0.85, pal: [P.warmWin, P.warmWin2, 0xf8f3d0], skipGround: true }, roof: { ac: 2, tank: false, vents: 1 }, extraH: 5 });
+  prop('noodle-bar', [14, 11.5, 8]);
+  STAGE = 2;
+  const Z1 = b.Z1;
+  for (let a = FX(8); a <= FX(20) + 1; a++) for (let y = BY + 1; y <= BY + 5; y++) {
+    if ((a - FX(8)) % 10 === 9) continue;                                                            // brick pillars
+    fset(a, y, Z1, GLASS, 'glass');
+    const h = hash(a, y, 501), thing = h < 0.28;
+    fset(a, y, Z1 - 1, thing ? (h < 0.14 ? 0x5a3a2a : 0x2a1f2e) : hash(a >> 1, 0, 503) < 0.6 ? P.warmWin : 0xf8f3d0, !thing);
+  }
+  for (let a = FX(13); a <= FX(14) + 1; a++) for (let y = BY; y <= BY + 4; y++) { fdel(a, y, Z1); fset(a, y, Z1 - 1, P.warmWin, true); }      // open door
+  for (let a = FX(12) + 1; a <= FX(15); a++) { const v = V.get(key(a, BY - 1, Z1 + 1)); if (v) v.c = 0x2e3238; }                                   // worn threshold
+  lamp([FX(13), BY + 1, Z1 - 1], FX(14), BY + 3, Z1 + 3, { color: P.warmWin, power: 1.6, r: 11, dir: [0, 0, 1], cone: 0, wrap: 0.15 });
+  fbox(FX(12) - 1, BY + 2, Z1 + 1, FX(12) - 1, BY + 3, Z1 + 1, 0xbafdfc, true);                                                                  // menu board by the door
+  // awning with a valance, red paper lanterns hanging under it
+  fbox(FX(8), BY + 6, Z1 + 1, FX(20) + 1, BY + 6, Z1 + 3, (x) => P.awning[(x >> 1) % 2]);
+  for (let a = FX(8); a <= FX(20) + 1; a++) fset(a, BY + 5, Z1 + 3, P.awning[1]);
+  for (const a of [FX(9), FX(12) + 1, FX(16), FX(19) + 1]) { fset(a, BY + 5, Z1 + 2, P.iron); fset(a, BY + 4, Z1 + 2, 0xff6a3a, true); lamp([a, BY + 4, Z1 + 2], a, BY + 3.5, Z1 + 2, { color: 0xff6a3a, power: 1.0, r: 4.5, wrap: 0.5 }); }   // on a short string, below the valance
+  // roof sign: red panel with pale "letters" on a steel frame, dark from behind
+  STAGE = 3;
+  const Y1 = b.Y1;
+  for (const x of [FX(8), FX(20) + 1]) for (let y = Y1 + 1; y <= Y1 + 7; y++) fset(x, y, Z1 - 1, P.iron);
+  for (let a = FX(8) - 1; a <= FX(20) + 2; a++) for (let y = Y1 + 2; y <= Y1 + 7; y++) {
+    const edge = a < FX(8) || a > FX(20) + 1 || y === Y1 + 2 || y === Y1 + 7;
+    fset(a, y, Z1 - 2, P.metalDark);
+    if (edge) { fset(a, y, Z1 - 1, P.metalDark); continue; }
+    const letter = y >= Y1 + 4 && y <= Y1 + 5 && hash(a >> 1, y, 601) < 0.35 && a > FX(9) && a < FX(19);
+    fset(a, y, Z1 - 1, letter ? P.signText : hash(a, y, 602) < 0.06 ? P.neonRedDark : P.neonRed, !(hash(a, y, 602) < 0.06));
+  }
+  lamp(findGlow(FX(14), Y1 + 4, Z1 - 1), FX(14), Y1 + 4, Z1 + 3, { color: P.neonRed, power: 2.0, r: 15, dir: [0, 0, 1], cone: 0, wrap: 0.2 });
+  vsign('z', b.X1, 1, FZ(20), BY + 3, BY + 13, P.neonMag, { power: 1.3, r: 8, name: 'sign-noodle-blade' });
+  STAGE = 4;
+  steam('steam-noodle', FX(10), FZ(18) + 1, Y1 + 1, 4);
+  prop();
+  return b;
+}
+
+// ---------- the blocks ----------
+STAGE = 1;
+const hero = heroTower();
+monolith();
+const BLK = {};
+BLK.A = block('block-a', -36, -6, -23, 8, 30, { pal: P.concrete, retail: ['front', 'right'], roof: { mast: FY(5), ac: 3 }, piers: true });
+BLK.B = block('block-b', -32, -32, -20, -16, 44, { pal: P.concrete, roof: { mast: FY(7), corners: true }, win: { w: 2, wh: 4, gap: 2, lit: 0.32 } });
+BLK.C = block('block-c', 7, -6, 19, 6, 26, { pal: P.concrete, retail: ['left', 'front'], roof: { ac: 3 } });
+BLK.D = block('block-d', 23, -6, 33, 7, 34, { pal: P.concrete2, retail: ['front', 'left'], roof: { ac: 0, tank: false, vents: 0, corners: true }, win: { w: 3, wh: 4, gap: 2, lit: 0.4 } });
+BLK.E = block('block-e', -20, 17, -7, 25, 16, { pal: P.concrete2, retail: ['front', 'right'], roof: { ac: 3, vents: 2 }, win: { w: 3, wh: 3, gap: 3, lit: 0.5 } });
+BLK.G = block('block-g', -14, -32, -3, -18, 36, { pal: P.steel, spandrel: P.spandrel, roof: { mast: FY(6) }, win: { w: 2, wh: 4, gap: 2, lit: 0.3, pal: [P.whiteWin, P.coolWin, P.warmWin, P.warmWin2, P.warmWin2] }, piers: true });
+BLK.F = block('block-f', 21, -26, 30, -16, 22, { pal: P.concrete2, roof: { ac: 2 }, win: { w: 3, wh: 3, gap: 3, lit: 0.42 } });
+const shop = noodleBar();
+
+// ---------- signs on the blocks ----------
+STAGE = 2;
+billboard('x', BLK.A.Z1, 1, BLK.A.X0 + 3, BLK.A.X1 - 3, FY(GY + 18), FY(GY + 25), { c: [P.neonCyan, P.neonCyan2], px: P.neonCyanDim, power: 1.5, r: 16, name: 'sign-a-front' });
+vsign('z', BLK.A.X1, 1, FZ(4), FY(GY + 6), FY(GY + 16), P.neonMag, { name: 'sign-a-blade' });
+screenPanel('z', BLK.A.X1, 1, FZ(-2), FZ(1) + 1, FY(GY + 14), FY(GY + 18), { c: P.neonOrange, px: P.neonRedDark, name: 'sign-a-side' });   // below skybridge-a
+billboard('x', BLK.B.Z1, 1, BLK.B.X0 + 3, BLK.B.X1 - 3, FY(GY + 30), FY(GY + 37), { c: [P.neonCyan2, P.neonCyan], power: 1.4, r: 15, name: 'sign-b-front' });
+vsign('z', BLK.B.X1, 1, FZ(-24), FY(GY + 10), FY(GY + 30), P.neonMag, { power: 1.4, r: 9, name: 'sign-b-blade' });
+screenPanel('x', BLK.C.Z1, 1, FX(9), FX(16) + 1, FY(GY + 14), FY(GY + 20), { c: [P.neonCyan2, P.neonCyan], power: 1.4, r: 14, name: 'sign-c-front' });
+// alley blades: staggered heights and 1.5 m deep so the two walls' signs don't merge into one column from the front
+vsign('z', BLK.C.X1, 1, FZ(-3), FY(GY + 6), FY(GY + 13), P.neonRed, { name: 'sign-alley-red', depth: 3 });
+vsign('z', BLK.C.X1, 1, FZ(3), FY(GY + 15), FY(GY + 25), P.neonCyan2, { name: 'sign-alley-cyan', depth: 3 });
+vsign('z', BLK.D.X0, -1, FZ(0), FY(GY + 6), FY(GY + 14), P.neonMag, { name: 'sign-alley-mag', depth: 3 });
+vsign('z', BLK.D.X0, -1, FZ(-5), FY(GY + 16), FY(GY + 26), P.neonOrange, { name: 'sign-alley-orange', depth: 3 });
+billboard('x', BLK.D.Z1, 1, BLK.D.X0 + 3, BLK.D.X1 - 3, FY(GY + 22), FY(GY + 28), { c: [P.neonMag, 0xf07ad0], px: P.neonMagDim, power: 1.5, r: 14, name: 'sign-d-front' });
+screenPanel('x', BLK.E.Z1, 1, FX(-18), FX(-12) + 1, FY(GY + 9), FY(GY + 14), { c: [P.neonCyan2, P.neonCyan], power: 1.4, r: 12, name: 'sign-e-front' });
+vsign('z', BLK.E.X1, 1, FZ(19), FY(GY + 3), FY(GY + 13), P.neonRed, { name: 'sign-e-blade' });
+billboard('x', BLK.G.Z1, 1, BLK.G.X0 + 3, BLK.G.X1 - 3, FY(GY + 24), FY(GY + 30), { c: [P.neonOrange, P.neonRed], px: P.neonRedDark, power: 1.4, r: 14, name: 'sign-g-front' });
+screenPanel('z', BLK.G.X1, 1, FZ(-28), FZ(-22) + 1, FY(GY + 10), FY(GY + 15), { c: P.whiteWin, px: 0x4a5a66, name: 'sign-g-side' });
+screenPanel('z', BLK.F.X1, 1, FZ(-24), FZ(-19) + 1, FY(GY + 12), FY(GY + 17), { c: [P.neonCyan2, P.neonCyan], power: 1.2, r: 10, name: 'sign-f-side' });   // +x face: the -x face looks at the monolith's wall
+billboard('x', BLK.G.Z0, -1, BLK.G.X0 + 3, BLK.G.X1 - 3, FY(GY + 20), FY(GY + 26), { c: [P.neonCyan2, P.neonCyan], power: 1.4, r: 14, name: 'sign-g-back' });
+screenPanel('x', BLK.B.Z0, -1, BLK.B.X0 + 3, BLK.B.X0 + 10, FY(GY + 14), FY(GY + 19), { c: P.neonMag, px: P.neonMagDim, name: 'sign-b-back' });
+vsign('x', BLK.B.Z0, -1, BLK.B.X1 - 4, FY(GY + 24), FY(GY + 40), P.neonRed, { name: 'sign-b-back-blade' });
+screenPanel('x', BLK.F.Z0, -1, BLK.F.X0 + 3, BLK.F.X1 - 3, FY(GY + 10), FY(GY + 15), { c: P.neonOrange, px: P.neonRedDark, name: 'sign-f-back' });
+vsign('x', BLK.D.Z0, -1, BLK.D.X0 + 5, FY(GY + 8), FY(GY + 24), P.neonCyan2, { name: 'sign-d-back' });
+screenPanel('x', BLK.A.Z0, -1, BLK.A.X0 + 3, BLK.A.X0 + 9, FY(GY + 16), FY(GY + 21), { c: P.whiteWin, px: 0x4a5a66, name: 'sign-a-back' });
+billboard('z', BLK.A.X0, -1, BLK.A.Z0 + 3, BLK.A.Z1 - 3, FY(GY + 20), FY(GY + 26), { c: [P.neonCyan2, P.neonCyan], power: 1.4, r: 14, name: 'sign-a-left' });
+vsign('z', BLK.A.X0, -1, FZ(5), FY(GY + 5), FY(GY + 17), P.neonOrange, { name: 'sign-a-left-blade' });
+screenPanel('z', BLK.B.X0, -1, BLK.B.Z0 + 3, BLK.B.Z0 + 10, FY(GY + 24), FY(GY + 30), { c: [P.neonMag, 0xf07ad0], px: P.neonMagDim, name: 'sign-b-left' });
+vsign('z', BLK.B.X0, -1, FZ(-19), FY(GY + 8), FY(GY + 22), P.neonCyan2, { name: 'sign-b-left-blade' });
+// back street: a loading door on block G's back-street face with an amber lamp, and on block C's back
+for (let a = FX(-8); a <= FX(-5) + 1; a++) for (let y = BY; y <= BY + 6; y++) fset(a, y, BLK.G.Z1, (y - BY) % 2 ? 0x2a3038 : 0x30363c);
+prop('lamp-dock-g', [0.5, 1.5, 0.5]); wallLamp('x', BLK.G.Z1, 1, FX(-6), BY + 8, { color: 0xffa040, power: 1.2, r: 6 }); prop();
+prop('lamp-dock-c', [0.5, 1.5, 0.5]); wallLamp('x', BLK.C.Z0, -1, FX(12), BY + 7, { color: 0xffa040, power: 1.2, r: 6 }); prop();
+
+// ---------- sky bridge: glass tube between the hero tower and block C over the avenue ----------
+STAGE = 3;
+{
+  prop('skybridge', [12, 4, 2]);
+  const x0 = hero.X1 + 1, x1 = BLK.C.X0 - 1, z0 = FZ(-2), z1 = FZ(0) - 1, y0 = FY(GY + 16);
+  for (let x = x0; x <= x1; x++) for (let z = z0; z <= z1; z++) {
+    fset(x, y0, z, P.metalDark); fset(x, y0 + 1, z, (x + z) % 2 ? 0x30363c : 0x2a3036);
+    fset(x, y0 + 6, z, P.metalDark);
+    if (z === z0 || z === z1) { for (let y = y0 + 2; y <= y0 + 5; y++) fset(x, y, z, x % 5 === 0 ? P.fin : GLASS, x % 5 === 0 ? false : 'glass'); fset(x, y0 + 1, z, P.neonCyan2, true); }
+  }
+  for (const x of [x0 + 4, x0 + 12, x0 + 18]) { lamp([x, y0 + 1, z0], x, y0, z0 - 1, { color: P.neonCyan2, power: 0.7, r: 7, wrap: 0.5 }); lamp([x, y0 + 1, z1], x, y0, z1 + 1, { color: P.neonCyan2, power: 0.7, r: 7, wrap: 0.5 }); }
+  for (let x = x0 + 3; x < x1; x += 4) { fset(x, y0 + 2, z0 + 2, 0x4a4a52); fset(x, y0 + 3, z0 + 2, 0x3a3a44); fset(x, y0 + 4, z0 + 2, 0x8a6a58); }   // people inside
+  prop();
+}
+// second sky bridge: block A to the hero across the alley at 24
+{
+  prop('skybridge-a', [5, 4, 2]);
+  const x0 = BLK.A.X1 + 1, x1 = hero.X0 - 1, z0 = FZ(-1), z1 = FZ(1) - 1, y0 = FY(GY + 24);
+  for (let x = x0; x <= x1; x++) for (let z = z0; z <= z1; z++) {
+    fset(x, y0, z, P.metalDark); fset(x, y0 + 1, z, (x + z) % 2 ? 0x30363c : 0x2a3036); fset(x, y0 + 6, z, P.metalDark);
+    if (z === z0 || z === z1) { for (let y = y0 + 2; y <= y0 + 5; y++) fset(x, y, z, x % 5 === 0 ? P.fin : GLASS, x % 5 === 0 ? false : 'glass'); fset(x, y0 + 1, z, P.neonMag, true); }
+  }
+  lamp([x0 + 3, y0 + 1, z1], x0 + 3, y0, z1 + 1, { color: P.neonMag, power: 0.7, r: 6, wrap: 0.5 });
+  fset(x0 + 4, y0 + 2, z0 + 2, 0x4a4a52); fset(x0 + 4, y0 + 3, z0 + 2, 0x3a3a44); fset(x0 + 4, y0 + 4, z0 + 2, 0x8a6a58);
+  prop();
+}
+// helipad on block D
+{
+  prop('helipad-d', [9, 0.5, 9]);
+  const y = BLK.D.Y1 + 1, cx = dc(Math.round(BLK.D.cx)), cz = dc(Math.round(BLK.D.cz));
+  disc(cx, cz, 3.6, 4.1, y, y, 0xffe0a0, true);
+  disc(cx, cz, 0, 3.4, y, y, [0x3a3e44, 0x363a40]);
+  for (let k = -2; k <= 2; k++) { fset(Math.round(cx * S) - 2, y, Math.round(cz * S) + k, 0xf0f0e8); fset(Math.round(cx * S) + 2, y, Math.round(cz * S) + k, 0xf0f0e8); }
+  for (let k = -1; k <= 1; k++) fset(Math.round(cx * S) + k, y, Math.round(cz * S), 0xf0f0e8);
+  const sz = Math.round(cz * S);
+  lamp(findGlow(Math.round((cx + 3.9) * S), y, sz, 2), Math.round(cx * S), y + 1, sz, { color: 0xffe0a0, power: 1.0, r: 8, wrap: 0.6 });
+  prop();
+}
+// lattice antenna on block F
+{ prop('antenna-f', [2.5, 11, 2.5]); const x = BLK.F.X0 + 4, z = BLK.F.Z1 - 7, y = BLK.F.Y1 + 1; lattice(x, x + 3, z, z + 3, y, y + 16, 5, P.metal[2], P.metal[1]); fbox(x, y + 16, z, x + 3, y + 16, z + 3, P.metal[1]); mast(x + 1, y + 17, z + 1, 4, { power: 0.7, r: 4 }); prop(); }
+// fire escape on block E's left face (toward the park)
+{
+  prop('fire-escape-e', [1.5, 12, 3.5]);
+  const X0 = BLK.E.X0, z0 = FZ(19), z1 = FZ(22) - 1;
+  for (let f = 1; f < 4; f++) {
+    const y = BY + f * FLOOR;
+    for (let z = z0; z <= z1; z++) for (let x = X0 - 3; x <= X0 - 1; x++) fset(x, y, z, P.metal[2]);
+    for (let z = z0; z <= z1; z += 2) fset(X0 - 3, y + 1, z, P.metal[2]);
+    for (let z = z0; z <= z1; z++) fset(X0 - 3, y + 2, z, P.metal[2]);
+    if (f < 3) fline(X0 - 2, y + 1, f % 2 ? z0 : z1, X0 - 2, y + FLOOR - 1, f % 2 ? z1 : z0, P.metal[2]);
+    wallLamp('z', X0, -1, z1 + 1, y + 4, { color: 0xffa040, power: 0.9, r: 5 });                                   // an amber bulb per landing
+    for (let yy = y + 1; yy <= y + 4; yy++) { fset(X0, yy, z0 + 2, 0x2a3038); fset(X0, yy, z0 + 3, 0x2a3038); }    // a door onto the landing
+  }
+  fline(X0 - 2, BY, z0 + 1, X0 - 2, BY + FLOOR, z0 + 1, P.iron);                                                  // ladder to the ground
+  prop();
+}
+// alley between C and D: cables with lanterns, a dumpster, crates, puddles are in the ground already
+{
+  const y = FY(GY + 4), y2 = FY(GY + 5);                 // below every blade sign, so the lanterns show
+  prop('alley-cables', null);
+  for (const [yy, zz] of [[y, FZ(-4)], [y2, FZ(2)], [y + 1, FZ(-1) + 1]]) {
+    fline(BLK.C.X1, yy, zz, BLK.D.X0, yy, zz, P.metalDark);
+    for (let x = BLK.C.X1 + 3; x < BLK.D.X0 - 1; x += 3) { const c = pick([0xff6a3a, P.neonMag, 0xffd27a]); fset(x, yy - 1, zz, c, true); lamp([x, yy - 1, zz], x, yy - 1.5, zz, { color: c, power: 0.8, r: 4, wrap: 0.5 }); }
+  }
+  prop();
+  STAGE = 4;
+  dumpster('dumpster-alley', FX(20), FZ(-5), 1, 0x1e3a2a);
+  crates('crates-alley', FX(21) - 1, FZ(4), 3);   // crates(fx) spans fx..fx+3: keep it off block D's wall
+  vending('vending-alley', 'z', BLK.D.X0, -1, FZ(5), { c: P.neonMagBright });
+}
+
+// ---------- street level: lamps, cars, people, furniture ----------
+STAGE = 4;
+// street lamps on the pavements, arms over the roads
+// poles on the kerb cell (half a unit in) where the arm points the negative way, so the head hangs over the road
+streetLamp('lamp-ave-1', -4, -7, 1, 0); streetLamp('lamp-ave-2', 5.5, 2, -1, 0); streetLamp('lamp-ave-3', -4, 7, 1, 0); streetLamp('lamp-ave-4', 5.5, 21, -1, 0);
+streetLamp('lamp-cross-1', -22, 15.5, 0, -1); streetLamp('lamp-cross-2', 22, 15.5, 0, -1); streetLamp('lamp-cross-3', 6, 8, 0, 1);
+streetLamp('lamp-blvd-1', -26, 33.5, 0, -1); streetLamp('lamp-blvd-2', -10, 33.5, 0, -1); streetLamp('lamp-blvd-3', 8, 33.5, 0, -1); streetLamp('lamp-blvd-4', 26, 33.5, 0, -1);
+streetLamp('lamp-back-1', -20, -9.5, 0, -1); streetLamp('lamp-back-2', 6, -15, 0, 1); streetLamp('lamp-back-3', 24, -9.5, 0, -1);
+streetLamp('lamp-lot', 33, 24, -1, 0, { power: 1.6, r: 12 });
+// cars: avenue (two-way), boulevard, cross street, the back street van, the parking lot
+car('car-ave-n', -2, -1, 0, 'silver');
+car('car-ave-s', 3, 22, 2, 'black');                 // right-hand traffic everywhere; clear of the zebra
+car('taxi-blvd', -24, 32.5, 1, 'taxi', { roofSign: true });   // rot 1 spans FZ(v)-3..FZ(v): the +z lane for +x travel
+car('car-blvd-e', -4, 32.5, 1, 'red');
+car('car-blvd-w', 14, 28, 3, 'white');                 // rot 3 spans FZ(v)..FZ(v)+3: the -z lane for -x travel
+car('car-cross', 14, 10, 3, 'blue');
+van('van-back', -8, -10.5, 1, 'white');
+car('car-lot-1', 23.5, 19, 0, 'green', { parked: true }); car('car-lot-2', 28.5, 19, 0, 'silver', { parked: true });   // bays are the 4 cells between lines every 5 car('car-lot-3', 32.5, 22.5, 2, 'black', { parked: true });   // rot 2 extends toward -z and -x: origin at the bay's far corner
+// parking machine and a lot sign
+{ prop('ticket-machine', [0.5, 1.5, 0.5]); const x = FX(24), z = FZ(24); for (let y = BY; y < BY + 3; y++) fset(x, y, z, 0x2a3038); fset(x, BY + 2, z + 1, P.coolWin, true); lamp([x, BY + 2, z + 1], x, BY + 2, z + 2, { color: P.coolWin, power: 0.6, r: 3, wrap: 0.5 }); prop(); }
+// people: by the noodle bar, in the alley, on the avenue, at the bus stop, in the park
+person('ped-shop-1', FX(11), FZ(26), { umbrella: true }); person('ped-shop-2', FX(15) + 1, FZ(25) + 1); person('ped-shop-3', FX(18), FZ(26) + 1, { umbrella: 0x1a1a22 });
+person('ped-shop-4', FX(12) + 1, FZ(26) + 1, { hood: true });
+person('ped-alley-1', FX(21), FZ(-1), { umbrella: 0xbafdfc }); person('ped-alley-2', FX(20) + 1, FZ(3) + 1);
+person('ped-ave-1', FX(-4) + 1, FZ(2), { umbrella: true }); person('ped-ave-2', FX(6), FZ(-4), { hood: true });
+person('ped-hero-1', FX(-10), FZ(7) + 1, { umbrella: 0xe032ad }); person('ped-hero-2', FX(-8) + 1, FZ(8));
+person('ped-park-1', FX(-28) - 1, FZ(20) + 1, { umbrella: 0x8a2020 });
+person('ped-stop-1', FX(-6) + 1, FZ(34) + 1); person('ped-stop-2', FX(-11), FZ(34), { umbrella: 0x1a1a22 });
+// vending machines and bins
+vending('vending-shop', 'z', shop.X1, 1, FZ(23), { c: P.coolWin });
+vending('vending-back', 'x', BLK.G.Z1, 1, FX(-13), { c: P.neonMagBright });
+dumpster('dumpster-back-1', FX(-12) + 1, FZ(-17), 0, 0x3a3a44); dumpster('dumpster-back-2', FX(-10) + 1, FZ(-17), 0, 0x1e3a2a);
+dumpster('dumpster-shop', FX(18), FZ(16), 0, 0x1e3a2a);
+crates('crates-back', FX(-6), FZ(-16), 2);
+// bus shelter on the boulevard's far pavement: roof on three posts, a glowing ad panel, a bench
+{
+  prop('bus-shelter', [6, 2.6, 2]);
+  const x0 = FX(-9), x1 = FX(-3) - 1, z0 = FZ(34), z1 = FZ(35) + 1, g = topAt(x0, z1) + 1, y = g + 5;   // west of the avenue, which runs on to the rim
+  fbox(x0, y, z0, x1, y, z1, 0x3a4048);
+  for (const x of [x0, x1]) for (let yy = g; yy < y; yy++) fset(x, yy, z1, P.iron);
+  for (let yy = g; yy < y; yy++) fset((x0 + x1) >> 1, yy, z1, P.iron);
+  for (let x = x0 + 1; x <= x0 + 3; x++) for (let yy = g + 1; yy <= g + 4; yy++) { fset(x, yy, z1, hash(x, yy, 701) < 0.25 ? P.neonMagDim : P.neonMag, hash(x, yy, 701) >= 0.25); }
+  fset(x0 + 1, g + 1, z1, P.neonMag, true); lamp([x0 + 1, g + 1, z1], x0 + 2, g + 3, z1 - 2, { color: P.neonMag, power: 1.0, r: 6, dir: [0, 0, -1], cone: 0, wrap: 0.3 });
+  for (let x = x0 + 5; x <= x1 - 1; x++) { fset(x, g + 1, z1 - 1, P.wood[x % 3]); if (x === x0 + 5 || x === x1 - 1) fset(x, g, z1 - 1, P.iron); }
+  prop();
+}
+// park plaza: planters with trees and shrubs, benches, a lit fountain, low lamp posts, bollards toward the boulevard
+cityTree('tree-park-1', -30.5, 19.5, 6, 2.4); cityTree('tree-park-2', -25, 23.5, 5.5, 2.1); cityTree('tree-park-3', -31.5, 23.5, 7, 2.6);   // h is the branch-tip height; crowns add ~3 m
+for (const [u, v, r] of [[-29.5, 18.5, 0.8], [-26, 22.5, 0.7], [-23.5, 24.5, 0.6], [-31.8, 20.6, 0.6]]) shrub(X(u), Z(v), r);
+bench('bench-park-1', FX(-29), FZ(21) + 1, true); bench('bench-park-2', FX(-22) - 1, FZ(19) + 1, false);   // both clear of the fountain ring
+{
+  prop('fountain-park', [5, 1.5, 5]);
+  const cx = X(-25.5), cz = Z(19.5), y = BY;
+  disc(cx, cz, 1.9, 2.5, y, y + 1, [0x4a4e52, 0x454a4e]);
+  disc(cx, cz, 0, 1.9, y, y, 0x2a7a8a, true);
+  const fx = Math.round(cx * S), fz = Math.round(cz * S);
+  for (let k = 0; k < 3; k++) fset(fx, y + 1 + k, fz, k === 2 ? 0x9fe8f0 : 0x6ab8c8, true);
+  lamp([fx, y, fz - 2], fx, y + 2, fz, { color: 0x62d5dc, power: 1.0, r: 7, wrap: 0.6 });
+  prop();
+}
+prop('post-park-1', [0.4, 4, 0.4]); lampPost(X(-23), Z(18), { color: 0xd8ecff, power: 1.0, r: 7 }); prop();
+prop('post-park-2', [0.4, 4, 0.4]); lampPost(X(-31), Z(25.5), { color: 0xd8ecff, power: 1.0, r: 7 }); prop();
+// bollards along the rim where the pavement just ends
+{
+  prop('bollards-rim', null);
+  for (let fx = LO; fx < LO + WD; fx++) for (let fz = LO; fz < LO + WD; fz++) {
+    const t = topAt(fx, fz); if (t === -OUT) continue;
+    const x = dc(fx), z = dc(fz), e = edgeR(x, z) - Math.pow((x - CX) ** 4 + (z - CZ) ** 4, 0.25), k = groundKind(fx, fz);
+    if (e > 1.4 && e <= 2.2 && (k === 'pave' || k === 'plaza') && hash(fx, fz, 91) < 0.07 && !fhas(fx, t + 1, fz)) { fset(fx, t + 1, fz, P.iron); fset(fx, t + 2, fz, 0xb8bcb8); }
+  }
+  prop();
+}
+// steam from block E's roof and the monolith's base plant
+steam('steam-e', BLK.E.X0 + 5, BLK.E.Z0 + 3, BLK.E.Y1 + 1, 5);
+// a couple of puddle-side details: traffic cones by the back street works
+{ prop('cones-back', null); for (const [x, z] of [[FX(-8), FZ(-14)], [FX(-8) + 2, FZ(-14) + 1], [FX(-7) + 1, FZ(-13)]]) { const t = topAt(x, z) + 1; fset(x, t, z, 0xe85a20); fset(x, t + 1, z, 0xf0f0e8); } prop(); }
+// footprint check: every building corner must stand on the island
+for (const b of [hero, ...Object.values(BLK), shop]) for (const [x, z] of [[b.X0, b.Z0], [b.X1, b.Z0], [b.X0, b.Z1], [b.X1, b.Z1]]) if (topAt(x, z) === -OUT) console.warn(`${b.name}: corner ${x},${z} is off the island`);
+
+// =====================================================================================================
+// ENGINE: connectivity, meshes, lighting, animation (keep; tune lights/camera to the scene)
+// =====================================================================================================
+// scruff: weeds at the foot of anything standing in the lawn, leaf litter under trees. Strengths 0 = off.
+const SCRUFF = { weeds: 0.3, litter: 0.3 };   // only the planters are soft ground
+{
+  const add = [];
+  for (let fx = LO; fx < LO + WD; fx++) for (let fz = LO; fz < LO + WD; fz++) {
+    const t = topAt(fx, fz);
+    if (t === -OUT || fhas(fx, t + 1, fz) || hardAt(fx, fz)) continue;
+    const foot = [[1, 0], [-1, 0], [0, 1], [0, -1]].some(([a, c]) => fhas(fx + a, t + 1, fz + c) && fhas(fx + a, t + 2, fz + c));
+    if (foot && hash(fx, fz, 81) < SCRUFF.weeds) {
+      const n = hash(fx, fz, 82) < 0.4 ? 2 : 1;
+      for (let k = 1; k <= n; k++) add.push([fx, t + k, fz, pick(P.weed)]);
+      if (hash(fx, fz, 83) < 0.12) add.push([fx, t + n + 1, fz, pick(P.flower)]);
+    }
+  }
+  for (const [cx, cz, r, pal = P.litter] of CANOPY)
+    for (let fx = Math.floor((cx - r) * S); fx <= Math.ceil((cx + r) * S); fx++) for (let fz = Math.floor((cz - r) * S); fz <= Math.ceil((cz + r) * S); fz++) {
+      const d = Math.hypot(dc(fx) - cx, dc(fz) - cz) / r, v = V.get(key(fx, topAt(fx, fz), fz));
+      if (v && !hardAt(fx, fz) && d < 1.1 && hash(fx, fz, 84) < SCRUFF.litter * (1.1 - d)) v.c = pick(pal);
+    }
+  TAG = 9;                         // scruff grass: free-standing cells the bake keeps light (no grime/streaks/side AO)
+  for (const [x, y, z, c] of add) fset(x, y, z, c);
+  TAG = 0;
+}
+
+// hollow solid masses (TAG >= 6: 6 leaves, 7 animals, 8 bales/logs/crops): drop every voxel with neighbours one and
+// two cells away on all six sides, keeping a 2-cell skin that stays face-connected
+{
+  const D = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]], drop = [];
+  for (const v of V.values()) if (v.g >= 6 && D.every(([a, b, c]) => fhas(v.x + a, v.y + b, v.z + c) && fhas(v.x + 2 * a, v.y + 2 * b, v.z + 2 * c))) drop.push(v);
+  for (const v of drop) fdel(v.x, v.y, v.z);
+  console.info(`hollowed ${drop.length} interior voxels`);
+}
+
+// keep only what is connected (face to face) to one seed on the ground surface
+{
+  const seen = new Set(), stack = [];
+  const k0 = key(Math.round(CX * S), topAt(Math.round(CX * S), Math.round((CZ + 12) * S)), Math.round((CZ + 12) * S));
+  seen.add(k0); stack.push(V.get(k0));
+  const D = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+  while (stack.length) {
+    const v = stack.pop();
+    for (const [dx, dy, dz] of D) {
+      const k = key(v.x + dx, v.y + dy, v.z + dz);
+      if (!seen.has(k) && V.has(k)) { seen.add(k); stack.push(V.get(k)); }
+    }
+  }
+  let removed = 0;
+  const lost = {};                 // where voxels came loose, bucketed by 4-unit design cells (read window.__lost)
+  for (const k of [...V.keys()]) if (!seen.has(k)) { const v = V.get(k), b = `${v.x / S >> 2 << 2},${v.y / S >> 2 << 2},${v.z / S >> 2 << 2}`; lost[b] = (lost[b] || 0) + 1; V.delete(k); removed++; }
+  window.__lost = lost;
+  console.info(`connectivity: removed ${removed} floating voxels`);
+}
+// only lamps whose fixture still glows emit light
+const bakedLights = LAMPS.filter(l => V.get(key(...l.src))?.e === true);
+if (bakedLights.length < LAMPS.length) console.warn(`lamps without a glowing source voxel dropped: ${LAMPS.length - bakedLights.length} at`, LAMPS.filter(l => !bakedLights.includes(l)).map(l => `[${l.src}] ${V.get(key(...l.src))?.p ?? '-'}`).join(' '));
+
+const vox = [...V.values()];
+const LAYER = 0.17 / S;            // seconds per fine layer (a 106 m tower: ~22 s build)
+const SCAN = LAYER * 1.2;          // seconds per layer when printing (no jitter, so a little slower)
+const DURS = { drop: 0.55, grow: 0.45, swarm: 1.6, tornado: 1.8, slide: 0.7, pop: 0.6, tumble: 0.9, squash: 0.75, flash: 0.9 };   // motion duration per voxel
+let minY = 1e9, maxY = -1e9, minX = 1e9, maxX = -1e9, minZ = 1e9, maxZ = -1e9;
+for (const v of vox) {
+  minY = Math.min(minY, v.y); maxY = Math.max(maxY, v.y); minX = Math.min(minX, v.x); maxX = Math.max(maxX, v.x);
+  minZ = Math.min(minZ, v.z); maxZ = Math.max(maxZ, v.z);
+}
+const layerT = (v, y0) => (v.y - y0) * LAYER + (hash(v.x, v.z, v.y) * 0.6 + Math.hypot(v.x - CX * S, v.z - CZ * S) / (2 * CX * S * 0.75) * 0.4) * 0.28 * 2.2;
+const COUNT = vox.length;
+let DUR, BUILD_END;
+// (re)compute start times for ANIM.order and re-sort; called again when the UI changes the order or motion
+function plan() {
+  if (ANIM.order === 'scan') {
+    // head rasters each layer in rows along z, alternating direction like a printer nozzle
+    const nx = maxX - minX + 1, nz = maxZ - minZ + 1;
+    for (const v of vox) {
+      const row = v.z - minZ, along = row % 2 ? maxX - v.x : v.x - minX;
+      v.t0 = (v.y - minY) * SCAN + (row + along / nx) / nz * SCAN * 0.9;
+    }
+  } else if (ANIM.order === 'stages') {
+    // each stage builds bottom-up from its own lowest voxel; the next starts when this one is ~80% done
+    const groups = new Map();
+    for (const v of vox) (groups.get(v.st) || groups.set(v.st, []).get(v.st)).push(v);
+    let start = 0;
+    for (const s of [...groups.keys()].sort((a, b) => a - b)) {
+      const g = groups.get(s), y0 = g.reduce((m, v) => Math.min(m, v.y), 1e9);
+      let span = 0;
+      for (const v of g) { const lt = layerT(v, y0); v.t0 = start + lt; span = Math.max(span, lt); }
+      start += span * 0.8 + 0.3;
+    }
+  } else for (const v of vox) v.t0 = layerT(v, minY);
+  vox.sort((a, b) => a.t0 - b.t0);
+  DUR = DURS[ANIM.motion] ?? 0.55;
+  BUILD_END = vox[COUNT - 1].t0 + DUR;
+}
+plan();
+document.getElementById('info').textContent = `${COUNT.toLocaleString()} voxels · F skip · D demolish · P pile · H hides UI · drag to orbit`;
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+// Sky as a texture: call useSkyTexture(dayStops, nightStops, at) when the canvas is opaque (bloom / EffectComposer),
+// where the CSS sky and the #night overlay can't show. setSky then redraws it, lerping day -> night.
+let drawSky = null;
+function useSkyTexture(day, nightStops, at) {
+  const cv = document.createElement('canvas'); cv.width = 2; cv.height = 256;
+  scene.background = new THREE.CanvasTexture(cv);
+  scene.background.colorSpace = THREE.SRGBColorSpace;
+  let last = -1;
+  drawSky = k => {
+    if (Math.abs(k - last) < 0.004) return;
+    last = k;
+    const g = cv.getContext('2d'), gr = g.createLinearGradient(0, 0, 0, 256), a = new THREE.Color(), b = new THREE.Color();
+    at.forEach((s, i) => gr.addColorStop(s, '#' + a.set(day[i]).lerp(b.set(nightStops[i]), k).getHexString()));
+    g.fillStyle = gr; g.fillRect(0, 0, 2, 256);
+    scene.background.needsUpdate = true;
+  };
+  drawSky(0);
+}
+useSkyTexture(SKY.day, SKY.night, SKY.at);   // always: the bloom composer makes the canvas opaque, so the CSS sky can't show
+const VIEW = 72;                   // half-height of the view in world units at the target (a 106 m spire plus the island underside)
+const FOV = 28;                    // ?cam=persp vertical field of view in degrees: modest, so verticals stay near-parallel
+const cam = CAM === 'persp' ? new THREE.PerspectiveCamera(FOV, 1, 0.1, 1000) : new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 1000);
+const controls = new OrbitControls(cam, renderer.domElement);
+controls.target.set(0, 38, 0);
+controls.enableDamping = true;
+let userMoved = false;
+controls.addEventListener('start', () => { userMoved = true; });
+const orbitBox = document.getElementById('orbit');
+const ORBIT_EL = 0.33;             // camera elevation (~19°): the photo looks slightly down over the rooftops
+const ORBIT_R = CAM === 'persp' ? VIEW / Math.tan(FOV / 2 * Math.PI / 180) : 240;   // perspective: distance that frames VIEW at the target
+function placeCamera(az) {
+  cam.position.set(Math.sin(az) * Math.cos(ORBIT_EL) * ORBIT_R, 38 + Math.sin(ORBIT_EL) * ORBIT_R, Math.cos(az) * Math.cos(ORBIT_EL) * ORBIT_R);
+}
+let camAz = 0.35;                  // 0 = looking at the +z (front) side; the photo looks from slightly right
+placeCamera(camAz);
+let composer = null, bloomPass = null;
+function resize() {
+  const a = innerWidth / innerHeight;
+  if (cam.isPerspectiveCamera) { cam.aspect = a; cam.zoom = Math.min(1, a); }
+  else { const v = a < 1 ? VIEW / a : VIEW; cam.left = -v * a; cam.right = v * a; cam.top = v; cam.bottom = -v; }
+  cam.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  composer?.setSize(innerWidth, innerHeight);
+}
+addEventListener('resize', resize); resize();
+// bloom: neon and lit glass bloom, lit surfaces stay under the threshold (skill reference/lighting.md). ?bloom=0 turns it off.
+const BLOOM = Q.get('bloom') !== '0';
+composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, cam));
+bloomPass = new UnrealBloomPass(new THREE.Vector2(Math.max(1, innerWidth), Math.max(1, innerHeight)), 0.6, 0.4, 0.6);
+composer.addPass(bloomPass);
+composer.addPass(new OutputPass());
+
+// Light defaults for a photographic look: soft cool sky fill, a warm sun a little stronger than it, exposure 0.95.
+// Match the photo (overcast: hemi up, sun down; dusk: low warm sun from behind). setSky scales these at night.
+const LIGHT = { hemi: 1.5, sun: 0.55, sky: 0x5a7a8e, ground: 0x3a4048, sunColor: 0x9fb8d8 };   // night: cool haze from above, a weak blue moon; neon does the rest
+const hemi = new THREE.HemisphereLight(LIGHT.sky, LIGHT.ground, LIGHT.hemi);
+scene.add(hemi);
+const sun = new THREE.DirectionalLight(LIGHT.sunColor, LIGHT.sun);
+sun.position.set(-90, 190, 80);
+sun.castShadow = true;
+sun.shadow.mapSize.set(4096, 4096);
+Object.assign(sun.shadow.camera, { left: -120, right: 120, top: 120, bottom: -120, near: 1, far: 600 }); // cover the island and the spire
+sun.shadow.bias = -0.0006;
+sun.shadow.normalBias = 0.02;
+scene.add(sun);
+const W = (fx, fy, fz) => new THREE.Vector3((fx + 0.5) / S - CX, (fy + 0.5) / S - GY, (fz + 0.5) / S - CZ);   // fine -> world
+// real PointLights only for hero lamps (they light glass and moving voxels; each costs per pixel)
+const warmLights = bakedLights.filter(l => l.hero).map(({ fx, fy, fz, color }) => {
+  const l = new THREE.PointLight(color, 10, 10, 1.5); l.position.copy(W(fx, fy, fz)); l.userData.base = 10; scene.add(l); return l;
+});
+
+// voxel outlines: a near-invisible border by default (the cubes read as surfaces), the full grid behind ?grid=1
+const cv = document.createElement('canvas'); cv.width = cv.height = 32;
+const g = cv.getContext('2d');
+g.fillStyle = GRID ? '#dadada' : '#f4f4f4'; g.fillRect(0, 0, 32, 32);
+g.fillStyle = '#ffffff'; g.fillRect(3, 3, 26, 26);
+const tex = new THREE.CanvasTexture(cv);
+tex.colorSpace = THREE.SRGBColorSpace;
+
+// three materials: lit, glowing, glass (clearly visible: blue tint, ~0.55 opacity, environment reflections)
+const pmrem = new THREE.PMREMGenerator(renderer);
+const envTex = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+const glowMat = new THREE.MeshBasicMaterial({ map: tex });
+const glassMat = new THREE.MeshPhysicalMaterial({
+  transparent: true, opacity: 0.6, roughness: 0.03, metalness: 0, envMap: envTex, envMapIntensity: 0.3,
+  specularIntensity: 1, clearcoat: 1, clearcoatRoughness: 0.05, depthWrite: false,
+});
+const geo = new THREE.BoxGeometry(1, 1, 1);
+const counts = [0, 0, 0];
+for (const v of vox) { v.m = v.e === 'glass' ? 2 : v.e ? 1 : 0; v.i = counts[v.m]++; }
+// lit material: baked lamp light (per-instance attribute `lamp`, filled by bake()) is added as emission, so it shows
+// on walls the sun and sky don't reach and at night. As albedo it is multiplied by the scene light and vanishes.
+const litMat = new THREE.MeshStandardMaterial({ map: tex, roughness: 0.9 });
+const lampK = { value: 0 };
+// Depth fade (aerial haze): the final colour blends toward the sky's horizon band by depth along the camera's view axis
+// (vViewPosition.z, so it works for the orthographic and the perspective camera). It starts `near` world units in front
+// of the target depth and reaches `strength` at `far` behind it. Per-normal tint: top faces take a little sky colour,
+// sides are slightly cooler and darker, undersides darker still, so the cubes read as lit surfaces rather than flat paint.
+const HAZE = { strength: 0.48, near: -25, far: 95 };   // the photo is foggy; the island is ~100 units deep
+const raw = h => new THREE.Color(h);   // linear: with the bloom composer the material writes linear colour and OutputPass converts to sRGB
+const HAZE_DAY = raw(SKY.day[2]), HAZE_NIGHT = raw(SKY.night[2]);
+const hazeU = { hazeCol: { value: HAZE_DAY.clone() }, hazeC: { value: 140 }, hazeK: { value: HAZE.strength }, hazeNear: { value: HAZE.near }, hazeFar: { value: HAZE.far }, skyTint: { value: hemi.color } };
+litMat.onBeforeCompile = sh => {
+  sh.uniforms.lampK = lampK;
+  Object.assign(sh.uniforms, hazeU);
+  sh.vertexShader = sh.vertexShader.replace('#include <common>', '#include <common>\nattribute vec3 lamp;\nvarying vec3 vLamp;\nvarying float vNy;')
+    .replace('#include <begin_vertex>', '#include <begin_vertex>\nvLamp = lamp;\nvNy = normal.y;');
+  sh.fragmentShader = sh.fragmentShader.replace('#include <common>', '#include <common>\nvarying vec3 vLamp;\nvarying float vNy;\nuniform float lampK;\nuniform vec3 hazeCol;\nuniform vec3 skyTint;\nuniform float hazeC, hazeK, hazeNear, hazeFar;')
+    .replace('#include <color_fragment>', `#include <color_fragment>
+  {
+    float up = clamp(vNy, 0.0, 1.0), down = clamp(-vNy, 0.0, 1.0);
+    vec3 skyN = skyTint / max(0.001, max(skyTint.r, max(skyTint.g, skyTint.b)));
+    vec3 nt = mix(vec3(0.93, 0.945, 0.985), mix(vec3(1.0), skyN, 0.22) * 1.03, up);
+    nt = mix(nt, vec3(0.82, 0.84, 0.9), down);
+    diffuseColor.rgb *= nt;
+  }`)
+    .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\ntotalEmissiveRadiance += diffuseColor.rgb * vLamp * lampK;')
+    .replace('#include <colorspace_fragment>', `#include <colorspace_fragment>
+  gl_FragColor.rgb = mix(gl_FragColor.rgb, hazeCol, hazeK * smoothstep(hazeC + hazeNear, hazeC + hazeFar, vViewPosition.z));`);
+};
+const litGeo = geo.clone();
+litGeo.setAttribute('lamp', new THREE.InstancedBufferAttribute(new Float32Array(Math.max(1, counts[0]) * 3), 3));
+const meshes = [litMat, glowMat, glassMat].map((mat, m) => {
+  const mesh = new THREE.InstancedMesh(m === 0 ? litGeo : geo, mat, Math.max(1, counts[m]));
+  mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  mesh.castShadow = m === 0; mesh.receiveShadow = m === 0;
+  mesh.renderOrder = m === 2 ? 1 : 0;
+  mesh.frustumCulled = false;
+  return mesh;
+});
+const c3 = new THREE.Color();
+for (const v of vox) {
+  c3.setHex(v.c);
+  if (v.m === 0) c3.offsetHSL(0, 0, (hash(v.x, v.z, v.y + 99) - 0.5) * 0.04);
+  meshes[v.m].setColorAt(v.i, c3);
+}
+
+// ---------- bake: ambient occlusion into the lit mesh's instance colours, baked lamps into its `lamp` attribute ----------
+// AO: from every exposed face cast 9 short rays (normal ± tangents) through an occupancy grid; near hits
+// darken. Openings, eaves, porches and corners get depth for free. Glass does not occlude.
+// Returns A = weathered + AO colours; the lamp light goes to the `lamp` attribute, faded in by setLights().
+// gain: lamp emission strength (emission ignores sun/sky, so it reads the same on shaded walls and at night).
+const BAKE = { ao: 0.5, reach: 8, gain: 1.1 };   // night: lamps dominate, AO a little lighter
+// Weathering: nothing real is evenly coloured. Broad blotches, odd stones/boards off-shade, grime splashed
+// up the foot of walls, rain streaks down them, moss on what faces the sky. Strengths 0 = off.
+// hue: each blotch also drifts slightly warm or cool, so large same-material areas are not one flat tone.
+const WEATHER = { patch: 0.12, hue: 0.05, speckle: 0.1, grime: 0.4, grimeH: 2.5, streak: 0.2, moss: 0.06 };   // rain streaks and grime, hardly any moss
+const GRIME = new THREE.Color(0x4f4a34), MOSS = new THREE.Color(0x5e7540);
+function weather(v, fn, r, g, b) {
+  if (v.g === 7) return [r, g, b];                              // animals stay clean: AO only
+  if (v.g === 9 || v.g === 1) {                                // scruff grass and steam: blotch and hue drift only, never grime or moss
+    const m = 1 + (vnoise(v.x, v.z, 7 * S, 91) - 0.5) * 2 * WEATHER.patch, hd = (vnoise(v.x, v.z, 9 * S, 95) - 0.5) * 2 * WEATHER.hue;
+    return [r * m * (1 + hd), g * m, b * m * (1 - hd)];
+  }
+  const side = fn.some(n => n[1] === 0), up = fn.some(n => n[1] === 1);
+  const h = (v.y - topAt(v.x, v.z)) / S;                        // design units above the local ground
+  let m = 1 + (vnoise(v.x + v.y * 0.7, v.z - v.y * 0.5, 7 * S, 91) - 0.5) * 2 * WEATHER.patch;
+  m *= 1 + (hash(v.x, v.z, v.y + 7) - 0.5) * 2 * WEATHER.speckle * (hash(v.x, v.y, v.z + 3) < 0.2 ? 1 : 0.3);
+  if (side && h >= WEATHER.grimeH) m *= 1 - WEATHER.streak * Math.max(0, vnoise(v.x + v.z, 0, 2.5, 93) - 0.4) * 1.7;   // vertical streaks
+  let tk = 0, tint = GRIME;
+  if (side && h >= 0.5 && h < WEATHER.grimeH + 0.5) tk = WEATHER.grime * (1 - (h - 0.5) / WEATHER.grimeH) * (0.5 + vnoise(v.x + v.z, v.y, 3, 92));
+  const mo = vnoise(v.x, v.z, 4 * S, 94);
+  // no moss on props (STAGE 4) other than leaves (TAG 6): it tints iron lantern caps green
+  if (up && h > 1 && mo > 0.6 && !(v.st === 4 && v.g !== 6)) { tk = Math.min(0.6, WEATHER.moss * (mo - 0.6) / 0.4 * 2.2); tint = MOSS; }
+  tk = Math.max(0, Math.min(0.6, tk));
+  const hd = (vnoise(v.x - v.y * 0.4, v.z + v.y * 0.6, 9 * S, 95) - 0.5) * 2 * WEATHER.hue;   // per-blotch hue drift: + warm, − cool
+  return [r * m * (1 + hd) * (1 - tk) + tint.r * tk, g * m * (1 - tk) + tint.g * tk, b * m * (1 - hd) * (1 - tk) + tint.b * tk];
+}
+function bake() {
+  const t0 = performance.now();
+  let x0 = 1e9, y0 = 1e9, z0 = 1e9, x1 = -1e9, y1 = -1e9, z1 = -1e9;
+  for (const v of vox) { x0 = Math.min(x0, v.x); y0 = Math.min(y0, v.y); z0 = Math.min(z0, v.z); x1 = Math.max(x1, v.x); y1 = Math.max(y1, v.y); z1 = Math.max(z1, v.z); }
+  const NY = y1 - y0 + 1, NZ = z1 - z0 + 1, occ = new Uint8Array((x1 - x0 + 1) * NY * NZ);
+  const gi = (x, y, z) => ((x - x0) * NY + (y - y0)) * NZ + (z - z0);
+  const inB = (x, y, z) => x >= x0 && x <= x1 && y >= y0 && y <= y1 && z >= z0 && z <= z1;
+  const solid = (x, y, z) => inB(x, y, z) && occ[gi(x, y, z)] > 0;
+  const blocks = (x, y, z) => inB(x, y, z) && occ[gi(x, y, z)] === 1;   // glowing fixtures don't shadow their own light
+  for (const v of vox) if (v.m !== 2) occ[gi(v.x, v.y, v.z)] = v.m === 1 ? 2 : 1;
+  const N = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+  const RAYS = N.map(n => {
+    const ax = n.findIndex(c => c !== 0), [ta, tb] = [0, 1, 2].filter(i => i !== ax), out = [];
+    for (const a of [-1, 0, 1]) for (const b of [-1, 0, 1]) { const d = n.slice(); d[ta] += a; d[tb] += b; out.push(d); }
+    return out;
+  });
+  const lights = bakedLights.map(l => ({ ...l, x: l.fx, y: l.fy, z: l.fz, r: l.r * S, col: new THREE.Color(l.color) }));
+  const base = meshes[0].instanceColor.array, A = new Float32Array(base), LL = meshes[0].geometry.attributes.lamp.array;
+  const L = BAKE.reach * S / 2, hits = lights.map(() => 0);
+  for (const v of vox) {
+    if (v.m !== 0) continue;
+    const fn = [];
+    let occl = 0;
+    for (let f = 0; f < 6; f++) {
+      const n = N[f];
+      if (solid(v.x + n[0], v.y + n[1], v.z + n[2])) continue;
+      fn.push(n);
+      if (v.g === 9 && n[1] !== 1) continue;                      // scruff grass: only the top face is occluded (a tuft's sides see the lawn one cell away)
+      for (const d of RAYS[f]) for (let k = 1; k <= L; k++) if (solid(v.x + d[0] * k, v.y + d[1] * k, v.z + d[2] * k)) { occl += 1 - (k - 1) / L; break; }
+    }
+    if (!fn.length) continue;                                     // hidden voxel: leave as is
+    const ao = 1 - BAKE.ao * occl / (fn.length * 9);
+    let lr = 0, lg = 0, lb = 0;
+    for (let li = 0; li < lights.length; li++) {
+      const l = lights[li], dx = l.x - v.x, dy = l.y - v.y, dz = l.z - v.z, dist = Math.hypot(dx, dy, dz);
+      if (dist > l.r || dist < 0.5) continue;
+      if (l.shadow === false && v.y < topAt(v.x, v.z) - S) continue;   // shadowless lamps (fire in steam) must not shine through the island
+      let face = 0, nb = fn[0];
+      for (const n of fn) { const f = (n[0] * dx + n[1] * dy + n[2] * dz) / dist; if (f > face) { face = f; nb = n; } }
+      if (face <= 0) continue;
+      const wrap = l.wrap ?? 0.35;                                 // light on faces it barely faces (0 = strictly by angle)
+      let k = l.power * (wrap + (1 - wrap) * face) * (1 - dist / l.r) ** 2;
+      if (l.cone !== undefined) k *= Math.min(1, Math.max(0, (-(l.dir[0] * dx + l.dir[1] * dy + l.dir[2] * dz) / dist - l.cone) / (1 - l.cone) * 2));
+      if (k <= 0) continue;
+      if (l.shadow !== false) {                                   // march from just off the lit face to the lamp
+        const px = v.x + nb[0], py = v.y + nb[1], pz = v.z + nb[2], ex = l.x - px, ey = l.y - py, ez = l.z - pz, D = Math.hypot(ex, ey, ez);
+        let hit = false;
+        // stop 2.5 cells short: those are the lamp's own fixture (caps, bracket), which must not shadow it
+        for (let s = 0; s < D - 2.5; s++) if (blocks(Math.round(px + ex / D * s), Math.round(py + ey / D * s), Math.round(pz + ez / D * s))) { hit = true; break; }
+        if (hit) continue;
+      }
+      lr += l.col.r * k; lg += l.col.g * k; lb += l.col.b * k;
+      if (k > 0.05) hits[li]++;
+    }
+    const o = v.i * 3;
+    const w = weather(v, fn, base[o], base[o + 1], base[o + 2]);
+    A[o] = w[0] * ao; A[o + 1] = w[1] * ao; A[o + 2] = w[2] * ao;
+    LL[o] = lr / ao; LL[o + 1] = lg / ao; LL[o + 2] = lb / ao;      // the shader multiplies by the AO'd colour; lamps aren't occluded twice
+  }
+  const dark = hits.map((n, i) => n < 20 ? i : -1).filter(i => i >= 0);
+  console.info(`bake: ${Math.round(performance.now() - t0)} ms, ${lights.length} baked lamps, lit voxels per lamp ~${Math.round(hits.reduce((a, b) => a + b, 0) / Math.max(1, hits.length))}` + (dark.length ? `; lamps reaching almost nothing (inside geometry?): ${dark.join(', ')}` : ''));
+  return A;
+}
+const colA = bake();
+// palette lint: photographic colours are muted. Warn for every P colour with sRGB saturation above 0.4 or lightness
+// outside 0.12–0.85; keys in ACCENT are exempt. Fix the palette (resample the photo), don't silence the warning.
+{
+  const c = new THREE.Color(), hsl = {}, bad = [];
+  for (const k in P) if (!ACCENT.has(k)) for (const h of [].concat(P[k])) {
+    if (typeof h !== 'number') continue;
+    c.setHex(h).getHSL(hsl, THREE.SRGBColorSpace);
+    if (hsl.s > 0.4 || hsl.l < 0.12 || hsl.l > 0.85) bad.push(`P.${k} #${h.toString(16).padStart(6, '0')} s ${hsl.s.toFixed(2)} l ${hsl.l.toFixed(2)}`);
+  }
+  if (bad.length) console.warn(`palette lint: ${bad.length} colour(s) outside the photographic range (s <= 0.4, 0.12 <= l <= 0.85):\n` + bad.join('\n'));
+  else console.info('palette lint: ok');
+}
+let bakeK = -1, bakeForce = null;
+function blendBake(k) {                                         // lamps off (0) .. on (1+); bakeK -1 rewrites the colours
+  if (bakeForce !== null) k = bakeForce;
+  if (bakeK < 0) { meshes[0].instanceColor.array.set(colA); meshes[0].instanceColor.needsUpdate = true; }
+  bakeK = k;
+  lampK.value = k * BAKE.gain;
+}
+const group = new THREE.Group();
+group.scale.setScalar(1 / S);
+group.position.set(-CX + 0.5 / S, 0.5 / S - GY, -CZ + 0.5 / S);
+meshes.forEach(m => group.add(m));
+scene.add(group);
+
+const MA = meshes.map(m => m.instanceMatrix.array);
+function setM(v, x, y, z, s, sy = s, sz = s) {   // scale + position; clears any rotation left by setR
+  const M = MA[v.m], o = v.i * 16;
+  M[o] = s; M[o + 5] = sy; M[o + 10] = sz;
+  M[o + 1] = M[o + 2] = M[o + 4] = M[o + 6] = M[o + 8] = M[o + 9] = 0;
+  M[o + 12] = x; M[o + 13] = y; M[o + 14] = z;
+}
+function setR(v, x, y, z, s, ax, ay, az, a) {     // uniform scale + rotation by angle a about unit axis (ax, ay, az)
+  const M = MA[v.m], o = v.i * 16, c = Math.cos(a), n = Math.sin(a), C = 1 - c;
+  M[o] = (c + ax * ax * C) * s;      M[o + 1] = (ay * ax * C + az * n) * s; M[o + 2] = (az * ax * C - ay * n) * s;
+  M[o + 4] = (ax * ay * C - az * n) * s; M[o + 5] = (c + ay * ay * C) * s;  M[o + 6] = (az * ay * C + ax * n) * s;
+  M[o + 8] = (ax * az * C + ay * n) * s; M[o + 9] = (ay * az * C - ax * n) * s; M[o + 10] = (c + az * az * C) * s;
+  M[o + 12] = x; M[o + 13] = y; M[o + 14] = z;
+}
+const easeOutCubic = p => 1 - Math.pow(1 - p, 3);
+const easeInOutCubic = p => p < 0.5 ? 4 * p * p * p : 1 - Math.pow(-2 * p + 2, 3) / 2;
+const easeOutBack = p => { const c = 1.9; return 1 + (c + 1) * Math.pow(p - 1, 3) + c * Math.pow(p - 1, 2); };
+const easeOutElastic = p => p === 0 ? 0 : Math.pow(2, -10 * p) * Math.sin((p * 10 - 0.75) * 2.094) + 1;
+const DROP = 6 * S, SWARM = 32 * S, SLIDE = 9 * S;
+// slide direction for a voxel: the open side (x+, x-, z+, z-) facing most away from the island centre
+// (so a wall's outside wins over a room's inside), else 4 = straight down from above
+const SIDES = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+function slideDir(v) {
+  if (v.sd === undefined) {
+    const ox = v.x - CX * S, oz = v.z - CZ * S;
+    let best = -Infinity; v.sd = 4;
+    for (let k = 0; k < 4; k++) {
+      if (V.has(key(v.x + SIDES[k][0], v.y, v.z + SIDES[k][1]))) continue;
+      const d = SIDES[k][0] * ox + SIDES[k][1] * oz;
+      if (d > best) { best = d; v.sd = k; }
+    }
+  }
+  return v.sd;
+}
+// flash: colour blends from hot white to the voxel's settled colour
+const BASE = meshes.map(m => m.instanceColor && new Float32Array(m.instanceColor.array));
+const HOT = [1.6, 1.35, 0.9];
+function tint(v, k) {               // k = 1 hot .. 0 settled
+  const arr = meshes[v.m].instanceColor.array, o = v.i * 3;
+  for (let c = 0; c < 3; c++) {
+    const base = v.m === 0 ? colA[o + c] : BASE[v.m][o + c];
+    arr[o + c] = base + (HOT[c] - base) * k;
+  }
+}
+function restoreColours() {
+  for (let m = 1; m < 3; m++) if (BASE[m]) { meshes[m].instanceColor.array.set(BASE[m]); meshes[m].instanceColor.needsUpdate = true; }
+  bakeK = -1;                         // forces blendBake to rewrite the lit mesh
+}
+// in-flight pose for motion progress p in [0, 1)
+const POSE = {
+  drop(v, p) {
+    const s = Math.max(0, easeOutBack(Math.min(1, p * 1.25)));
+    setM(v, v.x, v.y + (1 - easeOutCubic(p)) * DROP, v.z, s);
+  },
+  grow(v, p) {                     // stretch up from the voxel's floor, slight overshoot
+    const sy = Math.max(0.001, easeOutBack(p));
+    setM(v, v.x, v.y - 0.5 + sy / 2, v.z, 1, sy);
+  },
+  swarm(v, p) {                    // start in a cloud around and above the island, swirl in along a curve
+    const a = hash(v.x, v.z, v.y + 11) * 6.283, r = SWARM * (0.45 + hash(v.z, v.y, v.x + 12) * 0.55);
+    const k = 1 - easeInOutCubic(p), sw = a + k * 1.4;
+    const s = 0.35 + 0.65 * Math.min(1, p * 1.6);
+    setM(v, v.x + Math.cos(sw) * r * k, v.y + (0.25 + hash(v.y, v.x, v.z + 13)) * r * 0.7 * k, v.z + Math.sin(sw) * r * k, s);
+  },
+  tornado(v, p) {                  // ride a funnel around the island centre: wide and high, spiralling down and in
+    const dx = v.x - CX * S, dz = v.z - CZ * S, r0 = Math.hypot(dx, dz), a0 = Math.atan2(dz, dx);
+    const k = 1 - easeOutCubic(p), r = r0 + k * (10 + hash(v.x, v.y, v.z + 14) * 14) * S, a = a0 + k * 7;
+    setM(v, CX * S + Math.cos(a) * r, v.y + k * 26 * S, CZ * S + Math.sin(a) * r, 0.5 + 0.5 * Math.min(1, p * 2));
+  },
+  slide(v, p) {                    // walls slide in along their outward face; roofs and interiors drop in
+    const d = slideDir(v), k = 1 - easeOutBack(p) * 0.98 - 0.02 * p;
+    if (d === 4) setM(v, v.x, v.y + k * SLIDE, v.z, 1);
+    else setM(v, v.x + SIDES[d][0] * k * SLIDE, v.y, v.z + SIDES[d][1] * k * SLIDE, 1);
+  },
+  pop(v, p) {                      // no travel: an elastic scale-up in place
+    setM(v, v.x, v.y, v.z, Math.max(0, easeOutElastic(p)));
+  },
+  tumble(v, p) {                   // fall from higher while spinning about a random axis, landing square
+    const ax = hash(v.x, v.y, v.z + 15) - 0.5, ay = hash(v.y, v.z, v.x + 16) - 0.5, az = hash(v.z, v.x, v.y + 17) - 0.5, n = Math.hypot(ax, ay, az) || 1;
+    const k = 1 - easeOutCubic(p);
+    setR(v, v.x, v.y + k * DROP * 1.6, v.z, Math.min(1, 0.3 + p * 1.5), ax / n, ay / n, az / n, k * k * Math.PI * 2.5);
+  },
+  squash(v, p) {                   // accelerate down (stretched), then flatten on impact and spring back
+    if (p < 0.5) {
+      const q = p / 0.5;
+      setM(v, v.x, v.y + (1 - q * q) * DROP, v.z, 0.9, 1.15);
+    } else {
+      const q = (p - 0.5) / 0.5, sy = 1 - 0.45 * Math.cos(q * Math.PI * 2.5) * (1 - q) * (1 - q), sx = 1 / Math.sqrt(sy);
+      setM(v, v.x, v.y - 0.5 + sy / 2, v.z, sx, sy);
+    }
+  },
+  flash(v, p) {                    // drop in glowing hot, cool to the real colour
+    POSE.drop(v, Math.min(1, p * 1.6));
+    tint(v, (1 - p) * (1 - p));
+  },
+};
+POSE.flash.done = v => tint(v, 0);  // runs when a voxel settles
+let pose = POSE[ANIM.motion] || POSE.drop;
+
+// 3D-printer head for order=scan: a glowing plate riding on the layer being printed
+const head = new THREE.Mesh(new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2),
+  new THREE.MeshBasicMaterial({ color: 0xff8a2a, transparent: true, opacity: 0.16, depthWrite: false, side: THREE.DoubleSide }));
+head.scale.set(maxX - minX + 8, 1, maxZ - minZ + 8);
+head.position.set((minX + maxX) / 2, 0, (minZ + maxZ) / 2);
+head.renderOrder = 2;
+head.visible = false;
+group.add(head);
+
+// blueprint intro: an outline of every exposed voxel above the ground, shown for BLUEPRINT s before the build.
+// Slightly smaller than a voxel, so when the real ones land they hide it.
+const BLUEPRINT = 2.5;
+const ghost = (() => {
+  const c = document.createElement('canvas'); c.width = c.height = 32;
+  const x = c.getContext('2d');
+  x.fillStyle = 'rgba(40,120,230,0.10)'; x.fillRect(0, 0, 32, 32);
+  x.strokeStyle = 'rgba(30,105,220,0.9)'; x.lineWidth = 2.5; x.strokeRect(1.25, 1.25, 29.5, 29.5);
+  const map = new THREE.CanvasTexture(c); map.colorSpace = THREE.SRGBColorSpace;
+  const cells = vox.filter(v => v.y > topAt(v.x, v.z) && [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]].some(([a, b, d]) => !V.has(key(v.x + a, v.y + b, v.z + d))));
+  // depthWrite on + drawn last: only the nearest outline shows (with it off, hundreds of faces stacked into a milky blob)
+  const mesh = new THREE.InstancedMesh(geo, new THREE.MeshBasicMaterial({ map, transparent: true, opacity: 0 }), Math.max(1, cells.length));
+  const m4 = new THREE.Matrix4();
+  cells.forEach((v, i) => mesh.setMatrixAt(i, m4.makeScale(0.96, 0.96, 0.96).setPosition(v.x, v.y, v.z)));
+  mesh.count = cells.length; mesh.frustumCulled = false; mesh.renderOrder = 3; mesh.visible = false;
+  group.add(mesh);
+  return mesh;
+})();
+
+let t = 0, first = 0, paused = false, doneAt = -1, demoAt = -1, pileAt = -1;
+function reset() {
+  for (const v of vox) setM(v, 0, -9999, 0, 0);
+  meshes.forEach(m => { m.instanceMatrix.needsUpdate = true; });
+  t = ANIM.intro === 'blueprint' ? -BLUEPRINT : 0; first = 0; doneAt = -1; demoAt = -1; pileAt = -1;
+}
+reset();
+function step() {
+  let i = first;
+  while (i < COUNT && vox[i].t0 <= t) {
+    const v = vox[i];
+    const p = (t - v.t0) / DUR;
+    if (p >= 1) {
+      setM(v, v.x, v.y, v.z, 1);
+      if (pose.done) pose.done(v);
+      if (i === first) first++;
+    } else pose(v, p);
+    i++;
+  }
+  meshes.forEach(m => { m.instanceMatrix.needsUpdate = true; if (pose.done && m.instanceColor) m.instanceColor.needsUpdate = true; });
+}
+
+// demolish outro: the scene comes apart in reverse build order, pieces thrown outward under gravity, then the build replays
+const DEMO = { span: 4.5, fall: 1.5, g: 45 * S };
+let REL, VX, VY, VZ;
+function startDemolish() {
+  if (!REL) {
+    REL = new Float32Array(COUNT); VX = new Float32Array(COUNT); VY = new Float32Array(COUNT); VZ = new Float32Array(COUNT);
+    for (let i = 0; i < COUNT; i++) {
+      const v = vox[i], dx = v.x - CX * S, dz = v.z - CZ * S, d = Math.hypot(dx, dz) || 1, sp = (1.5 + hash(v.x, v.y, v.z + 21) * 5) * S;
+      REL[i] = (1 - v.t0 / vox[COUNT - 1].t0) * DEMO.span * 0.9 + hash(v.z, v.x, v.y + 22) * DEMO.span * 0.1;   // build order reversed
+      VX[i] = dx / d * sp; VZ[i] = dz / d * sp; VY[i] = hash(v.y, v.z, v.x + 23) * 4 * S;
+    }
+  }
+  for (const v of vox) setM(v, v.x, v.y, v.z, 1);   // also when triggered mid-build
+  first = COUNT; if (doneAt < 0) doneAt = t;
+  demoAt = t;
+}
+function demolish(d) {               // returns false when everything has fallen
+  let live = false;
+  for (let i = 0; i < COUNT; i++) {
+    const r = d - REL[i];
+    if (r <= 0) { live = true; continue; }
+    const v = vox[i];
+    if (r >= DEMO.fall) { setM(v, 0, -9999, 0, 0); continue; }
+    live = true;
+    const s = 1 - Math.max(0, (r - DEMO.fall * 0.5) / (DEMO.fall * 0.5));
+    setM(v, v.x + VX[i] * r, v.y + VY[i] * r - 0.5 * DEMO.g * r * r, v.z + VZ[i] * r, s);
+  }
+  meshes.forEach(m => { m.instanceMatrix.needsUpdate = true; });
+  return live;
+}
+// pile outro: everything above the ground flies onto a heap where the building stood (last built lands first, at
+// the bottom), holds, then flies back in build order, so the heap unstacks from the top. The same pairing of
+// voxels to slots would morph into another scene if that scene's voxels were the targets.
+const PILE = { fall: 3, hold: 1.2, rise: 4, fly: 1 };
+let PV, SX, SY, SZ;
+function startPile() {
+  const idx = [];
+  for (let i = 0; i < COUNT; i++) if (vox[i].y > topAt(vox[i].x, vox[i].z)) idx.push(i);   // not terrain: hummocks would leave holes
+  idx.sort((a, b) => vox[b].t0 - vox[a].t0);           // reverse build order -> bottom of the heap first
+  const N = idx.length;
+  PV = Int32Array.from(idx); SX = new Float32Array(N); SY = new Float32Array(N); SZ = new Float32Array(N);
+  const R = Math.cbrt(3 * N / (0.55 * Math.PI)) * 1.05, H = R * 0.55, cx = Math.round(CX * S), cz = Math.round(CZ * S);
+  let n = 0;
+  for (let y = 0; n < N; y++) {                         // cone layers; past the tip keep stacking a column
+    const r = Math.max(1.5, R * (1 - y / H)), ring = [];
+    for (let x = -Math.ceil(r); x <= Math.ceil(r); x++) for (let z = -Math.ceil(r); z <= Math.ceil(r); z++) {
+      const d = Math.hypot(x, z) + (hash(x, z, y + 31) - 0.5) * 1.2;   // ragged outline
+      if (d <= r) ring.push([x, z, d]);
+    }
+    ring.sort((a, b) => a[2] - b[2]);
+    for (const [x, z] of ring) { if (n >= N) break; SX[n] = cx + x; SY[n] = topAt(cx + x, cz + z) + 1 + y; SZ[n] = cz + z; n++; }
+  }
+  for (const v of vox) setM(v, v.x, v.y, v.z, 1);      // also when triggered mid-build
+  first = COUNT; if (doneAt < 0) doneAt = t;
+  pileAt = t;
+}
+function pile(d) {                  // returns false when the heap has rebuilt the scene
+  const N = PV.length, back = PILE.fall + PILE.fly + PILE.hold;
+  if (d > back + PILE.rise + PILE.fly) return false;
+  for (let j = 0; j < N; j++) {
+    const v = vox[PV[j]], r = j / N;
+    let a = (d - r * PILE.fall) / PILE.fly, fx = v.x, fy = v.y, fz = v.z, tx = SX[j], ty = SY[j], tz = SZ[j];
+    if (d > back) { a = (d - back - (1 - r) * PILE.rise) / PILE.fly; [fx, fy, fz, tx, ty, tz] = [tx, ty, tz, fx, fy, fz]; }
+    a = Math.max(0, Math.min(1, a));
+    if (d > back && a === 0) { setM(v, SX[j], SY[j], SZ[j], 1); continue; }
+    const e = easeInOutCubic(a), arc = Math.sin(Math.PI * e) * (4 * S + Math.hypot(tx - fx, tz - fz) * 0.35);
+    setM(v, fx + (tx - fx) * e, fy + (ty - fy) * e + arc, fz + (tz - fz) * e, 1);
+  }
+  meshes.forEach(m => { m.instanceMatrix.needsUpdate = true; });
+  return true;
+}
+// sky=night: dusk falls a couple of seconds after the build; glow and hero lights are pushed past 1 to stay bright
+const nightDiv = document.getElementById('night'), DAY_HEMI = hemi.color.clone(), NIGHT_HEMI = new THREE.Color(0x8ea4d6);
+let night = 0, nightForce = null;
+function setSky(dt) {
+  const want = ANIM.sky === 'night' && doneAt >= 0 && demoAt < 0 && pileAt < 0 && t - doneAt > 2 ? 1 : 0;
+  night += (want - night) * Math.min(1, dt * 0.45);
+  if (nightForce !== null) night = nightForce;
+  nightDiv.style.opacity = night.toFixed(3);
+  document.body.classList.toggle('dark', night > 0.5);
+  hemi.intensity = LIGHT.hemi * (1 - 0.72 * night);
+  hemi.color.copy(DAY_HEMI).lerp(NIGHT_HEMI, night);
+  sun.intensity = LIGHT.sun * (1 - 0.88 * night);
+  glassMat.envMapIntensity = 0.3 * (1 - 0.85 * night);          // the studio env's light bars read as things behind the glass at night
+  hazeU.hazeCol.value.copy(HAZE_DAY).lerp(HAZE_NIGHT, night);
+  if (drawSky) drawSky(night);
+}
+const GLOW_GAIN = 1.0;             // neon at its own colour; bloom adds the halo (1.25 pushed cyan to white)
+let lightK = 0;
+function setLights(k) {            // dim while building, full when complete
+  lightK = k;
+  warmLights.forEach(l => { l.intensity = l.userData.base * k; });
+  glowMat.color.setScalar((0.35 + 0.65 * k) * GLOW_GAIN);
+  blendBake(Math.min(1, k));       // baked lamps are emissive: no night boost needed, the dark around them does it
+}
+
+const bar = document.querySelector('#bar i');
+const loopBox = document.getElementById('loop');
+document.getElementById('replay').onclick = reset;
+const pauseBtn = document.getElementById('pause');
+const togglePause = () => { paused = !paused; pauseBtn.textContent = paused ? 'Play (Space)' : 'Pause (Space)'; };
+pauseBtn.onclick = togglePause;
+addEventListener('keydown', e => {
+  if (e.code === 'KeyR') reset();
+  else if (e.code === 'KeyF') t = BUILD_END;
+  else if (e.code === 'KeyD' && demoAt < 0 && pileAt < 0) startDemolish();
+  else if (e.code === 'KeyP' && demoAt < 0 && pileAt < 0) startPile();
+  else if (e.code === 'Space') { e.preventDefault(); togglePause(); }
+  else if (e.code === 'KeyH') document.getElementById('ui').classList.toggle('hidden');
+});
+// detail (voxel subdivision) changes the whole grid, so it reloads the page with ?res=
+const resSel = document.getElementById('res');
+resSel.value = S;
+resSel.onchange = () => { Q.set('res', resSel.value); location.search = '?' + Q; };
+// animation mode pickers: replan + replay on change, and keep the URL in sync so the combination can be shared
+for (const k in ANIM) {
+  const sel = document.getElementById(k);
+  sel.value = ANIM[k];
+  sel.onchange = () => {
+    ANIM[k] = sel.value;
+    if (k === 'order' && sel.value === 'scan') ANIM.motion = document.getElementById('motion').value = 'grow';
+    sel.blur();                        // keep Space/R/F going to the page, not the select
+    if (k === 'order' || k === 'motion') { plan(); pose = POSE[ANIM.motion]; REL = null; restoreColours(); reset(); }
+    else if (k === 'intro') reset();
+    for (const j in ANIM) Q.set(j, ANIM[j]);
+    history.replaceState(null, '', '?' + Q);
+  };
+}
+window.__seeAz = az => { camAz = az; placeCamera(az); };   // frame any side when testing
+window.__zoom = (z, x = 0, y = 4, zz = 0) => { cam.zoom = z; cam.updateProjectionMatrix(); controls.target.set(x, y, zz); };   // close-ups (world units)
+window.__lamps = bakedLights;                                    // the lamps that made it into the bake
+// per-prop report for the inspectors: measured size in metres vs the declared real size, lamps, glow voxels
+{
+  const R = {}, cell = M_PER_UNIT / S;
+  for (const v of vox) if (v.p) {
+    const r = R[v.p] ||= { n: 0, glow: 0, glass: 0, lamps: 0, x0: 1e9, y0: 1e9, z0: 1e9, x1: -1e9, y1: -1e9, z1: -1e9 };
+    r.n++; if (v.e === true) r.glow++; if (v.e === 'glass') r.glass++;
+    r.x0 = Math.min(r.x0, v.x); r.y0 = Math.min(r.y0, v.y); r.z0 = Math.min(r.z0, v.z);
+    r.x1 = Math.max(r.x1, v.x); r.y1 = Math.max(r.y1, v.y); r.z1 = Math.max(r.z1, v.z);
+  }
+  for (const l of bakedLights) { const p = V.get(key(...l.src))?.p; if (R[p]) R[p].lamps++; }
+  for (const name in PROPS) {
+    const r = R[name];
+    if (!r) { console.warn(`prop ${name}: no voxels left`); continue; }
+    r.m = [r.x1 - r.x0 + 1, r.y1 - r.y0 + 1, r.z1 - r.z0 + 1].map(d => +(d * cell).toFixed(2));   // x, y (height), z
+    r.centre = W((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2, (r.z0 + r.z1) / 2).toArray().map(c => +c.toFixed(1));
+    r.issues = [];
+    const real = PROPS[name].real;
+    if (real) {   // compare sorted footprint dims and the height; one cell of rounding is allowed
+      const [a, b] = [[r.m[0], r.m[2]].sort((p, q) => p - q), [real[0], real[2]].sort((p, q) => p - q)];
+      r.scale = [a[0] / b[0], r.m[1] / real[1], a[1] / b[1]].map(k => +k.toFixed(2));
+      [[a[0], b[0]], [r.m[1], real[1]], [a[1], b[1]]].forEach(([m, t], i) => {
+        if (m < t - cell || m > t * 1.2 + cell) r.issues.push(`${['width', 'height', 'length'][i]} ${m} m vs real ${t} m`);
+      });
+    }
+    if (r.glow && !r.lamps) r.issues.push(`${r.glow} glowing voxels but no lamp: it glows without lighting anything`);
+    if (r.issues.length) console.warn(`prop ${name}:`, r.issues.join('; '));
+  }
+  window.__props = R;
+}
+// frame one prop for a close-up: side angle (default: current), padding around its bounding box
+window.__seeProp = (name, az = camAz, pad = 1.8) => {
+  const r = window.__props[name];
+  if (!r) return `no prop ${name}`;
+  orbitBox.checked = false; userMoved = false;
+  __seeAz(az);
+  __zoom(VIEW / (Math.max(...r.m) / M_PER_UNIT / 2 * pad + 1), ...r.centre);
+  return r;
+};
+window.__night = k => { nightForce = k ?? null; };            // force the sky (0 day .. 1 night) for checks; no arg: automatic
+window.__hero = on => warmLights.forEach(l => { l.visible = on; });   // hero PointLights on/off for comparison
+// photo comparison: overlays the reference photo (object-fit: cover) at `opacity` over the render and prints the mean colour
+// of each 3×3 screen region for render and photo (hex, sRGB saturation/lightness, and the differences). Frame the camera
+// at the photo's angle first (__seeAz, drag), then __compare('ref/house.webp'); __compare() removes the overlay.
+window.__compare = (src, opacity = 0.5) => new Promise((resolve, reject) => {
+  let ov = document.getElementById('cmp');
+  if (!src) { ov?.remove(); return resolve(null); }
+  if (!ov) { ov = document.createElement('img'); ov.id = 'cmp'; Object.assign(ov.style, { position: 'fixed', inset: 0, width: '100%', height: '100%', objectFit: 'cover', pointerEvents: 'none', zIndex: 1 }); document.body.appendChild(ov); }
+  ov.style.opacity = opacity; ov.src = src;
+  const img = new Image();
+  img.onload = () => {
+    const w = renderer.domElement.width, h = renderer.domElement.height;
+    const grab = draw => { const c = document.createElement('canvas'); c.width = w; c.height = h; const g = c.getContext('2d', { willReadFrequently: true }); draw(g); return g.getImageData(0, 0, w, h).data; };
+    renderer.render(scene, cam);                                                   // read the frame right after rendering it
+    const R = grab(g => g.drawImage(renderer.domElement, 0, 0));
+    const sc = Math.max(w / img.naturalWidth, h / img.naturalHeight), iw = img.naturalWidth * sc, ih = img.naturalHeight * sc;   // cover
+    const F = grab(g => g.drawImage(img, (w - iw) / 2, (h - ih) / 2, iw, ih));
+    const c = new THREE.Color(), hsl = {}, rows = [];
+    const mean = (d, x0, y0, x1, y1) => { let r = 0, g = 0, b = 0, n = 0; for (let y = y0; y < y1; y += 4) for (let x = x0; x < x1; x += 4) { const o = (y * w + x) * 4; r += d[o]; g += d[o + 1]; b += d[o + 2]; n++; } return [r / n, g / n, b / n]; };
+    const fmt = ([r, g, b]) => { c.setRGB(r / 255, g / 255, b / 255, THREE.SRGBColorSpace).getHSL(hsl, THREE.SRGBColorSpace); return { hex: '#' + c.getHexString(), s: +hsl.s.toFixed(2), l: +hsl.l.toFixed(2) }; };
+    for (let j = 0; j < 3; j++) for (let i = 0; i < 3; i++) {
+      const box = [Math.floor(i * w / 3), Math.floor(j * h / 3), Math.floor((i + 1) * w / 3), Math.floor((j + 1) * h / 3)];
+      const a = fmt(mean(R, ...box)), b = fmt(mean(F, ...box));
+      rows.push({ region: `${['top', 'mid', 'bottom'][j]}-${['left', 'centre', 'right'][i]}`, render: a.hex, photo: b.hex, 'render s/l': `${a.s} / ${a.l}`, 'photo s/l': `${b.s} / ${b.l}`, ds: +(a.s - b.s).toFixed(2), dl: +(a.l - b.l).toFixed(2) });
+    }
+    console.table(rows);
+    resolve(rows);
+  };
+  img.onerror = () => reject(new Error('__compare: could not load ' + src));
+  img.src = src;
+});
+window.__bake = on => { bakeForce = on === undefined ? null : on ? 1 : 0; };   // force baked lamps on/off for comparison (no arg: auto)
+
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.1);
+  if (!paused) {
+    t += dt;
+    if (demoAt >= 0) { if (!demolish(t - demoAt)) reset(); }
+    else if (pileAt >= 0) { if (!pile(t - pileAt)) { for (const v of vox) setM(v, v.x, v.y, v.z, 1); meshes.forEach(m => { m.instanceMatrix.needsUpdate = true; }); pileAt = -1; doneAt = t; } }
+    else if (first < COUNT) step();
+    else if (doneAt < 0) doneAt = t;
+    else if (loopBox.checked && t - doneAt > 30) ({ demolish: startDemolish, pile: startPile }[ANIM.outro] || reset)();   // long hold so a full orbit shows every side
+    bar.style.width = Math.max(0, Math.min(100, (t / BUILD_END) * 100)) + '%';
+    if (!userMoved && orbitBox.checked) { camAz += dt * 0.12; placeCamera(camAz); }
+  }
+  head.visible = ANIM.order === 'scan' && t >= 0 && first < COUNT && demoAt < 0;
+  if (head.visible) head.position.y = minY + Math.min(maxY - minY, Math.floor(t / SCAN)) + 0.55;
+  // blueprint: fade in during the lead-in, hold through the build, fade out when complete
+  const bp = ANIM.intro !== 'blueprint' || demoAt >= 0 || pileAt >= 0 ? 0
+    : t < 0 ? Math.min(1, (t + BLUEPRINT) / 0.8) : doneAt < 0 ? 1 : Math.max(0, 1 - (t - doneAt) / 1.2);
+  ghost.visible = bp > 0; ghost.material.opacity = bp;
+  setSky(dt);
+  const out = demoAt >= 0 ? demoAt : pileAt;
+  setLights((out >= 0 ? Math.max(0.15, 1 - (t - out) * 0.85)
+    : doneAt < 0 ? 0.15 : 0.15 + 0.85 * Math.min(1, (t - doneAt) / 1.5)) * (1 + 1.2 * night));
+  controls.update();
+  hazeU.hazeC.value = cam.position.distanceTo(controls.target);   // depth of the target along the view axis
+  if (innerWidth > 0 && innerHeight > 0) {                     // a hidden pane has a zero-size framebuffer
+    if (BLOOM) { bloomPass.strength = 0.25 + 0.35 * Math.min(1, lightK); composer.render(); } else renderer.render(scene, cam);
+  }
+});
+</script>
+</body>
+</html>
